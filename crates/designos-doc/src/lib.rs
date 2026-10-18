@@ -48,6 +48,7 @@ mod settings;
 #[cfg(test)]
 mod slot_model_tests;
 pub mod spec;
+pub mod spec_bind;
 mod styles_ops;
 mod text_fills;
 mod textmodel;
@@ -74,6 +75,7 @@ pub use paint::*;
 pub use prototype::*;
 pub use settings::*;
 pub use spec::*;
+pub use spec_bind::*;
 pub use styles_ops::*;
 pub use text_fills::set_text_fills_everywhere;
 pub use textmodel::*;
