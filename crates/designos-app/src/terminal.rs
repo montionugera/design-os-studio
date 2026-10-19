@@ -912,7 +912,9 @@ impl TerminalState {
         if let Ok(bytes) = serde_json::to_vec_pretty(&context_reply) {
             let _ = atomic_write_session_file(&context_reply_path, &bytes);
         }
-        let _ = self.skills.write_run_record(&self.session_dir, &self.session_id, self.active_runtime);
+        if !self.skills.selected_names.is_empty() {
+            let _ = self.skills.write_run_record(&self.session_dir, &self.session_id, self.active_runtime);
+        }
         let status_path = self.session_dir.join("agent-status.json");
         if let Ok(bytes) = serde_json::to_vec_pretty(&session_hooks_settings(&status_path, Some(&context_reply_path))) {
             let _ = atomic_write_session_file(&self.session_dir.join("hooks.json"), &bytes);
