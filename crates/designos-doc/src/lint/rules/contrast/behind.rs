@@ -6,7 +6,7 @@
 use super::backdrop::{blends_as_group, inside_inset_box};
 use super::extent::{box_corners, clipped, page_box, paint_seen, painted_box, stroke_under};
 use super::subtree::{may_reach, SubtreeBounds};
-use designos_doc::{resolved_node, Affine, BlendMode, Color, Document, Node, NodeId, NodeKind, PaintKind, Rect, TextProps};
+use crate::{resolved_node, Affine, BlendMode, Color, Document, Node, NodeId, NodeKind, PaintKind, Rect, TextProps};
 
 /// Nodes one text check may look at in earlier siblings' subtrees. Past it the backdrop is unknown.
 const SUBTREE_BUDGET: usize = 4096;
@@ -133,7 +133,7 @@ impl Probe<'_> {
 
 /// What is painted behind a text layer.
 #[derive(Debug, PartialEq)]
-pub(in crate::check_designs) enum Behind {
+pub enum Behind {
     /// No layer painted before the text reaches it: its ancestors are its whole backdrop.
     Nothing,
     /// Something reaches it that is not modelled.
@@ -159,19 +159,8 @@ fn opaque_up_to_the_page(doc: &Document, id: NodeId) -> bool {
 
 /// What the layers painted before `id` (earlier siblings of it or of any ancestor) put behind it,
 /// by their own box, by what they paint beyond the box, or by anything in their subtree, scanned in
-/// paint order from the nearest. The first layer that reaches the text decides: a plain opaque
-/// cover (see `Probe::plain_cover`) is its backdrop and hides everything painted below it in the
-/// same parent, and any other layer makes the backdrop unknown. Layers below the cover but outside
-/// a parent drawn at less than full opacity still show through it, so the search goes on there.
-///
-/// `occluder` is an ancestor whose opaque fill covers the whole text box: what is painted below that
-/// fill, such as the earlier siblings of the occluder and of its ancestors, is hidden by it and
-/// ends the search. Earlier siblings of the text and of the layers between it and the occluder are
-/// painted above the fill and still count.
-///
-/// `bounds` only speeds the search up: it never changes the answer, except that a subtree it rules
-/// out no longer uses up the budget.
-pub(in crate::check_designs) fn has_layer_behind(doc: &Document, id: NodeId, occluder: Option<NodeId>, bounds: Option<&SubtreeBounds>) -> Behind {
+/// paint order from the nearest.
+pub fn has_layer_behind(doc: &Document, id: NodeId, occluder: Option<NodeId>, bounds: Option<&SubtreeBounds>) -> Behind {
     let Some(text_box) = page_box(doc, id) else { return Behind::Unknown };
     let mut probe = Probe { doc, text: id, text_box, bounds, budget: SUBTREE_BUDGET };
     let mut cover = None;
@@ -189,8 +178,6 @@ pub(in crate::check_designs) fn has_layer_behind(doc: &Document, id: NodeId, occ
             if !s.visible || s.opacity <= 0.0 || !probe.can_reach(*sibling, world, 0.0) {
                 continue;
             }
-            // The painted box contains the layer's own box. A clipping sibling paints nothing of its
-            // content outside its own box, which does not reach the text.
             let painted = painted_box(&world, s, 0.0);
             let clips = s.kind.frame_props().is_some_and(|f| f.clips_content);
             let reaches = painted.rect.intersects(&probe.text_box)
@@ -199,7 +186,6 @@ pub(in crate::check_designs) fn has_layer_behind(doc: &Document, id: NodeId, occ
             if !reaches {
                 continue;
             }
-            // A mask among the layers up to this one cuts it too.
             let masked = p.children[..=at].iter().any(|m| doc.get(*m).is_some_and(|m| m.is_mask));
             let fills = match probe.plain_cover(*sibling, &world) {
                 Some(fills) if cover.is_none() && !masked => fills,
@@ -210,10 +196,49 @@ pub(in crate::check_designs) fn has_layer_behind(doc: &Document, id: NodeId, occ
                 return found;
             }
             cover = Some(found);
-            // Everything else in this parent is under the cover.
             break;
         }
         cur = parent;
     }
     cover.unwrap_or(Behind::Nothing)
+}
+
+/// Returns the name of the top-most visible layer painted AFTER `id` whose painted subtree overlaps
+/// `id`'s page box, or `None` if no layer painted after `id` overlaps it.
+pub fn layer_painted_after(doc: &Document, id: NodeId, bounds: Option<&SubtreeBounds>) -> Option<String> {
+    let text_box = page_box(doc, id)?;
+    let mut probe = Probe { doc, text: id, text_box, bounds, budget: SUBTREE_BUDGET };
+    let mut chain = Vec::new();
+    let mut cur = id;
+    while let Some(parent) = doc.get(cur).and_then(|n| n.parent) {
+        chain.push((cur, parent));
+        cur = parent;
+    }
+    // Check from outermost ancestor to innermost so the top-most painted layer wins.
+    for (child, parent) in chain.into_iter().rev() {
+        let p = doc.get(parent)?;
+        let parent_world = doc.world_transform(parent);
+        let paint_kids = p.paint_children();
+        let pos = paint_kids.iter().position(|s| *s == child)?;
+        for sibling in paint_kids[pos + 1..].iter().rev() {
+            let Some(s) = doc.get(*sibling) else { continue };
+            if !s.visible || s.opacity <= 0.0 || s.is_mask {
+                continue;
+            }
+            let world = parent_world * s.transform;
+            let painted = painted_box(&world, s, 0.0);
+            let clips = s.kind.frame_props().is_some_and(|f| f.clips_content);
+            let reaches = (paints_something(s) && painted.rect.intersects(&probe.text_box))
+                || (!clips && s.children.iter().any(|c| doc.get(*c).is_some_and(|ch| probe.paints_over(*c, world * ch.transform, None, painted.effects))))
+                || (clips
+                    && painted.own.intersects(&probe.text_box)
+                    && s.children
+                        .iter()
+                        .any(|c| doc.get(*c).is_some_and(|ch| probe.paints_over(*c, world * ch.transform, Some(painted.own), painted.effects))));
+            if reaches {
+                return Some(s.name.clone());
+            }
+        }
+    }
+    None
 }

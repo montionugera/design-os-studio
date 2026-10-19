@@ -384,13 +384,13 @@ pub const RULES: &[RuleSpec] = &[
         presets: &[Strict],
     },
     RuleSpec {
-        id: "low-contrast-text",
-        aliases: &["contrast", "low-contrast"],
+        id: "contrast",
+        aliases: &["low-contrast-text", "low-contrast"],
         category: Accessibility,
         default_severity: Error,
         fixable: false,
-        needs: Geometry,
-        presets: &[Strict],
+        needs: RuleNeeds::Pixels,
+        presets: &[Agent, CheckDesigns, Recommended, Strict],
     },
 ];
 

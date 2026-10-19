@@ -106,6 +106,8 @@ pub struct LintConfig {
     pub include_ignored: bool,
     /// Include unoverridden layers inside component instances.
     pub include_instances: bool,
+    /// WCAG contrast conformance level (`AA` or `AAA`).
+    pub contrast_level: ContrastLevel,
     /// Numeric thresholds for rules.
     pub thresholds: LintThresholds,
     /// Maximum number of findings to return in a single page (`None` = unlimited).
@@ -129,7 +131,15 @@ impl LintConfig {
                 enabled_rules.insert(rule.id, rule.default_severity);
             }
         }
-        Self { enabled_rules, include_ignored: false, include_instances: false, thresholds: LintThresholds::default(), limit: None, cursor: None }
+        Self {
+            enabled_rules,
+            include_ignored: false,
+            include_instances: false,
+            contrast_level: ContrastLevel::AA,
+            thresholds: LintThresholds::default(),
+            limit: None,
+            cursor: None,
+        }
     }
 
     /// Parses a preset string:
@@ -155,6 +165,7 @@ impl LintConfig {
                 enabled_rules,
                 include_ignored: false,
                 include_instances: false,
+                contrast_level: ContrastLevel::AA,
                 thresholds: LintThresholds::default(),
                 limit: None,
                 cursor: None,
@@ -171,6 +182,7 @@ impl LintConfig {
                 enabled_rules,
                 include_ignored: false,
                 include_instances: false,
+                contrast_level: ContrastLevel::AA,
                 thresholds: LintThresholds::default(),
                 limit: None,
                 cursor: None,
@@ -188,7 +200,15 @@ impl LintConfig {
             };
             enabled_rules.insert(spec.id, spec.default_severity);
         }
-        Ok(Self { enabled_rules, include_ignored: false, include_instances: false, thresholds: LintThresholds::default(), limit: None, cursor: None })
+        Ok(Self {
+            enabled_rules,
+            include_ignored: false,
+            include_instances: false,
+            contrast_level: ContrastLevel::AA,
+            thresholds: LintThresholds::default(),
+            limit: None,
+            cursor: None,
+        })
     }
 
     /// Replaces the enabled rules with the given explicit rule list (`rules` array in MCP).
@@ -239,6 +259,19 @@ impl LintConfig {
             }
         }
         self
+    }
+
+    /// Returns the effective contrast level for a document (`AAA` if configured on `self`,
+    /// `self.thresholds`, or `doc.check_designs.contrast_level`).
+    pub fn effective_contrast_level(&self, doc: &crate::Document) -> ContrastLevel {
+        if self.contrast_level == ContrastLevel::AAA
+            || self.thresholds.contrast_level == ContrastLevel::AAA
+            || doc.check_designs.contrast_level == ContrastLevel::AAA
+        {
+            ContrastLevel::AAA
+        } else {
+            ContrastLevel::AA
+        }
     }
 
     /// Returns the effective severity of `rule_id` (or alias) if enabled.

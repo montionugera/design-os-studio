@@ -1,5 +1,6 @@
 //! Evaluation of all 27 registered design lint rules.
 
+pub mod contrast;
 pub mod detached;
 
 use super::config::LintConfig;
@@ -7,7 +8,7 @@ use super::finding::{Finding, FixSuggestion};
 use super::registry::{Category, Severity};
 use super::LintEnv;
 use crate::openpencil::{infer_role_hint, node_to_xpath};
-use crate::{Affine, Color, ContrastLevel, Document, Node, NodeId, NodeKind, Paint, PaintKind, Rect, Sizing, TextAutoResize, Vec2};
+use crate::{Affine, Color, Document, Node, NodeId, NodeKind, Paint, PaintKind, Rect, Sizing, TextAutoResize, Vec2};
 use serde_json::json;
 
 pub const SPACING_SCALE: [f32; 15] = [0.0, 2.0, 4.0, 6.0, 8.0, 12.0, 16.0, 20.0, 24.0, 32.0, 40.0, 48.0, 64.0, 80.0, 96.0];
@@ -55,7 +56,7 @@ pub fn is_default_layer_name(name: &str) -> bool {
 pub fn relative_luminance(c: Color) -> f32 {
     fn chan(v: f32) -> f32 {
         let v = v.clamp(0.0, 1.0);
-        if v <= 0.03928 {
+        if v <= 0.04045 {
             v / 12.92
         } else {
             ((v + 0.055) / 1.055).powf(2.4)
@@ -154,14 +155,17 @@ pub struct NodeEvalCtx<'a> {
     pub config: &'a LintConfig,
     pub env: &'a dyn LintEnv,
     pub components: &'a detached::Components,
+    pub contrast_bounds: &'a contrast::SubtreeBounds,
 }
 
-/// Evaluates all enabled rules on `ctx.node` and appends any findings to `out`.
-pub fn evaluate_node(ctx: &NodeEvalCtx<'_>, out: &mut Vec<Finding>) {
+/// Evaluates all enabled rules on `ctx.node`, appends any findings to `out`, and returns `true`
+/// if a pixel-path contrast evaluation was executed.
+pub fn evaluate_node(ctx: &NodeEvalCtx<'_>, out: &mut Vec<Finding>) -> bool {
     let doc = ctx.doc;
     let n = ctx.node;
     let config = ctx.config;
     let tol = config.thresholds.geometry_tolerance;
+    let mut used_pixel_path = false;
 
     let mut emit = |rule_id: &'static str,
                     category: Category,
@@ -182,6 +186,14 @@ pub fn evaluate_node(ctx: &NodeEvalCtx<'_>, out: &mut Vec<Finding>) {
             xpath: node_to_xpath(doc, target.id),
             bounds: target_bounds,
             message,
+            measured_ratio: None,
+            required_ratio: None,
+            level: None,
+            large: None,
+            method: None,
+            worst_sample: None,
+            foreground_hex: None,
+            backdrop_hex: None,
             suggested_fix,
             fixable,
             ignored: false,
@@ -573,38 +585,6 @@ pub fn evaluate_node(ctx: &NodeEvalCtx<'_>, out: &mut Vec<Finding>) {
         if config.is_enabled("detached-text-style") && !n.style_refs.contains_key("text") {
             emit("detached-text-style", Category::Tokens, n, ctx.page_bounds, "Text layer is not linked to a shared text style".into(), None, false);
         }
-
-        if config.is_enabled("low-contrast-text") {
-            if let Some(fg) = tp.style.fills.iter().rev().find(|p| p.visible).or_else(|| n.fills.iter().rev().find(|p| p.visible)).and_then(|p| match p.kind {
-                PaintKind::Solid(c) => Some(c),
-                _ => None,
-            }) {
-                let bg = ctx.env.backdrop(doc, n.id, ctx.page_bounds).map(|b| b.color).unwrap_or_else(|| effective_background_color(doc, n.id));
-                let ratio = contrast_ratio(fg, bg);
-                let large = tp.style.font_size >= 24.0 || (tp.style.font_size >= 18.0 && tp.style.font_weight >= 700);
-                let min_ratio = match (config.thresholds.contrast_level, large) {
-                    (ContrastLevel::AA, true) => 3.0,
-                    (ContrastLevel::AA, false) => 4.5,
-                    (ContrastLevel::AAA, true) => 4.5,
-                    (ContrastLevel::AAA, false) => 7.0,
-                };
-                if ratio < min_ratio {
-                    let level_str = match config.thresholds.contrast_level {
-                        ContrastLevel::AA => "AA",
-                        ContrastLevel::AAA => "AAA",
-                    };
-                    emit(
-                        "low-contrast-text",
-                        Category::Accessibility,
-                        n,
-                        ctx.page_bounds,
-                        format!("Text contrast ratio {:.2}:1 is below WCAG {level_str} {:.1}:1 (#{} on #{})", ratio, min_ratio, fg.to_hex(), bg.to_hex()),
-                        None,
-                        false,
-                    );
-                }
-            }
-        }
     }
 
     // ------------------------------------------------------------------
@@ -736,6 +716,12 @@ pub fn evaluate_node(ctx: &NodeEvalCtx<'_>, out: &mut Vec<Finding>) {
             );
         }
     }
+
+    if config.is_enabled("contrast") {
+        used_pixel_path |= contrast::evaluate_contrast(ctx, ctx.contrast_bounds, out);
+    }
+
+    used_pixel_path
 }
 
 /// Sweep-and-prune sibling overlap detector (`O(n log n + k)`, `k` capped at 1,000 pairs per container).

@@ -8,7 +8,7 @@ pub mod rules;
 pub mod traverse;
 
 pub use config::{LintConfig, LintConfigError, LintThresholds, RuleSeverityConfig, RuleSeverityLevel};
-pub use finding::{Finding, FixSuggestion, LintFinding, LintFix, LintPage, LintReport, LintSummary, SkippedRule};
+pub use finding::{Finding, FixSuggestion, LintFinding, LintFix, LintPage, LintReport, LintSummary, SamplePoint, SkippedRule};
 pub use fix::{lint_fix_commands, lint_fix_document, lint_fix_with_history};
 pub use registry::{
     all_preset_names, all_rule_ids, canonical_rule_id, preset_rule_ids, resolve_rule, rule_aliases, Category, LintPreset, RuleNeeds, RuleSpec, Severity, RULES,
@@ -28,11 +28,21 @@ pub struct TextMetrics {
     pub substituted_family: Option<String>,
 }
 
-/// Sampled backdrop color behind a node.
+/// Sampled backdrop and foreground contrast result behind a node.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Backdrop {
+    /// Worst-case sampled backdrop color (`B_{argmin}`).
     pub color: Color,
+    /// Whether the backdrop is uniform across the sampled region.
     pub uniform: bool,
+    /// Worst-case sampled foreground color (`C_{argmin}`) when evaluated via the pixel path.
+    pub foreground: Option<Color>,
+    /// Worst-case contrast ratio (`min_i contrast(C_i, B_i)`) when evaluated via the pixel path.
+    pub worst_ratio: Option<f32>,
+    /// Page-space coordinates of the worst sample (`argmin_i ratio_i`).
+    pub worst_sample: Option<SamplePoint>,
+    /// True when `C == B` across all glyph interior samples (the text is completely covered by an opaque layer above it).
+    pub covered: bool,
 }
 
 /// Optional measurement environment supplied by the caller.
@@ -147,8 +157,8 @@ mod tests {
             ("collapsed-size", "zero-bounds"),
             ("non-4px-grid", "non-integer-bounds"),
             ("non-4px-grid", "subpixel-position"),
-            ("low-contrast-text", "contrast"),
-            ("low-contrast-text", "low-contrast"),
+            ("contrast", "low-contrast-text"),
+            ("contrast", "low-contrast"),
             ("tiny-text", "small-text"),
             ("small-touch-target", "touch-target"),
             ("misaligned-siblings", "unaligned-siblings"),
@@ -197,16 +207,19 @@ mod tests {
         assert!(agent.is_enabled("text-missing-fill"));
         assert!(agent.is_enabled("absolute-in-auto-layout"));
         assert!(agent.is_enabled("placeholder-text"));
+        assert!(agent.is_enabled("contrast"));
         assert!(!agent.is_enabled("detached-instance"));
         assert!(!agent.is_enabled("hardcoded-color"));
 
         let check_designs = LintConfig::from_preset_str("check-designs").unwrap();
         assert!(check_designs.is_enabled("detached-instance"));
+        assert!(check_designs.is_enabled("contrast"));
         assert!(!check_designs.is_enabled("default-layer-name"));
 
         let recommended = LintConfig::from_preset_str("recommended").unwrap();
         assert!(recommended.is_enabled("overflow-parent"));
         assert!(recommended.is_enabled("detached-instance"));
+        assert!(recommended.is_enabled("contrast"));
         assert!(recommended.is_enabled("default-layer-name"));
         assert!(recommended.is_enabled("empty-container"));
         assert!(!recommended.is_enabled("hardcoded-color"));
