@@ -661,29 +661,40 @@ impl ServerHandler for DesignOSServer {
         Ok(ListToolsResult { tools: tools(), ..Default::default() })
     }
     async fn call_tool(&self, request: CallToolRequestParams, _: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
-        let is_screenshot = request.name == "designos_get_screenshot" || request.name == "get_screenshot";
         let result = self
             .session
             .lock()
             .map_err(|_| "Session unavailable; restart the MCP server".to_string())
             .and_then(|mut session| session.call(&request.name, Value::Object(request.arguments.unwrap_or_default())));
         Ok(match result {
-            Ok(mut value) if is_screenshot => {
-                let image_content = value.get("content").and_then(Value::as_array).and_then(|arr| arr.first()).and_then(|item| {
-                    let data = item.get("data")?.as_str()?.to_string();
-                    let mime_type = item.get("mimeType")?.as_str()?.to_string();
-                    Some(ContentBlock::image(data, mime_type))
-                });
-                if let Some(obj) = value.as_object_mut() {
-                    obj.remove("content");
+            Ok(mut value) => {
+                let image_blocks: Vec<ContentBlock> = value
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|item| {
+                                if item.get("type").and_then(Value::as_str) != Some("image") {
+                                    return None;
+                                }
+                                let data = item.get("data")?.as_str()?.to_string();
+                                let mime_type = item.get("mimeType")?.as_str()?.to_string();
+                                Some(ContentBlock::image(data, mime_type))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !image_blocks.is_empty() {
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.remove("content");
+                    }
                 }
                 let mut res = CallToolResult::structured(value);
-                if let Some(img) = image_content {
-                    res.content = vec![img];
+                if !image_blocks.is_empty() {
+                    res.content = image_blocks;
                 }
                 res
             }
-            Ok(value) => CallToolResult::structured(value),
             Err(message) => CallToolResult::structured_error(json!({"error":message})),
         }
         .into())

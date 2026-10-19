@@ -59,6 +59,8 @@ pub fn tool_descriptor() -> Value {
     op_properties.insert("height".into(), size);
     op_properties.insert("visible".into(), json!({ "type": "boolean" }));
     op_properties.insert("opacity".into(), json!({ "type": "number", "minimum": 0, "maximum": 1 }));
+    op_properties.insert("fill".into(), json!({ "type": "string", "maxLength": 1024 }));
+    op_properties.insert("fills".into(), json!({ "type": "array", "items": { "type": "object" } }));
     op_properties.insert("upsert_collections".into(), json!({ "type": "array", "items": { "type": "object" } }));
     op_properties.insert("upsert_variables".into(), json!({ "type": "array", "items": { "type": "object" } }));
     op_properties.insert("delete_variables".into(), json!({ "type": "array", "items": { "type": "string" } }));
@@ -114,7 +116,6 @@ struct BatchArgs {
     #[serde(default)]
     idempotency_key: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     diff_image: bool,
 }
 
@@ -162,6 +163,10 @@ struct InsertOp {
     width: f32,
     #[serde(default = "default_size")]
     height: f32,
+    #[serde(default)]
+    fill: Option<String>,
+    #[serde(default)]
+    fills: Option<Vec<Paint>>,
     index: Option<usize>,
 }
 
@@ -182,6 +187,10 @@ struct UpdateOp {
     height: Option<f32>,
     visible: Option<bool>,
     opacity: Option<f32>,
+    #[serde(default)]
+    fill: Option<String>,
+    #[serde(default)]
+    fills: Option<Vec<Paint>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -466,6 +475,10 @@ fn parse_and_validate_ops(raw_ops: Vec<Value>) -> Result<Vec<ParsedOp>, String> 
                 }
                 validate_create_fields(&a.kind, a.name.as_deref(), a.text.as_deref(), a.x, a.y, a.width, a.height)
                     .map_err(|e| op_failed_error(idx, "insert", "VALUE_OUT_OF_RANGE", &op_path, e))?;
+                if let Some(fill_str) = &a.fill {
+                    resolve_easeui_color(fill_str)
+                        .ok_or_else(|| op_failed_error(idx, "insert", "VALUE_OUT_OF_RANGE", &op_path, format!("invalid fill color '{fill_str}'")))?;
+                }
                 ParsedOp::Insert(a)
             }
             "update" => {
@@ -480,6 +493,8 @@ fn parse_and_validate_ops(raw_ops: Vec<Value>) -> Result<Vec<ParsedOp>, String> 
                     height: a.height,
                     visible: a.visible,
                     opacity: a.opacity,
+                    fill: a.fill.clone(),
+                    fills: a.fills.clone(),
                 })
                 .map_err(|e| op_failed_error(idx, "update", "VALUE_OUT_OF_RANGE", &op_path, e))?;
                 ParsedOp::Update(a)
@@ -1094,6 +1109,7 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
     let mut created_count: usize = 0;
     let mut changed = ChangedCounts::default();
     let mut touched_records: Vec<TouchedRootRecord> = Vec::with_capacity(ops.len());
+    let mut deleted_ids: Vec<NodeId> = Vec::new();
 
     let default_page = engine.resolve_default_page().ok();
 
@@ -1180,9 +1196,16 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
                         format!("batch creates over {MAX_BATCH_CREATED_NODES} nodes"),
                     ));
                 }
-                let (id, target_idx, node) =
+                let (id, target_idx, mut node) =
                     build_created_node(&mut trial, parent, a.index, &a.kind, a.name.clone(), a.text.clone(), a.x, a.y, a.width, a.height)
                         .map_err(|e| op_failed_error(op_idx, op_name, "INVALID_ARGUMENTS", &op_path, e))?;
+                if let Some(fills) = &a.fills {
+                    node.fills = fills.clone();
+                } else if let Some(fill_str) = &a.fill {
+                    if let Some(color) = resolve_easeui_color(fill_str) {
+                        node.fills = vec![Paint::solid(color)];
+                    }
+                }
 
                 let cmd = Command::Insert { parent, index: target_idx, nodes: vec![node] };
                 if recording_live {
@@ -1222,10 +1245,13 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
                         height: a.height,
                         visible: a.visible,
                         opacity: a.opacity,
+                        fill: a.fill.clone(),
+                        fills: a.fills.clone(),
                     },
                 )
                 .map_err(|e| op_failed_error(op_idx, op_name, "INVALID_ARGUMENTS", &op_path, e))?;
 
+                let before_bounds = node_page_bounds(&trial, id);
                 if let Some(alias) = &a.alias {
                     alias_roots.insert(alias.clone(), id);
                 }
@@ -1241,7 +1267,6 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
                     relayout_targets.push(id);
                     changed.updated += 1;
                 }
-                let before_bounds = node_page_bounds(&trial, id);
                 touched_records.push(TouchedRootRecord { op: op_idx, node_id: id, before_bounds });
             }
             ParsedOp::Move(a) => {
@@ -1273,6 +1298,7 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
                 let siblings_without_id = pnode.children.iter().filter(|&&c| c != id).count();
                 let target_idx = a.index.unwrap_or(siblings_without_id).min(siblings_without_id);
                 let cur_idx = trial.get(old_parent).and_then(|p| p.children.iter().position(|&c| c == id));
+                let before_bounds = node_page_bounds(&trial, id);
 
                 if let Some(alias) = &a.alias {
                     alias_roots.insert(alias.clone(), id);
@@ -1291,7 +1317,6 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
                     relayout_targets.push(new_parent);
                     changed.moved += 1;
                 }
-                let before_bounds = node_page_bounds(&trial, id);
                 touched_records.push(TouchedRootRecord { op: op_idx, node_id: id, before_bounds });
             }
             ParsedOp::Delete(a) => {
@@ -1320,6 +1345,7 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
                 collected_cmds.push(cmd);
                 relayout_targets.push(former_parent);
                 changed.deleted += 1;
+                deleted_ids.push(id);
                 touched_records.push(TouchedRootRecord { op: op_idx, node_id: former_parent, before_bounds: parent_bounds_before });
             }
             ParsedOp::SetVariables(a) => {
@@ -1368,11 +1394,13 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
         }
     }
 
+    trial.flush_pending_relayout();
+
     // Build reply fields from the finished trial document (§3.3).
     let name_to_id = build_name_to_id_map(&trial, &created_roots, &all_created_ids);
     let mut touched_roots_json = Vec::with_capacity(touched_records.len());
     let mut union_bounds: Option<Rect> = None;
-    let mut check_ids: Vec<NodeId> = Vec::with_capacity(touched_records.len() + created_root_ids.len());
+    let mut check_ids: Vec<NodeId> = Vec::with_capacity(touched_records.len() + created_root_ids.len() + deleted_ids.len());
 
     for rec in &touched_records {
         check_ids.push(rec.node_id);
@@ -1398,9 +1426,27 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
         }));
     }
     check_ids.extend(all_created_ids.iter().copied());
+    check_ids.extend(deleted_ids.iter().copied());
 
     let touched_bounds_rect = union_bounds.unwrap_or(Rect::new(0.0, 0.0, 0.0, 0.0));
     let undo_label = agent_undo_label();
+
+    let mut reply = json!({
+        "dry_run": batch_args.dry_run,
+        "created": created_root_ids,
+        "created_count": created_count,
+        "name_to_id": name_to_id,
+        "changed": changed,
+        "touched_roots": touched_roots_json,
+        "touched_bounds": bounds_json(touched_bounds_rect),
+        "undo_label": undo_label,
+        "issues": [],
+        "issues_total": 0
+    });
+
+    if batch_args.diff_image {
+        crate::tools::screenshot::attach_diff_to_reply(&engine.doc, &trial, &check_ids, &mut reply);
+    }
 
     // Step 4: Dry run returns the trial result without committing or publishing (§3.2.4).
     // Step 5 & Edge case 5: Empty effective change skips commit, undo entry, and patch line (§8.5).
@@ -1420,18 +1466,7 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
         );
     }
 
-    Ok(json!({
-        "dry_run": batch_args.dry_run,
-        "created": created_root_ids,
-        "created_count": created_count,
-        "name_to_id": name_to_id,
-        "changed": changed,
-        "touched_roots": touched_roots_json,
-        "touched_bounds": bounds_json(touched_bounds_rect),
-        "undo_label": undo_label,
-        "issues": [],
-        "issues_total": 0
-    }))
+    Ok(reply)
 }
 
 /// Zero-allocation streaming hash of the document state (never calls `to_json`, CLAUDE.md §4.1).
@@ -2176,5 +2211,244 @@ mod tests {
             );
             assert!(commit_ms <= budget_ms, "E15-4 commit for {target_nodes} nodes took {commit_ms:.1}ms, exceeding budget {budget_ms:.1}ms");
         }
+    }
+
+    #[test]
+    fn recolour_bbox_equals_node_bounds() {
+        let mut engine = Engine::default();
+        let page = engine.resolve_default_page().unwrap();
+        let setup = engine
+            .call(
+                "designos_apply_batch",
+                json!({
+                    "ops": [
+                        { "op": "insert", "as": "board", "parent": page.0, "kind": "frame", "name": "Board", "x": 0.0, "y": 0.0, "width": 200.0, "height": 200.0, "fill": "#FFFFFF" },
+                        { "op": "insert", "as": "rect", "parent": "@board", "kind": "rectangle", "name": "Target", "x": 20.0, "y": 30.0, "width": 60.0, "height": 40.0, "fill": "#FF0000" }
+                    ]
+                }),
+            )
+            .unwrap();
+        let rect_id = setup["name_to_id"]["rect"].as_u64().unwrap();
+
+        let reply = engine
+            .call(
+                "designos_apply_batch",
+                json!({
+                    "ops": [
+                        { "op": "update", "node": rect_id, "fill": "#00FF00" }
+                    ],
+                    "diff_image": true
+                }),
+            )
+            .unwrap();
+
+        let diff = &reply["diff"];
+        assert_eq!(diff["changed_pixels"], 60 * 40);
+        assert_eq!(diff["changed_bbox"], json!({ "x": 20.0, "y": 30.0, "width": 60.0, "height": 40.0 }));
+        let content = reply["content"].as_array().expect("3 image content blocks");
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["mimeType"], "image/png");
+    }
+
+    #[test]
+    fn colour_change_highlights_only_the_rect() {
+        recolour_bbox_equals_node_bounds();
+    }
+
+    #[test]
+    fn noop_batch_reports_zero() {
+        let mut engine = Engine::default();
+        let page = engine.resolve_default_page().unwrap();
+        let setup = engine
+            .call(
+                "designos_apply_batch",
+                json!({
+                    "ops": [
+                        { "op": "insert", "as": "rect", "parent": page.0, "kind": "rectangle", "name": "Target", "x": 10.0, "y": 10.0, "width": 50.0, "height": 50.0, "fill": "#FF0000" }
+                    ]
+                }),
+            )
+            .unwrap();
+        let rect_id = setup["name_to_id"]["rect"].as_u64().unwrap();
+
+        let reply = engine
+            .call(
+                "designos_apply_batch",
+                json!({
+                    "ops": [
+                        { "op": "update", "node": rect_id, "fill": "#FF0000" }
+                    ],
+                    "diff_image": true
+                }),
+            )
+            .unwrap();
+
+        let diff = &reply["diff"];
+        assert_eq!(diff["changed_pixels"], 0);
+        assert_eq!(diff["changed_ratio"], 0.0);
+        assert!(diff["changed_bbox"].is_null());
+        assert!(reply.get("content").is_none(), "no image blocks when changed_pixels == 0");
+    }
+
+    #[test]
+    fn noop_batch_returns_zero_changed_pixels() {
+        noop_batch_reports_zero();
+    }
+
+    #[test]
+    fn move_includes_both_positions() {
+        let mut engine = Engine::default();
+        let page = engine.resolve_default_page().unwrap();
+        let setup = engine
+            .call(
+                "designos_apply_batch",
+                json!({
+                    "ops": [
+                        { "op": "insert", "as": "board", "parent": page.0, "kind": "frame", "name": "Board", "x": 0.0, "y": 0.0, "width": 300.0, "height": 200.0, "fill": "#FFFFFF" },
+                        { "op": "insert", "as": "rect", "parent": "@board", "kind": "rectangle", "name": "Mover", "x": 10.0, "y": 10.0, "width": 40.0, "height": 40.0, "fill": "#FF0000" }
+                    ]
+                }),
+            )
+            .unwrap();
+        let rect_id = setup["name_to_id"]["rect"].as_u64().unwrap();
+
+        let reply = engine
+            .call(
+                "designos_apply_batch",
+                json!({
+                    "ops": [
+                        { "op": "update", "node": rect_id, "x": 100.0, "y": 10.0 }
+                    ],
+                    "diff_image": true
+                }),
+            )
+            .unwrap();
+
+        let diff = &reply["diff"];
+        assert_eq!(diff["changed_pixels"], 2 * 40 * 40);
+        assert_eq!(diff["changed_bbox"], json!({ "x": 10.0, "y": 10.0, "width": 130.0, "height": 40.0 }));
+        assert_eq!(reply["content"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn move_node_unions_old_and_new_bounds() {
+        move_includes_both_positions();
+    }
+
+    #[test]
+    fn delete_node_captures_before_bounds() {
+        let mut engine = Engine::default();
+        let page = engine.resolve_default_page().unwrap();
+        let setup = engine
+            .call(
+                "designos_apply_batch",
+                json!({
+                    "ops": [
+                        { "op": "insert", "as": "board", "parent": page.0, "kind": "frame", "name": "Board", "x": 0.0, "y": 0.0, "width": 200.0, "height": 200.0, "fill": "#FFFFFF" },
+                        { "op": "insert", "as": "rect", "parent": "@board", "kind": "rectangle", "name": "Target", "x": 40.0, "y": 60.0, "width": 50.0, "height": 30.0, "fill": "#FF0000" }
+                    ]
+                }),
+            )
+            .unwrap();
+        let rect_id = setup["name_to_id"]["rect"].as_u64().unwrap();
+
+        let reply = engine
+            .call(
+                "designos_apply_batch",
+                json!({
+                    "ops": [
+                        { "op": "delete", "node": rect_id }
+                    ],
+                    "diff_image": true
+                }),
+            )
+            .unwrap();
+
+        let diff = &reply["diff"];
+        assert_eq!(diff["changed_pixels"], 50 * 30);
+        assert_eq!(diff["changed_bbox"], json!({ "x": 40.0, "y": 60.0, "width": 50.0, "height": 30.0 }));
+        assert_eq!(reply["content"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn dry_run_diff_leaves_document() {
+        let mut engine = Engine::default();
+        let page = engine.resolve_default_page().unwrap();
+        let setup = engine
+            .call(
+                "designos_apply_batch",
+                json!({
+                    "ops": [
+                        { "op": "insert", "as": "board", "parent": page.0, "kind": "frame", "name": "Board", "x": 0.0, "y": 0.0, "width": 200.0, "height": 200.0, "fill": "#FFFFFF" },
+                        { "op": "insert", "as": "rect", "parent": "@board", "kind": "rectangle", "name": "Target", "x": 10.0, "y": 10.0, "width": 40.0, "height": 40.0, "fill": "#FF0000" }
+                    ]
+                }),
+            )
+            .unwrap();
+        let rect_id = setup["name_to_id"]["rect"].as_u64().unwrap();
+        let before_json = engine.doc.to_json().unwrap();
+        let before_depth = engine.history.undo_depth();
+
+        let reply = engine
+            .call(
+                "designos_apply_batch",
+                json!({
+                    "ops": [
+                        { "op": "update", "node": rect_id, "fill": "#0000FF" }
+                    ],
+                    "dry_run": true,
+                    "diff_image": true
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(reply["dry_run"], true);
+        assert_eq!(reply["diff"]["changed_pixels"], 40 * 40);
+        assert_eq!(reply["content"].as_array().unwrap().len(), 3);
+        assert_eq!(engine.doc.to_json().unwrap(), before_json, "dry_run with diff_image must not mutate document");
+        assert_eq!(engine.history.undo_depth(), before_depth, "dry_run with diff_image must not mutate undo stack");
+    }
+
+    #[test]
+    fn multi_page_batch_caps_at_four_pages() {
+        let mut engine = Engine::default();
+        let p1 = engine.resolve_default_page().unwrap();
+        let p2 = engine.doc.add_page("Page 2");
+        let p3 = engine.doc.add_page("Page 3");
+        let p4 = engine.doc.add_page("Page 4");
+        let p5 = engine.doc.add_page("Page 5");
+        let pages = [p1, p2, p3, p4, p5];
+
+        let mut ops = Vec::new();
+        for (idx, p) in pages.iter().enumerate() {
+            ops.push(json!({
+                "op": "insert",
+                "parent": p.0,
+                "kind": "rectangle",
+                "name": format!("Box {idx}"),
+                "x": 10.0,
+                "y": 10.0,
+                "width": 30.0,
+                "height": 30.0,
+                "fill": "#FF0000"
+            }));
+        }
+
+        let reply = engine
+            .call(
+                "designos_apply_batch",
+                json!({
+                    "ops": ops,
+                    "diff_image": true
+                }),
+            )
+            .unwrap();
+
+        let diff = &reply["diff"];
+        assert_eq!(diff["pages"].as_array().unwrap().len(), 4, "must cap rendered diff pages at 4");
+        assert_eq!(diff["omitted_pages"], 1);
+        assert_eq!(diff["diff_skipped"], "more than 4 pages");
+        assert_eq!(reply["content"].as_array().unwrap().len(), 12, "4 pages * 3 images = 12 content blocks");
     }
 }

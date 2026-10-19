@@ -4,7 +4,7 @@
 pub mod batch;
 pub mod screenshot;
 
-use designos_doc::{Document, Node, NodeId, NodeKind, Rect, TextStyle};
+use designos_doc::{resolve_easeui_color, Document, Node, NodeId, NodeKind, Paint, Rect, TextStyle};
 
 pub(crate) fn bounded_text(field: &str, value: &str, max: usize) -> Result<(), String> {
     if value.len() > max {
@@ -22,6 +22,12 @@ pub(crate) fn geometry(x: f32, y: f32, width: f32, height: f32) -> Result<(), St
         return Err("width and height must be non-negative".into());
     }
     Ok(())
+}
+
+pub(crate) fn validate_fill_color(fill: Option<&str>) -> Result<Option<Paint>, String> {
+    let Some(f) = fill else { return Ok(None) };
+    let c = resolve_easeui_color(f).ok_or_else(|| format!("invalid fill color '{f}'"))?;
+    Ok(Some(Paint::solid(c)))
 }
 
 pub(crate) fn validate_create_fields(
@@ -97,6 +103,8 @@ pub(crate) struct UpdateFields {
     pub height: Option<f32>,
     pub visible: Option<bool>,
     pub opacity: Option<f32>,
+    pub fill: Option<String>,
+    pub fills: Option<Vec<Paint>>,
 }
 
 pub(crate) fn validate_update_fields(u: &UpdateFields) -> Result<(), String> {
@@ -137,6 +145,7 @@ pub(crate) fn validate_update_fields(u: &UpdateFields) -> Result<(), String> {
     if let Some(text) = &u.text {
         bounded_text("text", text, 100_000)?;
     }
+    validate_fill_color(u.fill.as_deref())?;
     Ok(())
 }
 
@@ -171,6 +180,12 @@ pub(crate) fn build_updated_node(doc: &Document, id: NodeId, u: UpdateFields) ->
     if let Some(opacity) = u.opacity {
         node.opacity = opacity;
     }
+    if let Some(paint) = validate_fill_color(u.fill.as_deref())? {
+        node.fills = vec![paint];
+    }
+    if let Some(fills) = u.fills {
+        node.fills = fills;
+    }
     if let Some(text) = u.text {
         let NodeKind::Text(props) = &mut node.kind else {
             return Err("text can only be set on text nodes".into());
@@ -184,4 +199,3 @@ pub(crate) fn build_updated_node(doc: &Document, id: NodeId, u: UpdateFields) ->
     let changed = doc.get(id) != Some(&node);
     Ok((node, changed))
 }
->>>>>>> .merge_file_0HmEXu

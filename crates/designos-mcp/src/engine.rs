@@ -132,14 +132,19 @@ impl Engine {
             "designos_create_node" => self.create(parse(args)?),
             "designos_update_node" => self.update(parse(args)?),
             "designos_delete_node" => {
-                let a: NodeArgs = parse(args)?;
+                let a: DeleteArgs = parse(args)?;
                 let n = self.node(a.node_id)?;
                 if n.parent.is_none() {
                     return Err("page roots cannot be deleted by this tool".into());
                 }
                 let id = n.id;
+                let before_doc = a.diff_image.then(|| self.doc.clone());
                 self.exec(Command::Remove { id })?;
-                Ok(json!({"node_id":id,"deleted":true}))
+                let mut out = json!({"node_id":id,"deleted":true});
+                if let Some(before) = &before_doc {
+                    crate::tools::screenshot::attach_diff_to_reply(before, &self.doc, &[id], &mut out);
+                }
+                Ok(out)
             }
             "designos_list_comments" => {
                 let a: ListCommentsArgs = parse(args)?;
@@ -262,6 +267,7 @@ impl Engine {
                 if !self.node(parent.0)?.kind.is_container() {
                     return Err("parent_id must identify a container".into());
                 }
+                let before_doc = a.diff_image.then(|| self.doc.clone());
                 let mut trial = self.doc.clone();
                 let root_id = trial.apply_spec(parent, &a.spec)?;
                 let mut nodes = Vec::new();
@@ -269,7 +275,11 @@ impl Engine {
                 let index = self.doc.get(parent).ok_or("parent not found")?.children.len();
                 self.exec(Command::Insert { parent, index, nodes })?;
                 self.relayout(parent);
-                Ok(json!({"root_node_id": root_id, "parent_id": parent.0, "node": self.doc.get(root_id), "changed": true}))
+                let mut out = json!({"root_node_id": root_id, "parent_id": parent.0, "node": self.doc.get(root_id), "changed": true});
+                if let Some(before) = &before_doc {
+                    crate::tools::screenshot::attach_diff_to_reply(before, &self.doc, &[root_id], &mut out);
+                }
+                Ok(out)
             }
             "designos_export_spec" => {
                 let a: NodeArgs = parse(args)?;
@@ -450,28 +460,59 @@ impl Engine {
             }
             None => self.resolve_default_page()?,
         };
-        let (id, index, node) = crate::tools::build_created_node(&mut self.doc, parent_id, None, &a.kind, a.name, a.text, a.x, a.y, a.width, a.height)?;
+        if let Some(fill_str) = &a.fill {
+            designos_doc::resolve_easeui_color(fill_str).ok_or_else(|| format!("invalid fill color '{fill_str}'"))?;
+        }
+        let before_doc = a.diff_image.then(|| self.doc.clone());
+        let (id, index, mut node) = crate::tools::build_created_node(&mut self.doc, parent_id, None, &a.kind, a.name, a.text, a.x, a.y, a.width, a.height)?;
+        if let Some(fills) = a.fills {
+            node.fills = fills;
+        } else if let Some(fill_str) = &a.fill {
+            if let Some(color) = designos_doc::resolve_easeui_color(fill_str) {
+                node.fills = vec![designos_doc::Paint::solid(color)];
+            }
+        }
         self.exec(Command::Insert { parent: parent_id, index, nodes: vec![node] })?;
         if let Some(page_id) = self.doc.page_of(id) {
             self.relayout(page_id);
         }
-        Ok(json!({"node":self.doc.get(id),"parent_id":parent_id.0,"changed":true}))
+        let mut out = json!({"node":self.doc.get(id),"parent_id":parent_id.0,"changed":true});
+        if let Some(before) = &before_doc {
+            crate::tools::screenshot::attach_diff_to_reply(before, &self.doc, &[id], &mut out);
+        }
+        Ok(out)
     }
 
     fn update(&mut self, a: UpdateArgs) -> Result<Value, String> {
         let (node, changed) = crate::tools::build_updated_node(
             &self.doc,
             NodeId(a.node_id),
-            crate::tools::UpdateFields { name: a.name, text: a.text, x: a.x, y: a.y, width: a.width, height: a.height, visible: a.visible, opacity: a.opacity },
+            crate::tools::UpdateFields {
+                name: a.name,
+                text: a.text,
+                x: a.x,
+                y: a.y,
+                width: a.width,
+                height: a.height,
+                visible: a.visible,
+                opacity: a.opacity,
+                fill: a.fill,
+                fills: a.fills,
+            },
         )?;
         let id = node.id;
+        let before_doc = a.diff_image.then(|| self.doc.clone());
         if changed {
             self.exec(Command::Update { node: Box::new(node) })?;
             if let Some(page_id) = self.doc.page_of(id) {
                 self.relayout(page_id);
             }
         }
-        Ok(json!({"node":self.doc.get(NodeId(a.node_id)),"changed":changed}))
+        let mut out = json!({"node":self.doc.get(NodeId(a.node_id)),"changed":changed});
+        if let Some(before) = &before_doc {
+            crate::tools::screenshot::attach_diff_to_reply(before, &self.doc, &[id], &mut out);
+        }
+        Ok(out)
     }
 }
 
@@ -502,6 +543,13 @@ struct Empty {}
 #[serde(deny_unknown_fields)]
 struct NodeArgs {
     node_id: u64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteArgs {
+    node_id: u64,
+    #[serde(default)]
+    diff_image: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -540,6 +588,12 @@ struct CreateArgs {
     width: f32,
     #[serde(default = "default_size")]
     height: f32,
+    #[serde(default)]
+    fill: Option<String>,
+    #[serde(default)]
+    fills: Option<Vec<designos_doc::Paint>>,
+    #[serde(default)]
+    diff_image: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -553,6 +607,12 @@ struct UpdateArgs {
     height: Option<f32>,
     visible: Option<bool>,
     opacity: Option<f32>,
+    #[serde(default)]
+    fill: Option<String>,
+    #[serde(default)]
+    fills: Option<Vec<designos_doc::Paint>>,
+    #[serde(default)]
+    diff_image: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -593,6 +653,8 @@ struct ResolveCommentArgs {
 struct ApplySpecArgs {
     parent_id: Option<u64>,
     spec: NodeSpec,
+    #[serde(default)]
+    diff_image: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -669,13 +731,13 @@ pub fn tools() -> Vec<Value> {
         true,
     );
     add("create_node","Create one layer in a container; defaults to x/y=0, width/height=100. Supports undo. Text is only valid for text layers. Changes are in memory until saved.",
-        json!({"parent_id":id,"kind":{"type":"string","enum":["frame","rectangle","ellipse","text"]},"name":name,"text":text,"x":coordinate,"y":coordinate,"width":size,"height":size}),vec!["parent_id","kind"],false,false);
+        json!({"parent_id":id,"kind":{"type":"string","enum":["frame","rectangle","ellipse","text"]},"name":name,"text":text,"x":coordinate,"y":coordinate,"width":size,"height":size,"fill":{"type":"string","maxLength":1024},"fills":{"type":"array","items":{"type":"object"}},"diff_image":{"type":"boolean","default":false}}),vec!["parent_id","kind"],false,false);
     add("update_node","Update specified fields of one non-page layer. Coordinates are parent-relative. Replacing text clears text runs and list ranges. Supports undo; changes remain in memory until saved.",
-        json!({"node_id":id,"name":name,"text":text,"x":coordinate,"y":coordinate,"width":size,"height":size,"visible":{"type":"boolean"},"opacity":{"type":"number","minimum":0,"maximum":1}}),vec!["node_id"],false,true);
+        json!({"node_id":id,"name":name,"text":text,"x":coordinate,"y":coordinate,"width":size,"height":size,"visible":{"type":"boolean"},"opacity":{"type":"number","minimum":0,"maximum":1},"fill":{"type":"string","maxLength":1024},"fills":{"type":"array","items":{"type":"object"}},"diff_image":{"type":"boolean","default":false}}),vec!["node_id"],false,true);
     add(
         "delete_node",
         "Remove a non-page layer and its entire subtree. Supports undo; changes remain in memory until saved.",
-        json!({"node_id":id}),
+        json!({"node_id":id,"diff_image":{"type":"boolean","default":false}}),
         vec!["node_id"],
         false,
         false,
@@ -715,7 +777,7 @@ pub fn tools() -> Vec<Value> {
     add(
         "apply_spec",
         "Build a complete UI subtree from a declarative NodeSpec (supports EaseUI BrainWave 2.0 presets like easeui-screen/easeui-card/easeui-button-primary, $easeui.* tokens, and Auto-Layout 5.0 row/column/wrap/hug/fill) in a single atomic undoable step.",
-        json!({"parent_id":id,"spec":{"type":"object","description":"Declarative NodeSpec tree (kind, name, preset, width, height, width_sizing, height_sizing, fill, stroke, corner_radius, text, font_size, layout, dev_status, annotations, children)."}}),
+        json!({"parent_id":id,"spec":{"type":"object","description":"Declarative NodeSpec tree (kind, name, preset, width, height, width_sizing, height_sizing, fill, stroke, corner_radius, text, font_size, layout, dev_status, annotations, children)."},"diff_image":{"type":"boolean","default":false}}),
         vec!["spec"],
         false,
         false,
