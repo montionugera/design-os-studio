@@ -201,35 +201,153 @@ impl Document {
     }
 }
 
+/// Origin of an undo step for [`History::fold_since`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StepOrigin {
+    #[default]
+    Unspecified,
+    Agent,
+    User,
+}
+
+/// Metadata attached to a single step on [`History`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UndoStepMeta {
+    pub origin: StepOrigin,
+    pub label: Option<String>,
+}
+
 /// Linear undo stack.
 #[derive(Default)]
 pub struct History {
     undo: Vec<Command>,
     redo: Vec<Command>,
+    undo_meta: Vec<UndoStepMeta>,
+    redo_meta: Vec<UndoStepMeta>,
 }
 
 impl History {
     pub fn exec(&mut self, doc: &mut Document, cmd: Command) -> Result<(), DocError> {
         let inv = cmd.apply(doc)?;
         self.undo.push(inv);
+        self.undo_meta.push(UndoStepMeta::default());
         self.redo.clear();
+        self.redo_meta.clear();
         Ok(())
     }
+
+    /// Executes an edit originating from an agent tool call (`live_patch_apply`) so
+    /// [`Self::fold_since`] can fold the contiguous agent tail on stop without folding
+    /// intervening user edits.
+    pub fn exec_agent(&mut self, doc: &mut Document, cmd: Command) -> Result<(), DocError> {
+        let inv = cmd.apply(doc)?;
+        self.undo.push(inv);
+        self.undo_meta.push(UndoStepMeta { origin: StepOrigin::Agent, label: None });
+        self.redo.clear();
+        self.redo_meta.clear();
+        Ok(())
+    }
+
+    /// Executes an edit explicitly marked as a user edit.
+    pub fn exec_user(&mut self, doc: &mut Document, cmd: Command) -> Result<(), DocError> {
+        let inv = cmd.apply(doc)?;
+        self.undo.push(inv);
+        self.undo_meta.push(UndoStepMeta { origin: StepOrigin::User, label: None });
+        self.redo.clear();
+        self.redo_meta.clear();
+        Ok(())
+    }
+
+    /// Marks the most recently pushed undo step as an agent step.
+    pub fn mark_last_undo_as_agent(&mut self) {
+        self.sync_meta_lengths();
+        if let Some(m) = self.undo_meta.last_mut() {
+            m.origin = StepOrigin::Agent;
+        }
+    }
+
+    /// Marks the most recently pushed undo step as a user step.
+    pub fn mark_last_undo_as_user(&mut self) {
+        self.sync_meta_lengths();
+        if let Some(m) = self.undo_meta.last_mut() {
+            m.origin = StepOrigin::User;
+        }
+    }
+
+    /// Label of the step [`Self::undo`] would apply next, if one was set (e.g. `"Agent turn (stopped)"`).
+    pub fn undo_label(&self) -> Option<&str> {
+        self.undo_meta.get(self.undo.len().checked_sub(1)?).and_then(|m| m.label.as_deref())
+    }
+
+    /// Label of the step [`Self::redo`] would apply next, if one was set.
+    pub fn redo_label(&self) -> Option<&str> {
+        self.redo_meta.get(self.redo.len().checked_sub(1)?).and_then(|m| m.label.as_deref())
+    }
+
+    fn sync_meta_lengths(&mut self) {
+        self.undo_meta.resize_with(self.undo.len(), UndoStepMeta::default);
+        self.redo_meta.resize_with(self.redo.len(), UndoStepMeta::default);
+    }
+
+    /// Folds the contiguous agent steps on top of the undo stack since `depth` into one
+    /// [`Command::Batch`] step labelled `label`, returning the number of folded steps (`#684`).
+    ///
+    /// Stops at the first step in `depth..` (walking from the top of the undo stack downward)
+    /// that is a user edit. Refuses and returns `0` when the redo stack is not empty or when
+    /// no foldable steps exist above `depth`.
+    pub fn fold_since(&mut self, depth: usize, label: impl Into<String>) -> usize {
+        if !self.redo.is_empty() || depth >= self.undo.len() {
+            return 0;
+        }
+        self.sync_meta_lengths();
+        let has_explicit_agent = self.undo_meta[depth..].iter().any(|m| m.origin == StepOrigin::Agent);
+        let is_foldable = |m: &UndoStepMeta| {
+            if has_explicit_agent {
+                m.origin == StepOrigin::Agent
+            } else {
+                m.origin != StepOrigin::User
+            }
+        };
+        let mut fold_start = self.undo.len();
+        while fold_start > depth && is_foldable(&self.undo_meta[fold_start - 1]) {
+            fold_start -= 1;
+        }
+        let folded_count = self.undo.len() - fold_start;
+        if folded_count == 0 {
+            return 0;
+        }
+        let mut tail: Vec<Command> = self.undo.drain(fold_start..).collect();
+        self.undo_meta.truncate(fold_start);
+        // Each step on `self.undo` is an inverse command pushed in execution order (oldest first).
+        // `Command::Batch::apply` executes its children front-to-back, so reversing `tail` applies
+        // the newest inverse first and the oldest inverse last when undoing the folded batch.
+        tail.reverse();
+        self.undo.push(Command::Batch(tail));
+        self.undo_meta.push(UndoStepMeta { origin: StepOrigin::Agent, label: Some(label.into()) });
+        folded_count
+    }
+
     /// Reverts the latest step. Any deferred auto-layout queue from the superseded edit is dropped
     /// before applying the inverse command, and affected auto-layout containers are re-solved from
     /// their restored state so descendants return to the pre-edit layout.
     pub fn undo(&mut self, doc: &mut Document) -> Result<bool, DocError> {
+        self.sync_meta_lengths();
         let Some(c) = self.undo.pop() else { return Ok(false) };
+        let meta = self.undo_meta.pop().unwrap_or_default();
         let inv = apply_and_relayout(doc, c)?;
         self.redo.push(inv);
+        self.redo_meta.push(meta);
         Ok(true)
     }
     /// Re-applies the latest undone step, dropping any superseded queue and re-solving affected
     /// auto-layout containers from their restored state, like [`Self::undo`].
     pub fn redo(&mut self, doc: &mut Document) -> Result<bool, DocError> {
+        self.sync_meta_lengths();
         let Some(c) = self.redo.pop() else { return Ok(false) };
+        let meta = self.redo_meta.pop().unwrap_or_default();
         let inv = apply_and_relayout(doc, c)?;
         self.undo.push(inv);
+        self.undo_meta.push(meta);
         Ok(true)
     }
     /// The command [`Self::undo`] would apply next.
@@ -251,6 +369,7 @@ impl History {
     /// reverted another way (by restoring a snapshot of the document).
     pub fn drop_undo_steps_after(&mut self, depth: usize) {
         self.undo.truncate(depth);
+        self.undo_meta.truncate(depth);
     }
     /// The steps [`Self::redo`] can take, oldest first, for [`Self::restore_redo`].
     pub fn redo_steps(&self) -> Vec<Command> {
@@ -258,7 +377,9 @@ impl History {
     }
     /// Puts back the redo steps an edit cleared, for an edit the caller reverted another way.
     pub fn restore_redo(&mut self, steps: Vec<Command>) {
+        let len = steps.len();
         self.redo = steps;
+        self.redo_meta.resize_with(len, UndoStepMeta::default);
     }
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
@@ -805,6 +926,85 @@ mod tests {
         assert_eq!(d.get(pid).unwrap().children, vec![rid]);
         h.undo(&mut d).unwrap();
         assert_eq!(d.pages, vec![p1]);
+    }
+
+    #[test]
+    fn fold_since_makes_the_tail_one_undo_step() {
+        let doc_hash = |doc: &Document| -> String {
+            serde_json::to_string(&(&doc.name, &doc.kind, &doc.nodes, &doc.pages, &doc.styles, &doc.flows, &doc.variables)).unwrap()
+        };
+        let mut d = Document::new("t");
+        let page = d.add_page("P1");
+        let mut h = History::default();
+
+        // Pre-turn user edit at depth 1.
+        let r0 = d.alloc_id();
+        h.exec_user(&mut d, Command::Insert { parent: page, index: 0, nodes: vec![Node::rectangle(r0, Rect::new(0.0, 0.0, 20.0, 20.0))] }).unwrap();
+        let start_depth = h.undo_depth();
+        assert_eq!(start_depth, 1);
+        let start_hash = doc_hash(&d);
+
+        // Three agent steps during the turn: insert r1, update r1 name, insert r2.
+        let r1 = d.alloc_id();
+        h.exec_agent(&mut d, Command::Insert { parent: page, index: 1, nodes: vec![Node::rectangle(r1, Rect::new(30.0, 0.0, 40.0, 40.0))] }).unwrap();
+        let mut r1_updated = d.get(r1).unwrap().clone();
+        r1_updated.name = "Agent Card".into();
+        h.exec_agent(&mut d, Command::Update { node: Box::new(r1_updated) }).unwrap();
+        let r2 = d.alloc_id();
+        h.exec_agent(&mut d, Command::Insert { parent: page, index: 2, nodes: vec![Node::rectangle(r2, Rect::new(80.0, 0.0, 40.0, 40.0))] }).unwrap();
+        assert_eq!(h.undo_depth(), start_depth + 3);
+        let after_turn_hash = doc_hash(&d);
+
+        let folded = h.fold_since(start_depth, "Agent turn (stopped)");
+        assert_eq!(folded, 3);
+        assert_eq!(h.undo_depth(), start_depth + 1);
+        assert_eq!(h.undo_label(), Some("Agent turn (stopped)"));
+
+        // One undo restores the exact document state at turn start.
+        assert!(h.undo(&mut d).unwrap());
+        assert_eq!(doc_hash(&d), start_hash);
+        assert_eq!(h.redo_label(), Some("Agent turn (stopped)"));
+
+        // One redo reapplies all 3 steps together.
+        assert!(h.redo(&mut d).unwrap());
+        assert_eq!(doc_hash(&d), after_turn_hash);
+    }
+
+    #[test]
+    fn fold_stops_at_a_user_step() {
+        let mut d = Document::new("t");
+        let page = d.add_page("P1");
+        let mut h = History::default();
+        let start_depth = h.undo_depth();
+
+        // Agent step 1 before user edit.
+        let a1 = d.alloc_id();
+        h.exec_agent(&mut d, Command::Insert { parent: page, index: 0, nodes: vec![Node::rectangle(a1, Rect::new(0.0, 0.0, 10.0, 10.0))] }).unwrap();
+
+        // User edit in between.
+        let u1 = d.alloc_id();
+        h.exec_user(&mut d, Command::Insert { parent: page, index: 1, nodes: vec![Node::rectangle(u1, Rect::new(20.0, 0.0, 10.0, 10.0))] }).unwrap();
+
+        // Contiguous agent tail (2 steps) after user edit.
+        let a2 = d.alloc_id();
+        h.exec_agent(&mut d, Command::Insert { parent: page, index: 2, nodes: vec![Node::rectangle(a2, Rect::new(40.0, 0.0, 10.0, 10.0))] }).unwrap();
+        let a3 = d.alloc_id();
+        h.exec_agent(&mut d, Command::Insert { parent: page, index: 3, nodes: vec![Node::rectangle(a3, Rect::new(60.0, 0.0, 10.0, 10.0))] }).unwrap();
+        assert_eq!(h.undo_depth(), 4);
+
+        // Fold stops at the user edit: only the 2 contiguous tail agent steps fold.
+        let folded = h.fold_since(start_depth, "Agent turn (stopped)");
+        assert_eq!(folded, 2);
+        assert_eq!(h.undo_depth(), 3, "a1 (1) + u1 (1) + folded(a2,a3) (1) = 3 steps");
+
+        // Undoing once removes a2 and a3 together while keeping u1 and a1.
+        assert!(h.undo(&mut d).unwrap());
+        assert!(d.get(a2).is_none() && d.get(a3).is_none());
+        assert!(d.get(u1).is_some() && d.get(a1).is_some());
+
+        // Undoing again removes the user step u1 while keeping a1.
+        assert!(h.undo(&mut d).unwrap());
+        assert!(d.get(u1).is_none() && d.get(a1).is_some());
     }
 }
 

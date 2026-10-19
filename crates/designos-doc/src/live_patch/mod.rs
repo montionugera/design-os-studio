@@ -15,7 +15,7 @@ mod validate;
 pub use record::live_ops_for_command;
 pub use replay::{replay_live_patch, LivePatchReport, LivePatchState};
 
-use crate::{Comment, CommentAnchor, CommentThread, Node, NodeId};
+use crate::{Comment, CommentAnchor, CommentThread, InProgress, Node, NodeId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -168,6 +168,14 @@ pub enum LiveOp {
         changed: Vec<ThreadChange>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         removed: Vec<String>,
+    },
+    /// Sets or clears a transient work-in-progress flag on `node` without creating a [`Command`](crate::Command)
+    /// or undo step (`E15-7` / `#592`).
+    SetInProgress {
+        #[serde(alias = "id")]
+        node: NodeId,
+        #[serde(default, alias = "value", skip_serializing_if = "Option::is_none")]
+        state: Option<InProgress>,
     },
 }
 
