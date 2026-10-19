@@ -1,8 +1,6 @@
 //! Typed, local document operations shared by the MCP transport and future bridges.
 use designos_doc::live_patch::{live_ops_for_command, LiveOp};
-use designos_doc::{
-    Annotation, Command, Comment, CommentAnchor, CommentThread, DevStatus, Document, History, Node, NodeId, NodeKind, NodeSpec, Rect, TextStyle, Vec2,
-};
+use designos_doc::{Annotation, Command, Comment, CommentAnchor, CommentThread, DevStatus, Document, History, Node, NodeId, NodeKind, NodeSpec, Vec2};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 
@@ -13,13 +11,17 @@ pub struct Engine {
     /// Edits executed since the last [`Engine::take_live_ops`], recorded while an open editor
     /// mirrors this session (`None` = not recording).
     pub live_ops: Option<Vec<LiveOp>>,
+    /// Undo-group label attached to the next [`designos_doc::live_patch::LivePatch`] line when set.
+    pub live_patch_label: Option<String>,
+    /// Optional RD-3 frame ownership lock: when `Some`, writes outside these root frames are refused.
+    pub owned_frames: Option<Vec<NodeId>>,
 }
 
 impl Default for Engine {
     fn default() -> Self {
         let mut doc = Document::new("Untitled");
         let page = doc.add_page("Page 1");
-        Self { doc, history: History::default(), active_page_id: Some(page), live_ops: None }
+        Self { doc, history: History::default(), active_page_id: Some(page), live_ops: None, live_patch_label: None, owned_frames: None }
     }
 }
 
@@ -41,12 +43,43 @@ impl Engine {
         match name {
             "designos_get_document" => {
                 let _: Empty = parse(args)?;
+                let in_progress_nodes: Vec<Value> = self
+                    .doc
+                    .in_progress
+                    .keys()
+                    .copied()
+                    .filter_map(|id| {
+                        let ip = self.doc.get_in_progress(id)?;
+                        Some(json!({
+                            "node_id": id.0,
+                            "name": self.doc.get(id).map(|n| n.name.as_str()).unwrap_or(""),
+                            "run_id": ip.run_id,
+                            "agent": ip.agent,
+                            "since_ms": ip.since_ms,
+                            "stale_after_s": ip.stale_after_s,
+                            "status": ip.status,
+                        }))
+                    })
+                    .collect();
+                let in_progress_map: serde_json::Map<String, Value> = self
+                    .doc
+                    .in_progress
+                    .keys()
+                    .copied()
+                    .filter_map(|id| {
+                        let ip = self.doc.get_in_progress(id)?;
+                        Some((id.0.to_string(), serde_json::to_value(ip).ok()?))
+                    })
+                    .collect();
                 Ok(json!({"name":self.doc.name,"kind":self.doc.kind,
                     "active_page_id":self.resolve_default_page().ok().map(|p| p.0),
-                    "pages":self.doc.pages.iter().filter_map(|id|self.doc.get(*id)).map(summary).collect::<Vec<_>>(),
+                    "pages":self.doc.pages.iter().filter_map(|id|self.doc.get(*id)).map(|n| summary(&self.doc, n)).collect::<Vec<_>>(),
                     "node_count":self.doc.nodes.len(),"variable_count":self.doc.variables.len(),
                     "comment_count":self.doc.comments.len(),
                     "style_count":self.doc.styles.len(),
+                    "in_progress_count":in_progress_nodes.len(),
+                    "in_progress_nodes":in_progress_nodes,
+                    "in_progress":in_progress_map,
                     "styles":self.doc.styles.iter().map(|(key,values)|{
                         let meta=self.doc.style_meta.get(key);
                         json!({"key":key,"name":self.doc.style_name(key),"property":designos_doc::style_property(&self.doc,key),
@@ -72,14 +105,24 @@ impl Engine {
                     .values()
                     .filter(|n| a.parent_id.is_none_or(|id| n.parent == Some(NodeId(id))) && n.name.to_lowercase().contains(&query))
                     .collect();
-                let nodes: Vec<_> = matching.iter().skip(a.offset).take(a.limit).map(|n| summary(n)).collect();
+                let nodes: Vec<_> = matching.iter().skip(a.offset).take(a.limit).map(|n| summary(&self.doc, n)).collect();
                 let next = a.offset.saturating_add(nodes.len());
                 Ok(json!({"nodes":nodes,"total":matching.len(),"offset":a.offset,
                     "next_offset":(next < matching.len()).then_some(next)}))
             }
             "designos_get_node" => {
                 let a: NodeArgs = parse(args)?;
-                Ok(json!({"node":self.node(a.node_id)?}))
+                let n = self.node(a.node_id)?;
+                let mut node_val = serde_json::to_value(n).map_err(|e| e.to_string())?;
+                let ip = self.doc.get_in_progress(n.id).cloned();
+                if let (Some(obj), Some(ip_ref)) = (node_val.as_object_mut(), &ip) {
+                    obj.insert("in_progress".into(), serde_json::to_value(ip_ref).map_err(|e| e.to_string())?);
+                }
+                let mut out = json!({"node": node_val});
+                if let (Some(obj), Some(ip_val)) = (out.as_object_mut(), ip) {
+                    obj.insert("in_progress".into(), serde_json::to_value(ip_val).map_err(|e| e.to_string())?);
+                }
+                Ok(out)
             }
             "designos_get_variables" => {
                 let a: VariablesArgs = parse(args)?;
@@ -265,6 +308,12 @@ impl Engine {
                 trial.walk(root_id, |n, _| nodes.push(n.clone()));
                 let index = self.doc.get(parent).ok_or("parent not found")?.children.len();
                 self.exec(Command::Insert { parent, index, nodes })?;
+                for (id, ip) in &trial.in_progress {
+                    if self.doc.in_progress.get(id) != Some(ip) {
+                        self.doc.set_in_progress(*id, Some(ip.clone()));
+                        self.record(vec![LiveOp::SetInProgress { node: *id, state: Some(ip.clone()) }]);
+                    }
+                }
                 self.relayout(parent);
                 Ok(json!({"root_node_id": root_id, "parent_id": parent.0, "node": self.doc.get(root_id), "changed": true}))
             }
@@ -294,6 +343,126 @@ impl Engine {
                 self.exec(Command::Update { node: Box::new(node) })?;
                 Ok(json!({"node_id": a.node_id, "dev": self.doc.get(NodeId(a.node_id)).map(|n| &n.dev), "changed": true}))
             }
+            "designos_set_in_progress" | "set_in_progress" => {
+                let a: SetInProgressArgs = parse(args)?;
+                if let Some(key) = &a.idempotency_key {
+                    bounded_text("idempotency_key", key, 128)?;
+                }
+                if let Some(agent) = &a.agent {
+                    bounded_text("agent", agent, 256)?;
+                }
+                if let Some(status) = &a.status {
+                    bounded_text("status", status, 512)?;
+                }
+                if let Some(run_id) = &a.run_id {
+                    bounded_text("run_id", run_id, 256)?;
+                }
+                if let Some(stale) = a.stale_after_s {
+                    if !(60..=86_400).contains(&stale) {
+                        return Err("stale_after_s must be between 60 and 86400".into());
+                    }
+                }
+                let flag = a.value.or(a.in_progress).ok_or_else(|| "missing required boolean field 'value'".to_string())?;
+                let mut ids = a.node_ids.unwrap_or_default();
+                if let Some(single) = a.node_id {
+                    if !ids.contains(&single) {
+                        ids.push(single);
+                    }
+                }
+                if ids.is_empty() {
+                    return Err("node_ids must contain at least 1 node ID".into());
+                }
+                if ids.len() > 200 {
+                    return Err("node_ids must contain at most 200 node IDs".into());
+                }
+                let effective_run_id = a
+                    .run_id
+                    .as_ref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| std::env::var("DESIGNOS_AGENT_RUN_ID").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+                let effective_agent = a
+                    .agent
+                    .as_ref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| std::env::var("DESIGNOS_AGENT_RUNTIME").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+                    .or_else(|| std::env::var("DESIGNOS_AGENT_NAME").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+                let effective_status = a.status.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
+                // Pre-validate every target node before mutating any state.
+                for &raw_id in &ids {
+                    if raw_id == 0 || self.doc.get(NodeId(raw_id)).is_none() {
+                        return Err(serde_json::to_string(&json!({
+                            "code": "NODE_NOT_FOUND",
+                            "node_id": raw_id,
+                            "message": format!("node {raw_id} not found"),
+                            "safe_to_retry": true
+                        }))
+                        .unwrap());
+                    }
+                    let id = NodeId(raw_id);
+                    if flag {
+                        if let Err(root_opt) = self.doc.is_in_progress_root(id) {
+                            let valid_options: Vec<u64> = root_opt.into_iter().map(|r| r.0).collect();
+                            return Err(serde_json::to_string(&json!({
+                                "code": "IN_PROGRESS_TARGET_NOT_ROOT",
+                                "node_id": raw_id,
+                                "root_frame_id": root_opt.map(|r| r.0),
+                                "valid_options": valid_options,
+                                "message": match root_opt {
+                                    Some(r) => format!("node {raw_id} is not a root frame; target root frame {} instead", r.0),
+                                    None => format!("node {raw_id} is not a root frame"),
+                                },
+                                "safe_to_retry": true
+                            }))
+                            .unwrap());
+                        }
+                        if !a.force {
+                            if let Some(existing) = self.doc.get_in_progress(id) {
+                                if let Some(ex_run) = &existing.run_id {
+                                    if effective_run_id.as_deref() != Some(ex_run.as_str()) {
+                                        return Err(serde_json::to_string(&json!({
+                                            "code": "NODE_IN_PROGRESS_BY_OTHER_RUN",
+                                            "node_id": raw_id,
+                                            "existing_run_id": ex_run,
+                                            "existing_agent": existing.agent,
+                                            "message": format!("node {raw_id} is already flagged in_progress by run '{ex_run}'"),
+                                            "next_step": "Pass force:true only when the other run is known dead.",
+                                            "safe_to_retry": true
+                                        }))
+                                        .unwrap());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut updated = Vec::with_capacity(ids.len());
+                let mut any_changed = false;
+                let now = designos_doc::now_ms();
+                for &raw_id in &ids {
+                    let id = NodeId(raw_id);
+                    let state = flag.then(|| designos_doc::InProgress {
+                        run_id: effective_run_id.clone(),
+                        agent: effective_agent.clone(),
+                        since_ms: now,
+                        stale_after_s: a.stale_after_s,
+                        status: effective_status.clone(),
+                    });
+                    let prev = self.doc.set_in_progress(id, state.clone());
+                    if prev != state {
+                        any_changed = true;
+                        self.record(vec![LiveOp::SetInProgress { node: id, state }]);
+                    }
+                    updated.push(json!({"node_id": raw_id, "in_progress": flag}));
+                }
+                Ok(json!({
+                    "updated": updated,
+                    "changed": any_changed
+                }))
+            }
             "designos_export_fig_file" | "export_fig_file" => {
                 let a: ExportFigArgs = parse(args)?;
                 let path = std::path::Path::new(&a.output_path);
@@ -309,6 +478,7 @@ impl Engine {
                 let root = a.page_id.map(NodeId).or_else(|| self.resolve_default_page().ok());
                 let selector = a.selector.trim();
                 let mut matches = Vec::new();
+                let doc = &self.doc;
                 let mut visit = |n: &Node| {
                     let kind_upper = n.kind.default_name().to_ascii_uppercase();
                     let matched = if selector.is_empty() || selector == "//*" || selector == "*" {
@@ -334,7 +504,7 @@ impl Engine {
                         n.name.to_lowercase().contains(&selector.to_lowercase()) || kind_upper == selector.to_ascii_uppercase()
                     };
                     if matched {
-                        matches.push(summary(n));
+                        matches.push(summary(doc, n));
                     }
                 };
                 if let Some(r) = root {
@@ -373,6 +543,7 @@ impl Engine {
                 let count = findings.len();
                 Ok(json!({"page_id": root.map(|r| r.0), "findings": findings, "total": count, "passed": count == 0}))
             }
+            "designos_apply_batch" => crate::tools::batch::apply(self, args),
             "designos_undo" | "designos_redo" => {
                 let _: Empty = parse(args)?;
                 let undo = name == "designos_undo";
@@ -382,6 +553,7 @@ impl Engine {
                     None => Vec::new(),
                 };
                 let changed = if undo { self.history.undo(&mut self.doc) } else { self.history.redo(&mut self.doc) }.map_err(|e| e.to_string())?;
+                self.doc.prune_in_progress();
                 // Undo and redo defer a deep layout tail to later frames; this engine has no frames.
                 self.settle_layout();
                 self.record(ops);
@@ -394,7 +566,7 @@ impl Engine {
     /// Re-solves auto layout under `root` and finishes what the pass had to defer. The editor
     /// drains deferred layout a step per frame; this engine has no window, and its document is
     /// read, saved and exported as is.
-    fn relayout(&mut self, root: NodeId) {
+    pub(crate) fn relayout(&mut self, root: NodeId) {
         self.doc.relayout_subtree(root);
         self.doc.flush_pending_relayout();
     }
@@ -405,14 +577,14 @@ impl Engine {
         self.doc.flush_pending_relayout();
     }
 
-    fn node(&self, id: u64) -> Result<&Node, String> {
+    pub(crate) fn node(&self, id: u64) -> Result<&Node, String> {
         if id == 0 {
             return Err("node IDs must be positive integers".into());
         }
         self.doc.get(NodeId(id)).ok_or_else(|| format!("node {id} not found"))
     }
 
-    fn exec(&mut self, command: Command) -> Result<(), String> {
+    pub(crate) fn exec(&mut self, command: Command) -> Result<(), String> {
         let ops = self.live_ops_for(&command)?;
         self.history.exec(&mut self.doc, command).map_err(|e| e.to_string())?;
         self.record(ops);
@@ -420,14 +592,14 @@ impl Engine {
     }
 
     /// The ops `command` will perform, when recording; refuses edits the editor cannot replay.
-    fn live_ops_for(&self, command: &Command) -> Result<Vec<LiveOp>, String> {
+    pub(crate) fn live_ops_for(&self, command: &Command) -> Result<Vec<LiveOp>, String> {
         if self.live_ops.is_none() {
             return Ok(Vec::new());
         }
         live_ops_for_command(&self.doc, command)
     }
 
-    fn record(&mut self, ops: Vec<LiveOp>) {
+    pub(crate) fn record(&mut self, ops: Vec<LiveOp>) {
         if let Some(log) = &mut self.live_ops {
             log.extend(ops);
         }
@@ -446,40 +618,7 @@ impl Engine {
             }
             None => self.resolve_default_page()?,
         };
-        let parent = self.node(parent_id.0)?;
-        if !parent.kind.is_container() {
-            return Err("parent_id must identify a container".into());
-        }
-        let index = parent.children.len();
-        geometry(a.x, a.y, a.width, a.height)?;
-        if let Some(name) = &a.name {
-            bounded_text("name", name, 1024)?;
-        }
-        if let Some(text) = &a.text {
-            bounded_text("text", text, 100_000)?;
-        }
-        if a.kind != "text" && a.text.is_some() {
-            return Err("text can only be set on text nodes".into());
-        }
-        let rect = Rect::new(a.x, a.y, a.width, a.height);
-        // Allocate only after every argument has passed validation.
-        let constructor: fn(NodeId, Rect) -> Node = match a.kind.as_str() {
-            "frame" => Node::frame,
-            "rectangle" => Node::rectangle,
-            "ellipse" => Node::ellipse,
-            "text" => |id, r| Node::text(id, r, "", TextStyle::default()),
-            _ => return Err("kind must be frame, rectangle, ellipse, or text".into()),
-        };
-        // Imported native files may carry a stale allocation counter. Derive a
-        // fresh ID from the actual nodes instead of risking an overwrite.
-        let id = self.doc.try_alloc_id().ok_or("Document has exhausted node IDs")?;
-        let mut node = constructor(id, rect);
-        if let Some(name) = a.name {
-            node.name = name;
-        }
-        if let (Some(text), NodeKind::Text(props)) = (a.text, &mut node.kind) {
-            props.content = text;
-        }
+        let (id, index, node) = crate::tools::build_created_node(&mut self.doc, parent_id, None, &a.kind, a.name, a.text, a.x, a.y, a.width, a.height)?;
         self.exec(Command::Insert { parent: parent_id, index, nodes: vec![node] })?;
         if let Some(page_id) = self.doc.page_of(id) {
             self.relayout(page_id);
@@ -488,49 +627,12 @@ impl Engine {
     }
 
     fn update(&mut self, a: UpdateArgs) -> Result<Value, String> {
-        let mut node = self.node(a.node_id)?.clone();
-        if node.parent.is_none() {
-            return Err("page roots cannot be updated by this tool".into());
-        }
-        if let Some(name) = a.name {
-            bounded_text("name", &name, 1024)?;
-            node.name = name;
-        }
-        if let Some(x) = a.x {
-            node.transform.tx = x;
-        }
-        if let Some(y) = a.y {
-            node.transform.ty = y;
-        }
-        if let Some(width) = a.width {
-            node.size.x = width;
-        }
-        if let Some(height) = a.height {
-            node.size.y = height;
-        }
-        geometry(node.transform.tx, node.transform.ty, node.size.x, node.size.y)?;
-        if let Some(visible) = a.visible {
-            node.visible = visible;
-        }
-        if let Some(opacity) = a.opacity {
-            if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
-                return Err("opacity must be between 0 and 1".into());
-            }
-            node.opacity = opacity;
-        }
-        if let Some(text) = a.text {
-            bounded_text("text", &text, 100_000)?;
-            let NodeKind::Text(props) = &mut node.kind else {
-                return Err("text can only be set on text nodes".into());
-            };
-            if props.content != text {
-                props.content = text;
-                props.runs.clear();
-                props.lists.clear();
-            }
-        }
+        let (node, changed) = crate::tools::build_updated_node(
+            &self.doc,
+            NodeId(a.node_id),
+            crate::tools::UpdateFields { name: a.name, text: a.text, x: a.x, y: a.y, width: a.width, height: a.height, visible: a.visible, opacity: a.opacity },
+        )?;
         let id = node.id;
-        let changed = self.doc.get(id) != Some(&node);
         if changed {
             self.exec(Command::Update { node: Box::new(node) })?;
             if let Some(page_id) = self.doc.page_of(id) {
@@ -541,31 +643,22 @@ impl Engine {
     }
 }
 
-fn summary(n: &Node) -> Value {
-    json!({"node_id":n.id,"name":n.name,"kind":n.kind.default_name(),"parent_id":n.parent,
+fn summary(doc: &Document, n: &Node) -> Value {
+    let mut out = json!({"node_id":n.id,"name":n.name,"kind":n.kind.default_name(),"parent_id":n.parent,
         "child_count":n.children.len(),"visible":n.visible,"x":n.transform.tx,"y":n.transform.ty,
-        "width":n.size.x,"height":n.size.y})
+        "width":n.size.x,"height":n.size.y});
+    if let (Some(obj), Some(ip)) = (out.as_object_mut(), doc.get_in_progress(n.id)) {
+        if let Ok(v) = serde_json::to_value(ip) {
+            obj.insert("in_progress".into(), v);
+        }
+    }
+    out
 }
 
-fn parse<T: DeserializeOwned>(args: Value) -> Result<T, String> {
+pub(crate) fn parse<T: DeserializeOwned>(args: Value) -> Result<T, String> {
     serde_json::from_value(args).map_err(|e| format!("invalid arguments: {e}"))
 }
-fn bounded_text(field: &str, value: &str, max: usize) -> Result<(), String> {
-    if value.len() > max {
-        Err(format!("{field} exceeds {max} UTF-8 bytes"))
-    } else {
-        Ok(())
-    }
-}
-fn geometry(x: f32, y: f32, width: f32, height: f32) -> Result<(), String> {
-    if [x, y, width, height].iter().any(|v| !v.is_finite() || v.abs() > 1_000_000.0) {
-        return Err("geometry must be finite and within +/-1000000".into());
-    }
-    if width < 0.0 || height < 0.0 {
-        return Err("width and height must be non-negative".into());
-    }
-    Ok(())
-}
+use crate::tools::bounded_text;
 fn default_limit() -> usize {
     100
 }
@@ -681,6 +774,30 @@ struct SetDevStatusArgs {
     node_id: u64,
     status: Option<String>,
     annotation: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetInProgressArgs {
+    #[serde(default)]
+    node_ids: Option<Vec<u64>>,
+    #[serde(default)]
+    node_id: Option<u64>,
+    #[serde(default)]
+    value: Option<bool>,
+    #[serde(default)]
+    in_progress: Option<bool>,
+    #[serde(default, alias = "agent_name")]
+    agent: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    stale_after_s: Option<u32>,
+    #[serde(default)]
+    force: bool,
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -827,12 +944,41 @@ pub fn tools() -> Vec<Value> {
     );
     add("undo", "Undo the latest successful edit in this session; returns changed=false if the stack is empty.", json!({}), vec![], false, false);
     add("redo", "Redo the most recently undone edit in this session; returns changed=false if the stack is empty.", json!({}), vec![], false, false);
+    out.push(json!({
+        "name": "designos_set_in_progress",
+        "description": "Flag or clear root frames as in progress while an agent works on them (work state, not an undo step).",
+        "inputSchema": {
+            "type": "object",
+            "required": ["node_ids", "value"],
+            "additionalProperties": false,
+            "properties": {
+                "node_ids": {
+                    "type": "array",
+                    "items": { "type": "integer", "minimum": 1 },
+                    "minItems": 1,
+                    "maxItems": 200
+                },
+                "value": { "type": "boolean" },
+                "stale_after_s": { "type": "integer", "minimum": 60, "maximum": 86400 },
+                "force": { "type": "boolean", "default": false },
+                "idempotency_key": { "type": "string", "maxLength": 128 }
+            }
+        },
+        "annotations": {
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        }
+    }));
+    out.push(crate::tools::batch::tool_descriptor());
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use designos_doc::Rect;
 
     #[test]
     fn variable_inspection_and_codegen_resolve_inherited_cross_collection_aliases() {

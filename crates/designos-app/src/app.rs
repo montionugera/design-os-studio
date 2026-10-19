@@ -349,6 +349,7 @@ impl App {
 
     /// Drops selection/hover entries that no longer exist or left the page.
     pub fn sanitize(&mut self) {
+        self.doc.prune_in_progress();
         let doc = &self.doc;
         let page = self.page;
         self.selection.retain(|id| doc.get(*id).is_some() && doc.page_of(*id) == Some(page));

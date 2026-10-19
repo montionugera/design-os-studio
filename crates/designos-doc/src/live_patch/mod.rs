@@ -15,7 +15,7 @@ mod validate;
 pub use record::live_ops_for_command;
 pub use replay::{replay_live_patch, LivePatchReport, LivePatchState, TouchKind};
 
-use crate::{Comment, CommentAnchor, CommentThread, Node, NodeId};
+use crate::{Comment, CommentAnchor, CommentThread, InProgress, Node, NodeId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -37,12 +37,22 @@ pub struct LivePatch {
     /// Optional human-readable agent label (`Claude`, `Codex`, `Grok`, `Antigravity`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_label: Option<String>,
+    /// Optional undo-group label shown in Studio's History panel (e.g. `Agent: <run>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     pub ops: Vec<LiveOp>,
 }
 
 impl LivePatch {
     pub fn new(ops: Vec<LiveOp>) -> Self {
-        Self { v: LIVE_PATCH_VERSION, base: None, session_id: None, agent_label: None, ops }
+        Self {
+            v: LIVE_PATCH_VERSION,
+            base: None,
+            session_id: None,
+            agent_label: None,
+            label: None,
+            ops,
+        }
     }
 
     pub fn with_base(mut self, base: Option<u64>) -> Self {
@@ -53,6 +63,11 @@ impl LivePatch {
     pub fn with_agent(mut self, session_id: impl Into<String>, agent_label: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
         self.agent_label = Some(agent_label.into());
+        self
+    }
+
+    pub fn with_label(mut self, label: Option<String>) -> Self {
+        self.label = label;
         self
     }
 }
@@ -180,6 +195,14 @@ pub enum LiveOp {
         changed: Vec<ThreadChange>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         removed: Vec<String>,
+    },
+    /// Sets or clears a transient work-in-progress flag on `node` without creating a [`Command`](crate::Command)
+    /// or undo step (`E15-7` / `#592`).
+    SetInProgress {
+        #[serde(alias = "id")]
+        node: NodeId,
+        #[serde(default, alias = "value", skip_serializing_if = "Option::is_none")]
+        state: Option<InProgress>,
     },
 }
 

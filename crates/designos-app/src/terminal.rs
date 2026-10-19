@@ -361,6 +361,8 @@ pub enum TerminalAction {
     /// `selection.spec.json` and pipes its path + node summary +
     /// unresolved Canvas Pin-Comments directly into the active PTY stdin.
     ExportSelectionToTerminal,
+    /// Clears `Document.in_progress` entries owned by an agent run that finished (`agent-status.json` -> `done`) or whose PTY exited.
+    ClearInProgress { run_id: Option<String>, agent: Option<String> },
 }
 
 /// Orca 3-tier live agent execution status (`Working` / `WaitingForInput` / `Done` / `Idle`).
@@ -689,6 +691,8 @@ pub struct TerminalState {
     pub search_query: String,
     /// Whether `Cmd+F` terminal search is case-sensitive (`Aa`).
     pub search_case_sensitive: bool,
+    /// Tracks whether `agent-status.json` was already observed in the `Done` state so transitions fire once.
+    pub last_agent_status_done: bool,
 }
 
 impl Default for TerminalState {
@@ -762,7 +766,13 @@ impl TerminalState {
             search_open: false,
             search_query: String::new(),
             search_case_sensitive: false,
+            last_agent_status_done: false,
         }
+    }
+
+    /// Returns true when `run_id` matches this terminal's `session_id` and at least one agent PTY tab is alive.
+    pub fn is_live_agent_run(&mut self, run_id: &str) -> bool {
+        self.session_id == run_id && self.tabs.iter_mut().any(|t| !t.is_shell_process() && t.is_alive())
     }
 
     /// Re-binds this terminal state to `session_id` under `/tmp/designos-sessions/<session_id>`.
@@ -782,6 +792,7 @@ impl TerminalState {
         self.last_watched_mtime = std::fs::metadata(&self.live_spec_path).and_then(|m| m.modified()).ok();
         self.live_patch = crate::live_patch_log::LivePatchLog::bind(self.session_dir.join("doc-patch.jsonl"));
         self.last_synced_key = None;
+        self.last_agent_status_done = false;
     }
 
     /// Builds a [`SessionEnv`] snapshot for this terminal state's per-file session.
@@ -1351,15 +1362,38 @@ impl TerminalState {
         let status_file = self.session_dir.join("agent-status.json");
         if let Ok(raw_status) = std::fs::read_to_string(&status_file) {
             if let Some(parsed) = parse_agent_status_payload(raw_status.trim()) {
+                let is_done = matches!(parsed, AgentTabStatus::Done);
                 if let Some(tab) = self.active_tab() {
                     if let Ok(mut st) = tab.agent_status.lock() {
                         *st = parsed;
                     }
                 }
+                if is_done && !self.last_agent_status_done {
+                    self.last_agent_status_done = true;
+                    let json_val = serde_json::from_str::<serde_json::Value>(raw_status.trim()).ok();
+                    let json_agent = json_val.as_ref().and_then(|v| v.get("agent")).and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let fallback_agent = self.active_tab().filter(|t| !t.is_shell_process()).map(|t| t.spawn_preset.binary_name().to_string()).or_else(|| {
+                        (!matches!(self.active_runtime, AgentCliPreset::Shell | AgentCliPreset::DesignOsHelp))
+                            .then(|| self.active_runtime.binary_name().to_string())
+                    });
+                    let agent = json_agent.or(fallback_agent);
+                    actions.push(TerminalAction::ClearInProgress { run_id: Some(self.session_id.clone()), agent: agent.clone() });
+                    if let Some(extra_run_id) = json_val
+                        .as_ref()
+                        .and_then(|v| v.get("run_id").or_else(|| v.get("session_id")))
+                        .and_then(|v| v.as_str())
+                        .filter(|r| !r.is_empty() && *r != self.session_id)
+                    {
+                        actions.push(TerminalAction::ClearInProgress { run_id: Some(extra_run_id.to_string()), agent });
+                    }
+                } else if !is_done {
+                    self.last_agent_status_done = false;
+                }
             }
         }
 
         let mut agent_exited = false;
+        let session_id = self.session_id.clone();
         for tab in &mut self.tabs {
             if tab.is_shell_process() || tab.exited_notice_shown {
                 continue;
@@ -1376,6 +1410,7 @@ impl TerminalState {
                 tab.title.push_str(" (exited)");
                 tab.exited_notice_shown = true;
                 agent_exited = true;
+                actions.push(TerminalAction::ClearInProgress { run_id: Some(session_id.clone()), agent: Some(tab.spawn_preset.binary_name().to_string()) });
             }
         }
         if agent_exited {
