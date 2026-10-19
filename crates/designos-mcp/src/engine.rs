@@ -1,5 +1,5 @@
 //! Typed, local document operations shared by the MCP transport and future bridges.
-use designos_doc::live_patch::{live_ops_for_command, LiveOp};
+use designos_doc::live_patch::{live_ops_for_command, live_ops_for_independent, LiveOp};
 use designos_doc::{
     Annotation, Command, Comment, CommentAnchor, CommentThread, DevStatus, Document, History, Node, NodeId, NodeKind, NodeSpec, Rect, TextStyle, Vec2,
 };
@@ -412,9 +412,10 @@ impl Engine {
         self.doc.get(NodeId(id)).ok_or_else(|| format!("node {id} not found"))
     }
 
-    fn exec(&mut self, command: Command) -> Result<(), String> {
-        let ops = self.live_ops_for(&command)?;
-        self.history.exec(&mut self.doc, command).map_err(|e| e.to_string())?;
+    pub fn exec(&mut self, command: Command) -> Result<(), String> {
+        let w = designos_doc::writer_command(&self.doc, command);
+        let ops = self.live_ops_for_parts(&w.parts)?;
+        self.history.exec(&mut self.doc, w.cmd).map_err(|e| e.to_string())?;
         self.record(ops);
         Ok(())
     }
@@ -425,6 +426,15 @@ impl Engine {
             return Ok(Vec::new());
         }
         live_ops_for_command(&self.doc, command)
+    }
+
+    /// Records independent command parts (from [`designos_doc::writer_command`]) without cloning
+    /// the document when `parts` came from a boundary-expanded batch.
+    fn live_ops_for_parts(&self, parts: &[Command]) -> Result<Vec<LiveOp>, String> {
+        if self.live_ops.is_none() {
+            return Ok(Vec::new());
+        }
+        live_ops_for_independent(&self.doc, parts)
     }
 
     fn record(&mut self, ops: Vec<LiveOp>) {
@@ -749,13 +759,13 @@ pub fn tools() -> Vec<Value> {
         true,
         true,
     );
-    add("create_node","Create one layer in a container; defaults to x/y=0, width/height=100. Supports undo. Text is only valid for text layers. Changes are in memory until saved.",
+    add("create_node","Create one layer in a container; defaults to x/y=0, width/height=100. Supports undo. Text is only valid for text layers. Changes are in memory until saved. Content added to, removed from or moved in an instance slot is kept when the main component changes.",
         json!({"parent_id":id,"kind":{"type":"string","enum":["frame","rectangle","ellipse","text"]},"name":name,"text":text,"x":coordinate,"y":coordinate,"width":size,"height":size}),vec!["parent_id","kind"],false,false);
     add("update_node","Update specified fields of one non-page layer. Coordinates are parent-relative. Replacing text clears text runs and list ranges. Supports undo; changes remain in memory until saved.",
         json!({"node_id":id,"name":name,"text":text,"x":coordinate,"y":coordinate,"width":size,"height":size,"visible":{"type":"boolean"},"opacity":{"type":"number","minimum":0,"maximum":1}}),vec!["node_id"],false,true);
     add(
         "delete_node",
-        "Remove a non-page layer and its entire subtree. Supports undo; changes remain in memory until saved.",
+        "Remove a non-page layer and its entire subtree. Supports undo; changes remain in memory until saved. Content added to, removed from or moved in an instance slot is kept when the main component changes.",
         json!({"node_id":id}),
         vec!["node_id"],
         false,
@@ -795,7 +805,7 @@ pub fn tools() -> Vec<Value> {
     );
     add(
         "apply_spec",
-        "Build a complete UI subtree from a declarative NodeSpec (supports EaseUI BrainWave 2.0 presets like easeui-screen/easeui-card/easeui-button-primary, $easeui.* tokens, and Auto-Layout 5.0 row/column/wrap/hug/fill) in a single atomic undoable step.",
+        "Build a complete UI subtree from a declarative NodeSpec (supports EaseUI BrainWave 2.0 presets like easeui-screen/easeui-card/easeui-button-primary, $easeui.* tokens, and Auto-Layout 5.0 row/column/wrap/hug/fill) in a single atomic undoable step. Content added to, removed from or moved in an instance slot is kept when the main component changes.",
         json!({"parent_id":id,"spec":{"type":"object","description":"Declarative NodeSpec tree (kind, name, preset, width, height, width_sizing, height_sizing, fill, stroke, corner_radius, text, font_size, layout, dev_status, annotations, children)."}}),
         vec!["spec"],
         false,
@@ -1192,5 +1202,267 @@ mod tests {
             assert_settled(&e, last, tool);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn engine_exec_applies_the_boundary() {
+        use designos_doc::live_patch::{replay_live_patch, LivePatch, LivePatchState};
+        use designos_doc::{AlignSelf, AutoLayout, FrameProps, LayoutDirection, Sizing};
+
+        let mut e = Engine::default();
+        let page = e.active_page_id.unwrap();
+        let fid = e.doc.alloc_id();
+        let mut frame = Node::frame(fid, Rect::new(0.0, 0.0, 200.0, 120.0));
+        let mut al = AutoLayout::v1();
+        al.direction = LayoutDirection::Horizontal;
+        al.primary_sizing = Sizing::Fixed;
+        al.counter_sizing = Sizing::Fixed;
+        frame.kind = NodeKind::Frame(FrameProps { clips_content: false, auto_layout: Some(al), grids: Vec::new() });
+        e.doc.insert(page, frame).unwrap();
+
+        let cid = e.doc.alloc_id();
+        let mut child = Node::rectangle(cid, Rect::new(0.0, 0.0, 50.0, 30.0));
+        child.layout_child.horizontal = Sizing::Fixed;
+        child.layout_child.vertical = Sizing::Fill;
+        child.layout_child.align_self = AlignSelf::Stretch;
+        e.doc.insert(fid, child).unwrap();
+
+        let mut mirror_doc = e.doc.clone();
+        e.live_ops = Some(Vec::new());
+
+        let mut flipped = e.doc.get(fid).unwrap().clone();
+        flipped.kind.frame_props_mut().unwrap().auto_layout.as_mut().unwrap().direction = LayoutDirection::Vertical;
+        e.exec(Command::Update { node: Box::new(flipped) }).unwrap();
+        e.relayout(fid);
+
+        let ops = e.take_live_ops();
+        assert_eq!(ops.len(), 2, "recorded live ops must include parent update and child update");
+        assert!(matches!(&ops[0], LiveOp::Update { id, .. } if *id == fid));
+        assert!(matches!(&ops[1], LiveOp::Update { id, .. } if *id == cid));
+
+        let report = replay_live_patch(&mut mirror_doc, &LivePatch::new(ops), &mut LivePatchState::default(), &mut |d, c| c.apply(d).map(|_| ())).unwrap();
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        mirror_doc.relayout_subtree(fid);
+        mirror_doc.flush_pending_relayout();
+
+        assert_eq!(mirror_doc.get(fid).unwrap(), e.doc.get(fid).unwrap());
+        assert_eq!(mirror_doc.get(cid).unwrap(), e.doc.get(cid).unwrap());
+        assert_eq!(e.doc.get(cid).unwrap().layout_child.align_self, AlignSelf::Auto);
+        assert_eq!(e.doc.get(cid).unwrap().layout_child.vertical, Sizing::Fill);
+    }
+
+    #[test]
+    fn engine_exec_does_not_clone_the_document_for_a_flip() {
+        use designos_doc::live_patch::batch_doc_clones;
+        use designos_doc::{AlignSelf, AutoLayout, FrameProps, LayoutDirection, Sizing};
+        use std::time::Instant;
+
+        let mut e = Engine::default();
+        let page = e.active_page_id.unwrap();
+
+        let fid = e.doc.alloc_id();
+        let mut frame = Node::frame(fid, Rect::new(0.0, 0.0, 400.0, 300.0));
+        let mut al = AutoLayout::v1();
+        al.direction = LayoutDirection::Horizontal;
+        al.primary_sizing = Sizing::Fixed;
+        al.counter_sizing = Sizing::Fixed;
+        frame.kind = NodeKind::Frame(FrameProps { clips_content: false, auto_layout: Some(al), grids: Vec::new() });
+        e.doc.insert(page, frame).unwrap();
+
+        // Populate 10,000 direct children under `fid` with the duplicate stretch pair.
+        let mut child_ids = Vec::with_capacity(10_000);
+        for i in 0..10_000usize {
+            let cid = e.doc.alloc_id();
+            let mut c = Node::rectangle(cid, Rect::new((i % 100) as f32 * 4.0, (i / 100) as f32 * 4.0, 20.0, 10.0));
+            c.parent = Some(fid);
+            c.layout_child.horizontal = Sizing::Fixed;
+            c.layout_child.vertical = Sizing::Fill;
+            c.layout_child.align_self = AlignSelf::Stretch;
+            e.doc.nodes.insert(cid, c);
+            child_ids.push(cid);
+        }
+        e.doc.get_mut(fid).unwrap().children = child_ids;
+
+        // Populate the remaining nodes on `page` so total document size is 100,000 nodes.
+        let existing = e.doc.nodes.len();
+        let remaining = 100_000usize.saturating_sub(existing);
+        let mut page_extra = Vec::with_capacity(remaining);
+        for i in 0..remaining {
+            let id = e.doc.alloc_id();
+            let mut n = Node::rectangle(id, Rect::new((i % 200) as f32 * 6.0, (i / 200) as f32 * 6.0, 4.0, 4.0));
+            n.parent = Some(page);
+            e.doc.nodes.insert(id, n);
+            page_extra.push(id);
+        }
+        e.doc.get_mut(page).unwrap().children.extend(page_extra);
+        assert_eq!(e.doc.nodes.len(), 100_000);
+
+        let mut flipped = e.doc.get(fid).unwrap().clone();
+        flipped.kind.frame_props_mut().unwrap().auto_layout.as_mut().unwrap().direction = LayoutDirection::Vertical;
+        let update_cmd = Command::Update { node: Box::new(flipped) };
+
+        // Compute the reference batch ops via `live_ops_for_command` on the batch BEFORE mutating `e.doc`.
+        let w_ref = designos_doc::writer_command(&e.doc, update_cmd.clone());
+        let clones_before_batch = batch_doc_clones();
+        let batch_ops = live_ops_for_command(&e.doc, &w_ref.cmd).unwrap();
+        assert_eq!(batch_doc_clones(), clones_before_batch + 1, "batch path clones the document once");
+
+        // Now run through `Engine::exec` and verify zero document clones and identical live ops.
+        e.live_ops = Some(Vec::new());
+        let clones_before_exec = batch_doc_clones();
+        let t0 = Instant::now();
+        e.exec(update_cmd).unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(batch_doc_clones(), clones_before_exec, "Engine::exec must not clone the document");
+
+        let exec_ops = e.take_live_ops();
+        assert_eq!(exec_ops.len(), 10_001);
+        assert_eq!(exec_ops, batch_ops);
+
+        let budget_ms: u128 = if cfg!(debug_assertions) { 2_500 } else { 100 };
+        eprintln!("[#583 bench] 10k-children on 100k-node doc Engine::exec={}ms (budget={}ms)", elapsed.as_secs_f64() * 1000.0, budget_ms);
+        assert!(elapsed.as_millis() <= budget_ms, "Engine::exec took {}ms > {}ms budget", elapsed.as_millis(), budget_ms);
+    }
+
+    fn setup_slot_component_and_instance(e: &mut Engine, with_default_mirror: bool) -> (NodeId, NodeId, NodeId) {
+        let page = e.active_page_id.unwrap();
+        let comp_id = e.doc.alloc_id();
+        let mut comp = Node::new(comp_id, NodeKind::Component(designos_doc::FrameProps::default()));
+        comp.name = "Card".into();
+        comp.size = Vec2::new(200.0, 120.0);
+        e.doc.insert(page, comp).unwrap();
+
+        let slot_id = e.doc.alloc_id();
+        let mut slot = Node::frame(slot_id, Rect::new(8.0, 8.0, 184.0, 104.0));
+        slot.name = "Body".into();
+        e.doc.insert(comp_id, slot).unwrap();
+
+        if with_default_mirror {
+            let def_id = e.doc.alloc_id();
+            let mut def = Node::rectangle(def_id, Rect::new(0.0, 0.0, 40.0, 20.0));
+            def.name = "DefaultItem".into();
+            e.doc.insert(slot_id, def).unwrap();
+        }
+
+        designos_doc::convert_to_slot(&mut e.doc, slot_id).apply(&mut e.doc).unwrap();
+        designos_doc::create_instance(&mut e.doc, comp_id, page, Vec2::new(240.0, 0.0)).apply(&mut e.doc).unwrap();
+        let inst_id = designos_doc::instances_of(&e.doc, comp_id)[0];
+        let inst_slot = e.doc.get(inst_id).unwrap().children[0];
+        assert!(designos_doc::is_instance_slot(&e.doc, inst_slot));
+        assert!(!e.doc.get(inst_slot).unwrap().component.overrides.contains(&designos_doc::OverrideField::SlotContent));
+        (comp_id, inst_id, inst_slot)
+    }
+
+    #[test]
+    fn mcp_insert_into_instance_slot_survives_main_edit() {
+        let mut e = Engine::default();
+        let (comp_id, _inst_id, inst_slot) = setup_slot_component_and_instance(&mut e, false);
+
+        let res = e
+            .call(
+                "designos_create_node",
+                json!({
+                    "parent_id": inst_slot.0,
+                    "kind": "rectangle",
+                    "name": "CustomBadge",
+                    "width": 60.0,
+                    "height": 24.0
+                }),
+            )
+            .unwrap();
+        let created_id = NodeId(res["node"]["id"].as_u64().unwrap());
+
+        assert!(
+            e.doc.get(inst_slot).unwrap().component.overrides.contains(&designos_doc::OverrideField::SlotContent),
+            "designos_create_node into an instance slot must mark OverrideField::SlotContent"
+        );
+
+        // Edit the main component and sync instances: the custom child inside the instance slot must survive.
+        e.doc.get_mut(comp_id).unwrap().size.x = 240.0;
+        designos_doc::sync_instances(&mut e.doc, comp_id).apply(&mut e.doc).unwrap();
+
+        assert_eq!(e.doc.get(inst_slot).unwrap().children, vec![created_id]);
+        assert!(e.doc.get(created_id).is_some());
+    }
+
+    #[test]
+    fn mcp_apply_spec_into_instance_slot_survives() {
+        let mut e = Engine::default();
+        let (comp_id, _inst_id, inst_slot) = setup_slot_component_and_instance(&mut e, false);
+
+        e.call(
+            "designos_apply_spec",
+            json!({
+                "parent_id": inst_slot.0,
+                "spec": {
+                    "name": "SpecCard",
+                    "width": 120.0,
+                    "height": 48.0,
+                    "children": [
+                        { "kind": "text", "name": "SpecTitle", "text": "Hello Slot" }
+                    ]
+                }
+            }),
+        )
+        .unwrap();
+
+        assert!(
+            e.doc.get(inst_slot).unwrap().component.overrides.contains(&designos_doc::OverrideField::SlotContent),
+            "designos_apply_spec into an instance slot must mark OverrideField::SlotContent"
+        );
+        let slot_children = e.doc.get(inst_slot).unwrap().children.clone();
+        assert_eq!(slot_children.len(), 1);
+
+        e.doc.get_mut(comp_id).unwrap().size.y = 160.0;
+        designos_doc::sync_instances(&mut e.doc, comp_id).apply(&mut e.doc).unwrap();
+
+        assert_eq!(e.doc.get(inst_slot).unwrap().children, slot_children);
+        assert_eq!(e.doc.get(slot_children[0]).unwrap().name, "SpecCard");
+    }
+
+    #[test]
+    fn mcp_delete_default_mirror_is_kept_deleted() {
+        let mut e = Engine::default();
+        let (comp_id, _inst_id, inst_slot) = setup_slot_component_and_instance(&mut e, true);
+        let mirror_id = e.doc.get(inst_slot).unwrap().children[0];
+
+        e.call(
+            "designos_delete_node",
+            json!({
+                "node_id": mirror_id.0
+            }),
+        )
+        .unwrap();
+
+        assert!(e.doc.get(inst_slot).unwrap().children.is_empty());
+        assert!(
+            e.doc.get(inst_slot).unwrap().component.overrides.contains(&designos_doc::OverrideField::SlotContent),
+            "deleting a default mirror child from an instance slot must mark OverrideField::SlotContent"
+        );
+
+        // Edit the main component and sync instances: the deleted default mirror must NOT be re-created.
+        e.doc.get_mut(comp_id).unwrap().size.x = 260.0;
+        designos_doc::sync_instances(&mut e.doc, comp_id).apply(&mut e.doc).unwrap();
+
+        assert!(e.doc.get(inst_slot).unwrap().children.is_empty(), "synced instance slot must stay empty after default mirror was deleted");
+    }
+
+    #[test]
+    fn recording_a_marked_insert_does_not_clone_the_document() {
+        use designos_doc::live_patch::batch_doc_clones;
+
+        let mut e = Engine::default();
+        let (_comp_id, _inst_id, inst_slot) = setup_slot_component_and_instance(&mut e, false);
+
+        e.live_ops = Some(Vec::new());
+        let before = batch_doc_clones();
+        let child_id = e.doc.alloc_id();
+        let child = Node::rectangle(child_id, Rect::new(0.0, 0.0, 32.0, 16.0));
+        e.exec(Command::Insert { parent: inst_slot, index: 0, nodes: vec![child] }).unwrap();
+        assert_eq!(batch_doc_clones(), before, "recording a slot-marked insert must not clone the document");
+
+        let ops = e.take_live_ops();
+        assert_eq!(ops.len(), 2, "must emit Update for the marked slot and Insert for the child");
+        assert!(e.doc.get(inst_slot).unwrap().component.overrides.contains(&designos_doc::OverrideField::SlotContent));
     }
 }

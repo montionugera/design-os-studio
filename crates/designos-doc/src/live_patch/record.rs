@@ -3,6 +3,28 @@
 use super::{LiveOp, SiblingHint, ThreadChange, STRUCTURAL_FIELDS};
 use crate::{Command, CommentThread, Document, Node};
 use serde_json::{Map, Value};
+use std::cell::Cell;
+
+thread_local! {
+    static BATCH_DOC_CLONES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Number of scratch [`Document`] clones taken by the [`Command::Batch`] arm of
+/// [`live_ops_for_command`] on the current thread (used by performance / zero-clone tests).
+pub fn batch_doc_clones() -> usize {
+    BATCH_DOC_CLONES.with(Cell::get)
+}
+
+/// Records [`LiveOp`]s for a slice of commands that are independent of one another (such as the
+/// `parts` produced by [`crate::writer_command`]), inspecting each part against `doc` without
+/// cloning the scene graph.
+pub fn live_ops_for_independent(doc: &Document, parts: &[Command]) -> Result<Vec<LiveOp>, String> {
+    let mut out = Vec::new();
+    for part in parts {
+        out.extend(live_ops_for_command(doc, part)?);
+    }
+    Ok(out)
+}
 
 /// The [`LiveOp`]s `cmd` performs when applied to `doc`, read from the state before it runs.
 ///
@@ -41,6 +63,7 @@ pub fn live_ops_for_command(doc: &Document, cmd: &Command) -> Result<Vec<LiveOp>
         }
         Command::Batch(cmds) => {
             // Later commands see the state earlier ones leave behind.
+            BATCH_DOC_CLONES.with(|c| c.set(c.get() + 1));
             let mut scratch = doc.clone();
             for c in cmds {
                 out.extend(live_ops_for_command(&scratch, c)?);

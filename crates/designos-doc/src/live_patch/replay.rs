@@ -164,7 +164,7 @@ fn resolve(doc: &mut Document, op: &LiveOp, state: &mut LivePatchState, report: 
             if set.keys().chain(unset).any(|k| LAYOUT_FIELDS.contains(&k.as_str())) {
                 report.needs_layout.push(id);
             }
-            Some(Command::Update { node: Box::new(merged) })
+            Some(crate::writer_command(doc, Command::Update { node: Box::new(merged) }).cmd)
         }
         LiveOp::Reparent { id: agent_id, parent: agent_parent, at } => {
             let (id, id_redirected) = resolve_id(&state.remap, &state.replaced, doc, *agent_id);
@@ -199,7 +199,7 @@ fn resolve(doc: &mut Document, op: &LiveOp, state: &mut LivePatchState, report: 
             }
             report.needs_layout.extend(node.parent);
             report.needs_layout.extend([parent, id]);
-            Some(Command::Reparent { id, parent, index })
+            Some(crate::writer_command(doc, Command::Reparent { id, parent, index }).cmd)
         }
         LiveOp::Remove { id } => {
             let id = state.target(doc, *id);
@@ -212,7 +212,7 @@ fn resolve(doc: &mut Document, op: &LiveOp, state: &mut LivePatchState, report: 
                 return None;
             };
             report.needs_layout.push(parent);
-            Some(Command::Remove { id })
+            Some(crate::writer_command(doc, Command::Remove { id }).cmd)
         }
         LiveOp::Comments { added, changed, removed } => {
             let (remap, replaced) = (&state.remap, &state.replaced);
@@ -300,7 +300,7 @@ fn resolve_insert(
     let index = remap_hint(at, state).index_in(siblings);
     report.inserted_roots.push(nodes[0].id);
     report.needs_layout.push(parent);
-    Some(Command::Insert { parent, index, nodes })
+    Some(crate::writer_command(doc, Command::Insert { parent, index, nodes }).cmd)
 }
 
 /// `cur` with the changed top-level fields of `set` / `unset` applied; structure is kept.

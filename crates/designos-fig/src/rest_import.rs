@@ -1385,6 +1385,7 @@ impl<'a> Ctx<'a> {
         self.resolve_swaps();
         if !expand_instances {
             self.apply_rest_overrides();
+            self.mark_custom_instance_slots();
             self.resolve_proto();
             return;
         }
@@ -1474,6 +1475,7 @@ impl<'a> Ctx<'a> {
             self.doc.reserve_ids(NodeId(self.next_clone - 1));
         }
         self.apply_rest_overrides();
+        self.mark_custom_instance_slots();
         self.resolve_proto();
     }
 
@@ -1696,6 +1698,26 @@ impl<'a> Ctx<'a> {
                     "gridChildVerticalAlign" => n.component.grid_align_overrides[1] = true,
                     _ => {}
                 }
+            }
+        }
+    }
+
+    /// Marks every instance slot that carries custom children (`component.source == None`) with
+    /// `OverrideField::SlotContent` so a subsequent `sync_component_instances` preserves them.
+    fn mark_custom_instance_slots(&mut self) {
+        let to_mark: Vec<NodeId> = self
+            .doc
+            .nodes
+            .values()
+            .filter(|slot| {
+                designos_doc::is_instance_slot(&self.doc, slot.id)
+                    && slot.children.iter().any(|&c| self.doc.get(c).is_some_and(|ch| ch.component.source.is_none()))
+            })
+            .map(|slot| slot.id)
+            .collect();
+        for id in to_mark {
+            if let Some(slot) = self.doc.get_mut(id) {
+                slot.component.overrides.insert(OverrideField::SlotContent);
             }
         }
     }
@@ -2984,6 +3006,7 @@ impl designos_doc::PageHydrator for DeferredFigHydrator {
                 cx.apply_overrides(inst, &self.targets, &mut self.done);
             }
         }
+        cx.mark_custom_instance_slots();
         if cx.next_clone > 1 {
             cx.doc.reserve_ids(NodeId(cx.next_clone - 1));
         }

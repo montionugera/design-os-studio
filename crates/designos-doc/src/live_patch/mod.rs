@@ -12,7 +12,7 @@ mod replay;
 mod replay_comments;
 mod validate;
 
-pub use record::live_ops_for_command;
+pub use record::{batch_doc_clones, live_ops_for_command, live_ops_for_independent};
 pub use replay::{replay_live_patch, LivePatchReport, LivePatchState};
 
 use crate::{Comment, CommentAnchor, CommentThread, Node, NodeId};
