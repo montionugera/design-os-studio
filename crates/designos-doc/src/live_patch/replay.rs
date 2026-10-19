@@ -3,7 +3,7 @@
 use super::replay_comments::{resolve_comments, CommentRemap};
 use super::validate::insert_problem;
 use super::{LiveOp, LivePatch, SiblingHint, LIVE_PATCH_VERSION, STRUCTURAL_FIELDS};
-use crate::{Command, DocError, Document, Node, NodeId, NodeKind};
+use crate::{Command, DocError, Document, Node, NodeId, NodeKind, Variable, VariableCollection};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -214,12 +214,55 @@ fn resolve(doc: &mut Document, op: &LiveOp, state: &mut LivePatchState, report: 
             report.needs_layout.push(parent);
             Some(Command::Remove { id })
         }
+        LiveOp::Variables { collections, variables, removed_collections, removed_variables } => {
+            resolve_variables(doc, collections, variables, removed_collections, removed_variables, report)
+        }
         LiveOp::Comments { added, changed, removed } => {
             let (remap, replaced) = (&state.remap, &state.replaced);
             let node = |id: NodeId| resolve_id(remap, replaced, doc, id).0;
             resolve_comments(doc, added, changed, removed, &mut state.comments, &node, report)
         }
     }
+}
+
+/// The agent's variable and collection changes merged into the editor's own maps, which can hold
+/// more than the agent's copy did. Entries without an id are refused: the log is a file any local
+/// process can write.
+fn resolve_variables(
+    doc: &Document,
+    collections: &[VariableCollection],
+    variables: &[Variable],
+    removed_collections: &[String],
+    removed_variables: &[String],
+    report: &mut LivePatchReport,
+) -> Option<Command> {
+    let mut merged_vars = doc.variables.clone();
+    let mut merged_colls = doc.variable_collections.clone();
+    for id in removed_variables {
+        merged_vars.remove(id);
+    }
+    for id in removed_collections {
+        merged_colls.remove(id);
+    }
+    for v in variables {
+        if v.id.is_empty() {
+            report.skipped.push("a variable without an id was not replayed".to_string());
+            continue;
+        }
+        merged_vars.insert(v.id.clone(), v.clone());
+    }
+    for c in collections {
+        if c.id.is_empty() {
+            report.skipped.push("a variable collection without an id was not replayed".to_string());
+            continue;
+        }
+        merged_colls.insert(c.id.clone(), c.clone());
+    }
+    if merged_vars == doc.variables && merged_colls == doc.variable_collections {
+        report.duplicates += 1;
+        return None;
+    }
+    Some(Command::SetVariables { variables: merged_vars, collections: merged_colls })
 }
 
 /// `set` and `unset` of an edit to a replaced layer without the shape fields, each of which is

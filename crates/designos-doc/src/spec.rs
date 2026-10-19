@@ -385,7 +385,7 @@ impl Document {
         }
 
         let saved_next_id = self.next_id;
-        let had_easeui_coll = self.variable_collections.contains_key(EASEUI_DEPRECATED_COLLECTION_ID);
+        let data_before = crate::spec_data::SpecDataSnapshot::of(self);
         let mut inserted_ids: Vec<NodeId> = Vec::new();
         let mut index = SpecBindIndex::build(self);
         let mut report = SpecApplyReport { root_node_id: NodeId(0), bindings_created: 0, styles_linked: 0, warnings: Vec::new() };
@@ -403,10 +403,7 @@ impl Document {
                     let _ = self.remove(id);
                 }
                 self.next_id = saved_next_id;
-                if !had_easeui_coll && self.variable_collections.remove(EASEUI_DEPRECATED_COLLECTION_ID).is_some() {
-                    let prefix = format!("{EASEUI_DEPRECATED_COLLECTION_ID}/");
-                    self.variables.retain(|k, _| !k.starts_with(&prefix));
-                }
+                data_before.restore(self);
                 Err(err)
             }
         }
@@ -899,51 +896,9 @@ impl Document {
             }
         }
 
-        // 7. Font size and line height on Text nodes (or when spec.text is None)
+        // 7. Font size, line height and weight on Text nodes (or when spec.text is None)
         if is_text_kind || spec.text.is_none() {
-            if let Some(fs) = &spec.font_size {
-                if let Some(v) =
-                    self.bind_or_eval_number(id, &node_kind, fs, &["fontSize"], "font_size", format!("{path}.font_size"), index, libraries, report)?
-                {
-                    if let Some(n) = self.get_mut(id) {
-                        if let NodeKind::Text(tp) = &mut n.kind {
-                            tp.style.font_size = v.max(1.0);
-                        }
-                    }
-                }
-                // Explicit font_size together with text_style detaches the text style link
-                if spec.text_style.is_some() {
-                    if let Some(n) = self.get_mut(id) {
-                        if n.style_refs.remove("text").is_some() {
-                            report.warnings.push(SpecWarning {
-                                code: "STYLE_DETACHED_BY_SPEC".to_string(),
-                                path: format!("{path}.font_size"),
-                                token: spec.text_style.clone(),
-                                replacement: None,
-                                message: Some("Explicit font_size overrides and detaches text_style.".to_string()),
-                            });
-                        }
-                    }
-                }
-            }
-            if let Some(lh) = &spec.line_height {
-                if let Some(v) =
-                    self.bind_or_eval_number(id, &node_kind, lh, &["lineHeight"], "line_height", format!("{path}.line_height"), index, libraries, report)?
-                {
-                    if let Some(n) = self.get_mut(id) {
-                        if let NodeKind::Text(tp) = &mut n.kind {
-                            tp.style.line_height = LineHeight::Pixels(v.max(0.0));
-                        }
-                    }
-                }
-            }
-            if let Some(fw) = spec.font_weight {
-                if let Some(n) = self.get_mut(id) {
-                    if let NodeKind::Text(tp) = &mut n.kind {
-                        tp.style.font_weight = fw;
-                    }
-                }
-            }
+            self.apply_text_overrides(id, &node_kind, spec, path, index, libraries, report)?;
         }
 
         // Re-estimate intrinsic text bounds after text_style / font_size / line_height application
@@ -1043,18 +998,8 @@ impl Document {
                         }
                     }
                 }
-                if let Some(NumberOrVar::Ref(raw_ref)) = &spec.font_size {
-                    let fpath = format!("{path}.font_size");
-                    let var_id = crate::resolve_variable_ref(self, index, libraries, raw_ref, "font_size", &fpath)?;
-                    crate::validate_variable_binding_for_keys(self, index, &var_id, &["fontSize"], &tkind, raw_ref, "font_size", &fpath)?;
-                    report.bindings_created += crate::apply_variable_binding(self, tid, &["fontSize"], &var_id, &fpath, &mut report.warnings);
-                }
-                if let Some(NumberOrVar::Ref(raw_ref)) = &spec.line_height {
-                    let fpath = format!("{path}.line_height");
-                    let var_id = crate::resolve_variable_ref(self, index, libraries, raw_ref, "line_height", &fpath)?;
-                    crate::validate_variable_binding_for_keys(self, index, &var_id, &["lineHeight"], &tkind, raw_ref, "line_height", &fpath)?;
-                    report.bindings_created += crate::apply_variable_binding(self, tid, &["lineHeight"], &var_id, &fpath, &mut report.warnings);
-                }
+                // The generated label takes the same explicit overrides a text node does, after its style.
+                self.apply_text_overrides(tid, &tkind, spec, path, index, libraries, report)?;
                 if let Some(tn) = self.get_mut(tid) {
                     if let NodeKind::Text(tp) = &tn.kind {
                         tn.size = estimate_intrinsic_text_size(tp);
@@ -1069,6 +1014,63 @@ impl Document {
         }
 
         Ok(id)
+    }
+
+    /// Applies the explicit `font_size`, `line_height` and `font_weight` of `spec` to the text node
+    /// `id` after its text style, so they override the style. An explicit `font_size` together with
+    /// `text_style` also detaches the style link (`STYLE_DETACHED_BY_SPEC`).
+    #[allow(clippy::too_many_arguments)]
+    fn apply_text_overrides(
+        &mut self,
+        id: NodeId,
+        node_kind: &NodeKind,
+        spec: &NodeSpec,
+        path: &str,
+        index: &mut SpecBindIndex,
+        libraries: &[LibrarySnapshot],
+        report: &mut SpecApplyReport,
+    ) -> Result<(), SpecBindError> {
+        if let Some(fs) = &spec.font_size {
+            if let Some(v) = self.bind_or_eval_number(id, node_kind, fs, &["fontSize"], "font_size", format!("{path}.font_size"), index, libraries, report)? {
+                if let Some(n) = self.get_mut(id) {
+                    if let NodeKind::Text(tp) = &mut n.kind {
+                        tp.style.font_size = v.max(1.0);
+                    }
+                }
+            }
+            if spec.text_style.is_some() {
+                if let Some(n) = self.get_mut(id) {
+                    if n.style_refs.remove("text").is_some() {
+                        report.warnings.push(SpecWarning {
+                            code: "STYLE_DETACHED_BY_SPEC".to_string(),
+                            path: format!("{path}.font_size"),
+                            token: spec.text_style.clone(),
+                            replacement: None,
+                            message: Some("Explicit font_size overrides and detaches text_style.".to_string()),
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(lh) = &spec.line_height {
+            if let Some(v) =
+                self.bind_or_eval_number(id, node_kind, lh, &["lineHeight"], "line_height", format!("{path}.line_height"), index, libraries, report)?
+            {
+                if let Some(n) = self.get_mut(id) {
+                    if let NodeKind::Text(tp) = &mut n.kind {
+                        tp.style.line_height = LineHeight::Pixels(v.max(0.0));
+                    }
+                }
+            }
+        }
+        if let Some(fw) = spec.font_weight {
+            if let Some(n) = self.get_mut(id) {
+                if let NodeKind::Text(tp) = &mut n.kind {
+                    tp.style.font_weight = fw;
+                }
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

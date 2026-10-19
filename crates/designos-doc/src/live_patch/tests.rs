@@ -206,6 +206,91 @@ fn hist_peek(h: &History) -> Command {
     h.peek_undo().cloned().expect("undo entry")
 }
 
+fn collection(id: &str) -> crate::VariableCollection {
+    crate::VariableCollection {
+        id: id.into(),
+        name: id.into(),
+        modes: vec![crate::VariableMode { id: "m".into(), name: "Default".into() }],
+        default_mode: "m".into(),
+        variables: vec![format!("{id}/v")],
+        key: None,
+        source_library_key: None,
+    }
+}
+
+fn variable(id: &str, collection: &str) -> crate::Variable {
+    crate::Variable {
+        id: id.into(),
+        name: "v".into(),
+        collection: collection.into(),
+        kind: crate::VariableKind::Number,
+        values: [("m".to_string(), crate::VariableValue::Number(1.0))].into(),
+        description: String::new(),
+        scopes: Vec::new(),
+        hidden_from_publishing: false,
+        key: None,
+        code_syntax: Default::default(),
+    }
+}
+
+#[test]
+fn variables_the_agent_adds_merge_into_the_editors_and_undo_removes_only_those() {
+    // The editor holds a collection of its own that the agent's scoped copy lacks.
+    let (mut full, page, _) = full_doc(1, 0);
+    full.variable_collections.insert("user".into(), collection("user"));
+    full.variables.insert("user/v".into(), variable("user/v", "user"));
+    let user_data = (full.variables.clone(), full.variable_collections.clone());
+    let mut agent = scoped(&full, page, 1);
+    let mut hist = History::default();
+    let mut ops = Vec::new();
+
+    let id = agent.alloc_id();
+    let mut vars = agent.variables.clone();
+    vars.insert("easeui/v".into(), variable("easeui/v", "easeui"));
+    let mut colls = agent.variable_collections.clone();
+    colls.insert("easeui".into(), collection("easeui"));
+    let batch = Command::Batch(vec![
+        Command::SetVariables { variables: vars, collections: colls },
+        Command::Insert { parent: page, index: 0, nodes: vec![Node::rectangle(id, Rect::new(0.0, 0.0, 4.0, 4.0))] },
+    ]);
+    agent_exec(&mut agent, &mut hist, &mut ops, batch);
+    assert!(matches!(&ops[0], LiveOp::Variables { collections, variables, removed_collections, removed_variables }
+        if collections.len() == 1 && variables.len() == 1 && removed_collections.is_empty() && removed_variables.is_empty()));
+
+    let mut state = LivePatchState::default();
+    let report = replay(&mut full, ops.clone(), &mut state);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert_eq!(report.applied, 2);
+    assert!(full.variable_collections.contains_key("easeui") && full.variables.contains_key("easeui/v"));
+    assert!(full.variable_collections.contains_key("user") && full.variables.contains_key("user/v"), "the editor's own variables survive");
+
+    // A repeated delivery changes nothing.
+    let again = replay(&mut full, ops, &mut state);
+    assert_eq!(again.applied, 0);
+    assert_eq!(again.duplicates, 2);
+
+    // Undoing on the agent removes exactly what the agent added.
+    let undo = hist_peek(&hist);
+    let mut undo_ops = live_ops_for_command(&agent, &undo).unwrap();
+    hist.undo(&mut agent).unwrap();
+    assert!(matches!(undo_ops.iter().find(|o| matches!(o, LiveOp::Variables { .. })),
+        Some(LiveOp::Variables { removed_collections, removed_variables, collections, variables })
+            if removed_collections == &["easeui".to_string()] && removed_variables == &["easeui/v".to_string()] && collections.is_empty() && variables.is_empty()));
+    let report = replay(&mut full, std::mem::take(&mut undo_ops), &mut state);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert_eq!((full.variables.clone(), full.variable_collections.clone()), user_data);
+}
+
+#[test]
+fn a_variable_op_without_an_id_is_refused() {
+    let (mut full, _, _) = full_doc(1, 0);
+    let before = full.variables.clone();
+    let op = LiveOp::Variables { collections: Vec::new(), variables: vec![variable("", "c")], removed_collections: Vec::new(), removed_variables: Vec::new() };
+    let report = replay(&mut full, vec![op], &mut LivePatchState::default());
+    assert_eq!(report.skipped.len(), 1);
+    assert_eq!(full.variables, before);
+}
+
 #[test]
 fn edits_the_editor_cannot_replay_are_refused() {
     let (doc, _, _) = full_doc(1, 0);

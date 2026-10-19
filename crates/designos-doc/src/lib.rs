@@ -49,6 +49,9 @@ mod settings;
 mod slot_model_tests;
 pub mod spec;
 pub mod spec_bind;
+#[cfg(test)]
+mod spec_bind_rollback_label_tests;
+mod spec_data;
 mod styles_ops;
 mod text_fills;
 mod textmodel;
