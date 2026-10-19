@@ -164,7 +164,7 @@ fn resolve(doc: &mut Document, op: &LiveOp, state: &mut LivePatchState, report: 
             if set.keys().chain(unset).any(|k| LAYOUT_FIELDS.contains(&k.as_str())) {
                 report.needs_layout.push(id);
             }
-            Some(Command::Update { node: Box::new(merged) })
+            Some(crate::writer_command(doc, Command::Update { node: Box::new(merged) }).cmd)
         }
         LiveOp::Reparent { id: agent_id, parent: agent_parent, at } => {
             let (id, id_redirected) = resolve_id(&state.remap, &state.replaced, doc, *agent_id);
