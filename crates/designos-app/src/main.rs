@@ -1,5 +1,6 @@
 pub mod agent_sessions;
 mod agent_start_failure;
+pub mod agent_usage;
 mod app;
 mod board;
 mod canvas;

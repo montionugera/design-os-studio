@@ -412,6 +412,10 @@ pub struct TerminalTab {
     pub session_uuid: Option<String>,
     /// True when this tab was opened by resuming an entry from `sessions.json`.
     pub is_resumed: bool,
+    /// Asynchronous token and cost usage tracker (`#678`).
+    pub usage: crate::agent_usage::TabUsageTracker,
+    /// Last observed `AgentTabStatus` used to trigger event-driven usage refreshes on turn transitions (`#678`).
+    pub last_usage_status: Option<AgentTabStatus>,
 }
 
 impl TerminalTab {
@@ -561,7 +565,28 @@ impl TerminalTab {
             start_failure: None,
             session_uuid: None,
             is_resumed: false,
+            usage: crate::agent_usage::TabUsageTracker::default(),
+            last_usage_status: None,
         })
+    }
+
+    /// Validated [`crate::agent_usage::UsageReading`] for this tab (`None` for CLIs without a usable source).
+    pub fn usage_reading(&self) -> Option<crate::agent_usage::UsageReading> {
+        if !crate::agent_usage::cli_has_usable_usage_source(self.spawn_preset) {
+            return None;
+        }
+        self.usage.reading()
+    }
+
+    /// Compact header strip caption (`"in 12.4k · out 3.1k"` or `"in 12.4k · out 3.1k · $0.42 ref."`),
+    /// or `None` when no reading is available (`#678` §3.1, §7).
+    pub fn header_usage_caption(&self) -> Option<String> {
+        crate::agent_usage::header_usage_caption_for_tab(self.spawn_preset, self.usage_reading().as_ref())
+    }
+
+    /// Hover tooltip text for this tab (`#678` §3.7, §7).
+    pub fn usage_tooltip_text(&self) -> Option<String> {
+        crate::agent_usage::tooltip_usage_text_for_tab(self.spawn_preset, self.usage_reading().as_ref())
     }
 
     /// Test helper: Claude `spawn_preset` running a stub that prints and exits (no `$SHELL` fallback).
@@ -1031,10 +1056,11 @@ impl TerminalState {
             let _ = atomic_write_session_file(&context_reply_path, &bytes);
         }
         let status_path = self.session_dir.join("agent-status.json");
-        if let Ok(bytes) = serde_json::to_vec_pretty(&session_hooks_settings(&status_path, Some(&context_reply_path))) {
+        let transcript_capture_path = self.session_dir.join(crate::agent_usage::CLAUDE_TRANSCRIPT_META_FILENAME);
+        if let Ok(bytes) = serde_json::to_vec_pretty(&session_hooks_settings(&status_path, Some(&context_reply_path), Some(&transcript_capture_path))) {
             let _ = atomic_write_session_file(&self.session_dir.join("hooks.json"), &bytes);
         }
-        if let Ok(bytes) = serde_json::to_vec_pretty(&session_hooks_settings(&status_path, None)) {
+        if let Ok(bytes) = serde_json::to_vec_pretty(&session_hooks_settings(&status_path, None, None)) {
             let _ = atomic_write_session_file(&self.session_dir.join(".grok").join("hooks").join("designos-status.json"), &bytes);
         }
         if let Ok(bytes) = serde_json::to_vec_pretty(&agy_session_hooks(&status_path)) {
@@ -1413,6 +1439,12 @@ impl TerminalState {
                 if let Some(title) = custom_title {
                     tab.title = title;
                 }
+                if is_resumed && crate::agent_usage::cli_has_usable_usage_source(preset) {
+                    let cache_key = session_uuid.as_deref().unwrap_or(preset.binary_name());
+                    if let Some(cached) = crate::agent_usage::load_cached_usage(&self.session_dir, cache_key) {
+                        tab.usage.set_reading(Some(cached));
+                    }
+                }
                 if register_new_entry && crate::agent_sessions::is_registrable_cli(preset) {
                     let now = crate::agent_sessions::unix_timestamp_secs();
                     let entry = crate::agent_sessions::SessionEntry {
@@ -1431,6 +1463,9 @@ impl TerminalState {
                 }
                 self.tabs.push(tab);
                 self.active_tab = self.tabs.len() - 1;
+                if is_resumed {
+                    self.refresh_tab_usage(self.active_tab);
+                }
                 self.viewport_focused = true;
                 self.status_msg = Some(format!("Spawned {} ({} · {})", preset.tab_title(), self.doc_name, self.current_page_name));
                 Ok(self.active_tab)
@@ -1439,6 +1474,24 @@ impl TerminalState {
                 self.status_msg = Some(format!("PTY error: {e}"));
                 Err(e)
             }
+        }
+    }
+
+    /// Triggers an asynchronous, off-UI-thread usage refresh for `tab_idx` (`#678` §3.4, §3.5, §11).
+    /// Does nothing for CLIs without a verified usage source (`Codex`, `Antigravity`, `Shell`).
+    pub fn refresh_tab_usage(&mut self, tab_idx: usize) {
+        let Some(tab) = self.tabs.get(tab_idx) else { return };
+        match tab.spawn_preset {
+            AgentCliPreset::Claude => {
+                tab.usage.trigger_claude_transcript_poll(self.session_dir.clone(), tab.session_uuid.clone());
+            }
+            AgentCliPreset::Grok => {
+                if let Some(sid) = tab.session_uuid.clone() {
+                    let grok_bin = crate::agent_usage::resolve_grok_binary(&self.path_prepend);
+                    tab.usage.trigger_grok_usage(grok_bin, sid, crate::agent_usage::GROK_USAGE_TIMEOUT, Some(self.session_dir.clone()));
+                }
+            }
+            AgentCliPreset::Codex | AgentCliPreset::Antigravity | AgentCliPreset::Shell | AgentCliPreset::DesignOsHelp => {}
         }
     }
 
@@ -1597,6 +1650,35 @@ impl TerminalState {
                     }
                 }
             }
+        }
+
+        // Channel 4: Event-driven per-tab token & cost usage refresh (`#678` §3.4, §3.5, §11).
+        // Refreshes on turn-status transitions (e.g. turn end -> `Done`) and every 5 s while a Claude tab is `Working`.
+        let mut usage_refresh_indices = Vec::new();
+        for (idx, tab) in self.tabs.iter_mut().enumerate() {
+            if !crate::agent_usage::cli_has_usable_usage_source(tab.spawn_preset) {
+                continue;
+            }
+            let current_status = tab.agent_status.lock().ok().map(|g| g.clone()).unwrap_or_default();
+            let status_changed = tab.last_usage_status.as_ref() != Some(&current_status);
+            if status_changed {
+                let prev = tab.last_usage_status.replace(current_status.clone());
+                if matches!(current_status, AgentTabStatus::Done | AgentTabStatus::WaitingForInput(_))
+                    || (prev.is_some() && matches!(current_status, AgentTabStatus::Working(_)))
+                {
+                    usage_refresh_indices.push(idx);
+                    continue;
+                }
+            }
+            if tab.spawn_preset == AgentCliPreset::Claude
+                && matches!(current_status, AgentTabStatus::Working(_))
+                && tab.usage.elapsed_since_last_poll().is_none_or(|d| d >= crate::agent_usage::WORKING_POLL_INTERVAL)
+            {
+                usage_refresh_indices.push(idx);
+            }
+        }
+        for idx in usage_refresh_indices {
+            self.refresh_tab_usage(idx);
         }
 
         let mut agent_exited = false;
@@ -2485,8 +2567,12 @@ fn status_hook_command(status_path: &Path, state: &str) -> String {
     format!("printf '{{\"state\":\"{state}\"}}\\n' > '{}'", status_path.display())
 }
 
-fn command_handler_group(command: String) -> serde_json::Value {
-    serde_json::json!([{ "matcher": "*", "hooks": [{ "type": "command", "command": command }] }])
+fn command_handler_group(command: String, capture_command: Option<&str>) -> serde_json::Value {
+    let mut hooks = vec![serde_json::json!({ "type": "command", "command": command })];
+    if let Some(cap) = capture_command {
+        hooks.push(serde_json::json!({ "type": "command", "command": cap }));
+    }
+    serde_json::json!([{ "matcher": "*", "hooks": hooks }])
 }
 
 /// Session hooks in Claude's settings shape (`{"hooks": {Event: [{matcher, hooks: [...]}]}}`) for the
@@ -2494,18 +2580,22 @@ fn command_handler_group(command: String) -> serde_json::Value {
 /// `additionalContext` reply carrying the page (never the selection). Without it the prompt hook prints
 /// nothing: Grok reads any stdout that starts with `{` as a decision (a context reply shows as a
 /// failed hook) and discards an allowing hook's context anyway.
-fn session_hooks_settings(status_path: &Path, context_reply: Option<&Path>) -> serde_json::Value {
+/// With `transcript_capture`, each Claude hook event also includes a capture handler that records
+/// `session_id` and `transcript_path` once per session to `claude-transcript.json` (`#678`).
+fn session_hooks_settings(status_path: &Path, context_reply: Option<&Path>, transcript_capture: Option<&Path>) -> serde_json::Value {
     let prompt = match context_reply {
         Some(reply) => format!("{} && cat '{}'", status_hook_command(status_path, "working"), reply.display()),
         None => status_hook_command(status_path, "working"),
     };
+    let capture_cmd = transcript_capture.map(crate::agent_usage::claude_transcript_capture_command);
+    let cap = capture_cmd.as_deref();
     serde_json::json!({
         "hooks": {
-            "UserPromptSubmit": command_handler_group(prompt),
-            "PreToolUse": command_handler_group(status_hook_command(status_path, "working")),
-            "PostToolUse": command_handler_group(status_hook_command(status_path, "working")),
-            "PermissionRequest": command_handler_group(status_hook_command(status_path, "waiting")),
-            "Stop": command_handler_group(status_hook_command(status_path, "done")),
+            "UserPromptSubmit": command_handler_group(prompt, cap),
+            "PreToolUse": command_handler_group(status_hook_command(status_path, "working"), cap),
+            "PostToolUse": command_handler_group(status_hook_command(status_path, "working"), cap),
+            "PermissionRequest": command_handler_group(status_hook_command(status_path, "waiting"), cap),
+            "Stop": command_handler_group(status_hook_command(status_path, "done"), cap),
         }
     })
 }
@@ -2810,6 +2900,7 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
             let t_hit_rect =
                 if can_close { Rect::from_min_max(t_rect.min, Pos2::new((close_rect.left() - 2.0).max(t_rect.left() + 16.0), t_rect.max.y)) } else { t_rect };
             let tab_resp = ui.interact(t_hit_rect, Id::new(("agents-left-tab-select", tab.id)), Sense::click());
+            let tab_resp = if let Some(tip) = tab.usage_tooltip_text() { tab_resp.on_hover_text(tip) } else { tab_resp };
             let close_resp = if can_close { Some(ui.interact(close_rect, Id::new(("agents-left-tab-close", tab.id)), Sense::click())) } else { None };
 
             let bg = if is_active {
@@ -2854,6 +2945,7 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
             state.active_tab = idx;
             state.viewport_focused = true;
             state.runtime_dropdown_open = false;
+            state.refresh_tab_usage(idx);
         }
         if let Some(idx) = tab_to_close {
             state.close_tab(idx);
@@ -2882,13 +2974,35 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
             state.runtime_dropdown_open = !state.runtime_dropdown_open;
         }
 
-        // Active File + Page Context Strip (20px) so the user & agent always see the bound Page
+        // Active File + Page Context Strip (20px) so the user & agent always see the bound Page,
+        // plus the active tab's verified token/cost readout at the right end (`#678` §7).
         let ctx_h = 20.0;
         let ctx_r = Rect::from_min_size(Pos2::new(rect.left(), bar_r.bottom()), Vec2::new(rect.width(), ctx_h));
         p.rect_filled(ctx_r, 0.0, TERM_BG_ELEVATED);
         widgets::hline(&p, ctx_r.left(), ctx_r.right(), ctx_r.bottom() - 1.0, TERM_BORDER);
+        let active_usage_caption = state.active_tab().and_then(|t| t.header_usage_caption());
+        let active_usage_tooltip = state.active_tab().and_then(|t| t.usage_tooltip_text());
+        let usage_reserved_w = if let Some(ref cap) = active_usage_caption {
+            let max_cap_w = (ctx_r.width() * 0.62).max(60.0);
+            let cap_elided = widgets::elide(&p, cap, &theme::font_mono(), max_cap_w);
+            let cap_w = widgets::text_width(&p, &cap_elided, &theme::font_mono());
+            let cap_rect = Rect::from_min_max(
+                Pos2::new((ctx_r.right() - cap_w - 10.0).max(ctx_r.left() + 64.0), ctx_r.top()),
+                Pos2::new(ctx_r.right() - 6.0, ctx_r.bottom()),
+            );
+            p.text(Pos2::new(ctx_r.right() - 8.0, ctx_r.center().y), Align2::RIGHT_CENTER, cap_elided, theme::font_mono(), theme::TEXT_SECONDARY);
+            let cap_resp = ui.interact(cap_rect, Id::new("agents-header-usage"), Sense::hover());
+            if let Some(tip) = active_usage_tooltip {
+                let _ = cap_resp.on_hover_text(tip);
+            }
+            widgets::record(ui, "agents-header-usage", cap_rect);
+            cap_w + 16.0
+        } else {
+            ui.ctx().data_mut(|d| d.remove::<Rect>(Id::new(("test-rect", "agents-header-usage".to_string()))));
+            0.0
+        };
         let ctx_badge = format!("{} · {}", state.doc_name, state.current_page_name);
-        let ctx_elided = widgets::elide(&p, &ctx_badge, &theme::font_caption(), (ctx_r.width() - 24.0).max(40.0));
+        let ctx_elided = widgets::elide(&p, &ctx_badge, &theme::font_caption(), (ctx_r.width() - 24.0 - usage_reserved_w).max(32.0));
         p.circle_filled(Pos2::new(ctx_r.left() + 10.0, ctx_r.center().y), 2.5, STATUS_INFO_TEXT);
         p.text(Pos2::new(ctx_r.left() + 17.0, ctx_r.center().y), Align2::LEFT_CENTER, ctx_elided, theme::font_caption(), STATUS_INFO_TEXT);
 
@@ -3789,6 +3903,24 @@ fn render_terminal_surface(state: &mut TerminalState, ui: &mut Ui, rect: Rect, f
         actions.push(TerminalAction::ExportSelectionToTerminal);
     }
 
+    if let Some(cap) = state.active_tab().and_then(|t| t.header_usage_caption()) {
+        let cap_w = widgets::text_width(&p, &cap, &theme::font_mono());
+        if right_x - cap_w - 12.0 > tab_bar_rect.left() + 180.0 {
+            let cap_rect = Rect::from_min_max(Pos2::new(right_x - cap_w - 6.0, tab_bar_rect.top() + 4.0), Pos2::new(right_x, tab_bar_rect.bottom() - 4.0));
+            p.text(Pos2::new(right_x - 2.0, btn_cy), Align2::RIGHT_CENTER, cap, theme::font_mono(), theme::TEXT_SECONDARY);
+            let cap_resp = ui.interact(cap_rect, Id::new((surface_id, "agents-header-usage")), Sense::hover());
+            if let Some(tip) = state.active_tab().and_then(|t| t.usage_tooltip_text()) {
+                let _ = cap_resp.on_hover_text(tip);
+            }
+            widgets::record(ui, "agents-header-usage", cap_rect);
+            right_x = cap_rect.left() - 8.0;
+        } else {
+            ui.ctx().data_mut(|d| d.remove::<Rect>(Id::new(("test-rect", "agents-header-usage".to_string()))));
+        }
+    } else {
+        ui.ctx().data_mut(|d| d.remove::<Rect>(Id::new(("test-rect", "agents-header-usage".to_string()))));
+    }
+
     // Left side of Tab Bar: Session Tabs + Quick-Launch Preset Buttons
     let mut left_x = tab_bar_rect.left() + 8.0;
     let mut tab_to_select: Option<usize> = None;
@@ -3804,6 +3936,7 @@ fn render_terminal_surface(state: &mut TerminalState, ui: &mut Ui, rect: Rect, f
         let close_rect = Rect::from_min_size(Pos2::new(t_rect.right() - 18.0, t_rect.center().y - 7.0), Vec2::new(14.0, 14.0));
         let t_hit_rect = Rect::from_min_max(t_rect.min, Pos2::new((close_rect.left() - 2.0).max(t_rect.left() + 16.0), t_rect.max.y));
         let tab_resp = ui.interact(t_hit_rect, Id::new((surface_id, "term-tab-select", tab.id)), Sense::click());
+        let tab_resp = if let Some(tip) = tab.usage_tooltip_text() { tab_resp.on_hover_text(tip) } else { tab_resp };
         let close_resp = ui.interact(close_rect, Id::new((surface_id, "term-tab-close", tab.id)), Sense::click());
 
         let bg = if is_active {
@@ -3845,6 +3978,7 @@ fn render_terminal_surface(state: &mut TerminalState, ui: &mut Ui, rect: Rect, f
     if let Some(idx) = tab_to_select {
         state.active_tab = idx;
         state.viewport_focused = true;
+        state.refresh_tab_usage(idx);
     }
     if let Some(idx) = tab_to_close {
         state.close_tab(idx);
@@ -6092,5 +6226,60 @@ Done!
         assert_eq!(failure.cause, agent_start_failure::StartFailureCause::NotLoggedIn);
         assert_eq!(failure.fix, FixAction::RunLogin("grok login"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn header_strip_shows_usage_only_when_active_tab_has_a_reading() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx);
+        let panel_rect = Rect::from_min_size(Pos2::new(48.0, 0.0), Vec2::new(320.0, 800.0));
+
+        let mut st = TerminalState::for_tab(760);
+        // Active Codex tab: no reading -> no agents-header-usage rect.
+        let mut codex_tab = TerminalTab::spawn(1, AgentCliPreset::Shell, 24, 80, None).expect("spawn stub tab");
+        codex_tab.spawn_preset = AgentCliPreset::Codex;
+        codex_tab.usage = crate::agent_usage::TabUsageTracker::new(None);
+
+        let mut claude_tab = TerminalTab::spawn(2, AgentCliPreset::Shell, 24, 80, None).expect("spawn stub tab");
+        claude_tab.spawn_preset = AgentCliPreset::Claude;
+        claude_tab.usage = crate::agent_usage::TabUsageTracker::new(Some(crate::agent_usage::UsageReading {
+            input: 41_000,
+            output: 1_300,
+            cost: None,
+            source: crate::agent_usage::UsageSource::ClaudeTranscript,
+            as_of_ms: 1,
+        }));
+
+        let mut agy_tab = TerminalTab::spawn(3, AgentCliPreset::Shell, 24, 80, None).expect("spawn stub tab");
+        agy_tab.spawn_preset = AgentCliPreset::Antigravity;
+        agy_tab.usage = crate::agent_usage::TabUsageTracker::new(None);
+
+        st.tabs = vec![codex_tab, claude_tab, agy_tab];
+        st.active_tab = 0;
+
+        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0))), ..Default::default() };
+        let _ = ctx.run_ui(raw.clone(), |ui| {
+            let _ = show_left(&mut st, ui, panel_rect, None);
+        });
+        let codex_rect: Option<Rect> = ctx.data(|d| d.get_temp(Id::new(("test-rect", "agents-header-usage".to_string()))));
+        assert!(codex_rect.is_none(), "Codex tab must not paint agents-header-usage: {codex_rect:?}");
+
+        // Switch to the Claude tab with a reading -> agents-header-usage is painted.
+        st.active_tab = 1;
+        let _ = ctx.run_ui(raw.clone(), |ui| {
+            let _ = show_left(&mut st, ui, panel_rect, None);
+        });
+        let claude_rect: Option<Rect> = ctx.data(|d| d.get_temp(Id::new(("test-rect", "agents-header-usage".to_string()))));
+        assert!(claude_rect.is_some(), "Claude tab with reading must paint agents-header-usage");
+
+        // Switch to the Antigravity tab -> agents-header-usage is not painted.
+        st.active_tab = 2;
+        let _ = ctx.run_ui(raw, |ui| {
+            let _ = show_left(&mut st, ui, panel_rect, None);
+        });
+        let agy_rect: Option<Rect> = ctx.data(|d| d.get_temp(Id::new(("test-rect", "agents-header-usage".to_string()))));
+        assert!(agy_rect.is_none(), "Antigravity tab must not paint agents-header-usage: {agy_rect:?}");
+        kill_tabs(&mut st);
     }
 }
