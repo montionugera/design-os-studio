@@ -3261,8 +3261,8 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
         }
     });
 
-    let off_20 = theme::SPACE_SECTION + theme::SPACE_TIGHT;
-    let off_5 = theme::SPACE_TIGHT + 1.0;
+    let off_20 = theme::SPACE_BLOCK + theme::SPACE_ROW;
+    let off_5 = theme::SPACE_ROW + theme::BORDER_WIDTH;
     let icon_y = composer_rect.bottom() - off_20;
     let icon_gray = Color32::from_rgb(0xB3, 0xB3, 0xB3);
 
@@ -3286,7 +3286,7 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
     }
 
     // Bottom-left open-book button (toggles in-panel live PTY terminal / prompt library)
-    let off_46 = theme::ROW_HEIGHT_COMPACT + off_20 + 2.0;
+    let off_46 = theme::CONTROL_DENSE + off_20 + theme::INSET_SEGMENT;
     let book_r = Rect::from_center_size(Pos2::new(composer_rect.left() + off_46, icon_y), Vec2::splat(22.0));
     let book_resp = ui.interact(book_r, Id::new("agents-composer-book"), Sense::click());
     if book_resp.hovered() {
@@ -3299,7 +3299,7 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
     }
 
     // Bottom-left `PRD` context chip button (attaches/cycles `@prd `, `@selection `, `@tokens `)
-    let off_82 = theme::ROW_HEIGHT_STANDARD * 2.0 + off_20 + theme::SPACE_ROW_GAP;
+    let off_82 = theme::CONTROL_STANDARD * 2.0 + off_20 + theme::SPACE_ROW;
     let prd_r = Rect::from_center_size(Pos2::new(composer_rect.left() + off_82, icon_y), Vec2::new(38.0, 20.0));
     let prd_resp = ui.interact(prd_r, Id::new("agents-composer-prd"), Sense::click());
     let lower_in = state.input_line.to_ascii_lowercase();
@@ -3343,7 +3343,7 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
     }
 
     // Bottom-right Microphone circle button (`26x26` `#2D364D` circle + `#6EA8FE` mic glyph)
-    let off_50 = theme::ROW_HEIGHT_STANDARD + off_20 + 2.0;
+    let off_50 = theme::CONTROL_STANDARD + off_20 + theme::INSET_SEGMENT;
     let mic_center = Pos2::new(composer_rect.right() - off_50, icon_y);
     let mic_r = Rect::from_center_size(mic_center, Vec2::splat(26.0));
     let mic_resp = ui.interact(mic_r, Id::new("agents-composer-mic"), Sense::click());
@@ -3361,7 +3361,7 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
 
     // Bottom-right Up-Arrow Send circle button (`26x26` `#383838` / `#0D99FF` circle + `↑` arrow)
     let has_text = !state.input_line.trim().is_empty();
-    let off_18 = theme::SPACE_PANEL_PAD + theme::SPACE_ROW_GAP;
+    let off_18 = theme::INSET_PANEL + theme::INSET_SEGMENT;
     let send_center = Pos2::new(composer_rect.right() - off_18, icon_y);
     let send_r = Rect::from_center_size(send_center, Vec2::splat(26.0));
     let send_resp = ui.interact(send_r, Id::new("agents-composer-send"), Sense::click());
