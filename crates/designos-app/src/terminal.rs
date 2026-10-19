@@ -5099,6 +5099,7 @@ Done!
     #[test]
     fn export_selection_pastes_fixed_sentence_only() {
         let mut st = TerminalState::default();
+        st.bind_session(&format!("test-export-sel-{}", std::process::id()));
         st.spawn_tab(AgentCliPreset::Shell, None).expect("spawn");
         st.active_tab_mut().unwrap().spawn_preset = AgentCliPreset::Claude;
         let rec = attach_recorder(st.active_tab_mut().unwrap());
@@ -5155,6 +5156,7 @@ Done!
         let _ = std::fs::remove_file(&marker);
 
         let mut st = TerminalState::default();
+        st.bind_session(&format!("test-dead-tab-{}", std::process::id()));
         spawn_stub_exiting_agent_into(&mut st);
         assert!(wait_until_tab_exits(&mut st, 8), "stub agent must exit");
         assert!(!st.active_tab_mut().unwrap().is_alive());
@@ -5628,6 +5630,7 @@ Done!
     /// bridge is not polled here, so each test decides the spawn time the exit is judged against.
     fn exited_stub_state() -> TerminalState {
         let mut st = TerminalState::default();
+        st.bind_session(&format!("test-dead-tab-{}", std::process::id()));
         spawn_stub_exiting_agent_into(&mut st);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while st.active_tab_mut().unwrap().is_alive() {
