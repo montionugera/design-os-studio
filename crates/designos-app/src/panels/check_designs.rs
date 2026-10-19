@@ -2,7 +2,7 @@
 //! one-click Fix per finding and Fix all. Clicking a row selects and frames the layer.
 
 use crate::app::App;
-use crate::check_designs::{Finding, Report, Rule, MAX_SCANNED_LAYERS};
+use crate::check_designs::{Finding, Report, Rule, Truncation, MAX_SCANNED_LAYERS, MAX_VISITED_LAYERS};
 use crate::icons::{self, Icon};
 use crate::terminal::{STATUS_BAD_TEXT, STATUS_INFO_TEXT, STATUS_OK_TEXT, STATUS_WARN_BG, STATUS_WARN_BORDER, STATUS_WARN_TEXT};
 use crate::theme;
@@ -149,7 +149,7 @@ pub fn show(app: &mut App, ctx: &Context) {
                     }
                 }
                 if report.truncated {
-                    truncation_note(ui);
+                    truncation_note(ui, report.truncated_by);
                 }
             });
         });
@@ -258,13 +258,20 @@ fn empty_state(ui: &mut Ui, scanned: usize) {
     p.galley(Pos2::new(rect.center().x - galley.size().x / 2.0, rect.top() + 66.0), galley, theme::TEXT_SECONDARY);
 }
 
-fn truncation_note(ui: &mut Ui) {
+pub(crate) fn truncation_text(truncated_by: Option<Truncation>) -> String {
+    match truncated_by {
+        Some(Truncation::Work) => format!("Stopped after {MAX_VISITED_LAYERS} layers examined. Check a smaller selection to see the rest."),
+        Some(Truncation::Scanned) | None => format!("Stopped after {MAX_SCANNED_LAYERS} checked layers. Check a smaller selection to see the rest."),
+    }
+}
+
+fn truncation_note(ui: &mut Ui, truncated_by: Option<Truncation>) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(PANEL_W, NOTE_H), Sense::hover());
     let p = ui.painter();
     let inner = rect.shrink2(Vec2::new(PAD, 6.0));
     p.rect_filled(inner, theme::cr(theme::RADIUS_CONTROL), STATUS_WARN_BG);
     p.rect_stroke(inner, theme::cr(theme::RADIUS_CONTROL), Stroke::new(1.0, STATUS_WARN_BORDER), StrokeKind::Inside);
-    let note = format!("Stopped after {MAX_SCANNED_LAYERS} layers. Select fewer layers to check the rest.");
+    let note = truncation_text(truncated_by);
     let galley = p.layout(note, theme::font_body(), STATUS_WARN_TEXT, inner.width() - theme::SPACE_BLOCK);
     p.galley(Pos2::new(inner.left() + theme::SPACE_INLINE, inner.center().y - galley.size().y / 2.0), galley, STATUS_WARN_TEXT);
 }
