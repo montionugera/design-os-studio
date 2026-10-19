@@ -923,7 +923,9 @@ pub fn attach_diff_to_reply(before_doc: &Document, after_doc: &Document, touched
     let (diff_val, content_blocks) = compute_mutation_diff(before_doc, after_doc, touched_hints);
     if let Some(obj) = out.as_object_mut() {
         obj.insert("diff".into(), diff_val);
-        obj.insert("content".into(), Value::Array(content_blocks));
+        if !content_blocks.is_empty() {
+            obj.insert("content".into(), Value::Array(content_blocks));
+        }
     }
 }
 
