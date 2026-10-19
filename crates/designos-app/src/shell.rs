@@ -1146,6 +1146,8 @@ impl Shell {
         if let Some(ai_copy) = self.app.specs.last_ai_copy.take() {
             self.app.terminal.send_copy_for_ai(&ai_copy);
         }
+        self.app.terminal.window_focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        self.app.terminal.surface_visible = (!self.app.ui.left_collapsed && is_ai_panel) || self.app.terminal.dock_open;
         let bridge_actions = self.app.terminal.poll_live_agent_bridge();
         if !bridge_actions.is_empty() {
             execute_terminal_actions(&mut self.app, bridge_actions);

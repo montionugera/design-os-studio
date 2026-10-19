@@ -372,7 +372,7 @@ pub enum TerminalAction {
     ExportSelectionToTerminal,
 }
 
-/// Orca 3-tier live agent execution status (`Working` / `WaitingForInput` / `Done` / `Idle`).
+/// Live agent tab execution status (`#683` §3.3, §4).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum AgentTabStatus {
     #[default]
@@ -380,6 +380,8 @@ pub enum AgentTabStatus {
     Working(Option<String>),
     WaitingForInput(Option<String>),
     Done,
+    Error(Option<String>),
+    Stopped,
 }
 
 /// One live interactive PTY tab backed by `portable-pty` and a `vt100::Parser`.
@@ -412,6 +414,12 @@ pub struct TerminalTab {
     pub session_uuid: Option<String>,
     /// True when this tab was opened by resuming an entry from `sessions.json`.
     pub is_resumed: bool,
+    /// Set when a turn ends while this tab is not visible; cleared when the user shows the tab (`#683` §3.3).
+    pub unread: bool,
+    /// Name of the document this tab belongs to (`#683` §8.6).
+    pub doc_name: String,
+    /// Per-tab turn state machine and receipt ledger (`#683` §3.3, §3.5).
+    pub turn_tracker: crate::agent_turn_status::TabTurnTracker,
 }
 
 impl TerminalTab {
@@ -495,6 +503,7 @@ impl TerminalTab {
         let status_bg = Arc::clone(&agent_status);
         let output_at_bg = Arc::clone(&last_output_at);
 
+        let uses_pty_heuristic = preset == AgentCliPreset::Codex;
         std::thread::Builder::new()
             .name(format!("designos-pty-reader-{id}"))
             .spawn(move || {
@@ -507,10 +516,13 @@ impl TerminalTab {
                                 *ts = Some(std::time::Instant::now());
                             }
                             let chunk = String::from_utf8_lossy(&buf[..n]);
+                            let has_osc = chunk.contains("\x1b]9999;");
                             let (clean_chunk, detected_status) = parse_osc_agent_status_and_strip(&chunk);
-                            if let Some(next_status) = detected_status {
-                                if let Ok(mut st) = status_bg.lock() {
-                                    *st = next_status;
+                            if uses_pty_heuristic || has_osc {
+                                if let Some(next_status) = detected_status {
+                                    if let Ok(mut st) = status_bg.lock() {
+                                        *st = next_status;
+                                    }
                                 }
                             }
                             if let Ok(mut p) = parser_bg.lock() {
@@ -540,6 +552,7 @@ impl TerminalTab {
             })
             .map_err(|e| format!("failed to spawn PTY reader thread: {e}"))?;
 
+        let doc_name = session.map(|s| s.doc_name.clone()).unwrap_or_else(|| "Untitled".to_string());
         Ok(Self {
             id,
             title: format!("{} #{}", preset.button_label(), id),
@@ -561,7 +574,56 @@ impl TerminalTab {
             start_failure: None,
             session_uuid: None,
             is_resumed: false,
+            unread: false,
+            doc_name,
+            turn_tracker: crate::agent_turn_status::TabTurnTracker::default(),
         })
+    }
+
+    /// Effective status of this tab (`#683` §3.3, §4).
+    /// Codex uses the PTY output-burst heuristic (`terminal.rs:510`, `2270`); Claude, Grok, and Antigravity
+    /// are driven by `agent-events.jsonl` hook records.
+    pub fn effective_status(&self) -> AgentTabStatus {
+        let explicit_status = self.agent_status.lock().ok().map(|g| g.clone()).unwrap_or_default();
+        let recent_pty_activity = self.spawn_preset == AgentCliPreset::Codex
+            && self.last_output_at.lock().ok().and_then(|g| *g).is_some_and(|ts| ts.elapsed() < std::time::Duration::from_millis(600));
+        match explicit_status {
+            AgentTabStatus::Working(d) => AgentTabStatus::Working(d),
+            AgentTabStatus::WaitingForInput(d) => AgentTabStatus::WaitingForInput(d),
+            other if recent_pty_activity => AgentTabStatus::Working(None),
+            other => other,
+        }
+    }
+
+    /// Last completed turn receipt for this tab (`None` for Codex and Shell, which have no hook stream).
+    pub fn last_turn_receipt(&self) -> Option<&crate::agent_turn_status::TurnReceipt> {
+        if matches!(self.spawn_preset, AgentCliPreset::Codex | AgentCliPreset::Shell | AgentCliPreset::DesignOsHelp) {
+            return None;
+        }
+        self.turn_tracker.last_turn_receipt.as_ref()
+    }
+
+    /// Header status indicator (`(dot_color, text)`) when this tab is running, waiting for input, or in error (`#683` §5).
+    pub fn header_status_indicator(&self, now_s: u64) -> Option<(Color32, String)> {
+        match self.effective_status() {
+            AgentTabStatus::Working(detail) => {
+                let text = if self.turn_tracker.in_turn {
+                    self.turn_tracker.running_header_text(Some(now_s as f64))
+                } else {
+                    detail.unwrap_or_else(|| "Working…".to_string())
+                };
+                Some((theme::INFO, text))
+            }
+            AgentTabStatus::WaitingForInput(detail) => {
+                let text = detail.unwrap_or_else(|| "Waiting for approval".to_string());
+                Some((theme::WARNING, text))
+            }
+            AgentTabStatus::Error(reason) => {
+                let text = reason.unwrap_or_else(|| "Ended without a stop event".to_string());
+                Some((theme::DANGER, text))
+            }
+            AgentTabStatus::Idle | AgentTabStatus::Done | AgentTabStatus::Stopped => None,
+        }
     }
 
     /// Test helper: Claude `spawn_preset` running a stub that prints and exits (no `$SHELL` fallback).
@@ -714,6 +776,16 @@ pub struct TerminalState {
     pub agy_cwd_scoped: bool,
     /// Additional directories prepended at the front of `PATH` when spawning child PTYs.
     pub path_prepend: Vec<PathBuf>,
+    /// Append-only `agent-events.jsonl` reader (`#683` §3.1).
+    pub event_stream: crate::agent_turn_status::AgentEventStream,
+    /// Background desktop notification dispatcher (`#683` §3.7).
+    pub notifier: crate::agent_notify::AgentNotifier,
+    /// True when the Studio OS window currently has focus (`#683` §3.7).
+    pub window_focused: bool,
+    /// True when the Agents panel or Terminal dock is currently visible (`#683` §3.7).
+    pub surface_visible: bool,
+    /// Observed per-tab status transitions `(tab_id, new_status)` for tests and diagnostics (`#683` §10).
+    pub status_changes: Vec<(usize, AgentTabStatus)>,
 }
 
 impl Default for TerminalState {
@@ -755,6 +827,11 @@ impl TerminalState {
         let initial_spec_mtime = std::fs::metadata(&live_spec_path).and_then(|m| m.modified()).ok();
         let fallback_spec_mtime = std::fs::metadata("/tmp/designos-live-agent-out.spec.json").and_then(|m| m.modified()).ok();
         let live_patch = crate::live_patch_log::LivePatchLog::bind(session_dir.join("doc-patch.jsonl"));
+        let event_stream = crate::agent_turn_status::AgentEventStream::bind(session_dir.join("agent-events.jsonl"));
+        #[cfg(test)]
+        let notifier = crate::agent_notify::AgentNotifier::with_sink(Arc::new(crate::agent_notify::StubNotificationSink::new()));
+        #[cfg(not(test))]
+        let notifier = crate::agent_notify::AgentNotifier::default();
         Self {
             key: crate::agent_sessions::SessionKey::Fallback(session_id.clone()),
             session_id,
@@ -798,6 +875,11 @@ impl TerminalState {
             lock_owner: None,
             agy_cwd_scoped: false,
             path_prepend: Vec::new(),
+            event_stream,
+            notifier,
+            window_focused: true,
+            surface_visible: true,
+            status_changes: Vec::new(),
         }
     }
 
@@ -810,6 +892,7 @@ impl TerminalState {
         self.session_dir = session_dir;
         self.last_watched_mtime = std::fs::metadata(&self.live_spec_path).and_then(|m| m.modified()).ok();
         self.live_patch = crate::live_patch_log::LivePatchLog::bind(self.session_dir.join("doc-patch.jsonl"));
+        self.event_stream = crate::agent_turn_status::AgentEventStream::bind(self.session_dir.join("agent-events.jsonl"));
         self.last_synced_key = None;
     }
 
@@ -929,6 +1012,9 @@ impl TerminalState {
         self.current_page_id = page.0;
         self.current_page_name = doc.get(page).map(|n| n.name.clone()).unwrap_or_else(|| "Page 1".into());
         self.doc_name = if doc.name.trim().is_empty() { "Untitled".into() } else { doc.name.clone() };
+        for tab in &mut self.tabs {
+            tab.doc_name = self.doc_name.clone();
+        }
 
         // The canvas the agent reads must keep holding every edit the agent made. While one of its
         // edits waits for the user to finish, or the user is mid-edit, or deferred auto-layout
@@ -1587,13 +1673,45 @@ impl TerminalState {
             actions.push(TerminalAction::ApplyLiveLog(lines));
         }
 
-        // Channel 3: Scoped agent-status.json written by Claude/Codex/Grok/AGY session hooks
-        let status_file = self.session_dir.join("agent-status.json");
-        if let Ok(raw_status) = std::fs::read_to_string(&status_file) {
-            if let Some(parsed) = parse_agent_status_payload(raw_status.trim()) {
-                if let Some(tab) = self.active_tab() {
-                    if let Ok(mut st) = tab.agent_status.lock() {
-                        *st = parsed;
+        // Channel 3: Append-only agent-events.jsonl written by Claude, Grok, and Antigravity hooks (`#683`).
+        let has_eligible_tabs = self.tabs.iter().any(|t| matches!(t.spawn_preset, AgentCliPreset::Claude | AgentCliPreset::Grok | AgentCliPreset::Antigravity));
+        let records = self.event_stream.poll(has_eligible_tabs);
+        for record in records {
+            let tabs_info: Vec<crate::agent_turn_status::TabAttributionInfo> = self
+                .tabs
+                .iter_mut()
+                .enumerate()
+                .map(|(idx, t)| crate::agent_turn_status::TabAttributionInfo {
+                    idx,
+                    preset: t.spawn_preset,
+                    is_alive: t.is_alive(),
+                    session_uuid: t.session_uuid.clone(),
+                })
+                .collect();
+            if let Some(tab_idx) = crate::agent_turn_status::route_record_to_tab(&record, &tabs_info) {
+                let tab_visible = self.surface_visible && tab_idx == self.active_tab;
+                let effect = self.tabs[tab_idx].turn_tracker.on_event(&record);
+                if let Some(new_status) = effect.new_status {
+                    if let Ok(mut st) = self.tabs[tab_idx].agent_status.lock() {
+                        *st = new_status.clone();
+                    }
+                    let tab_id = self.tabs[tab_idx].id;
+                    self.status_changes.push((tab_id, new_status.clone()));
+                    if effect.mark_unread_if_hidden {
+                        if !tab_visible {
+                            self.tabs[tab_idx].unread = true;
+                        }
+                    } else if matches!(new_status, AgentTabStatus::Working(_)) {
+                        self.tabs[tab_idx].unread = false;
+                    }
+                }
+                if let Some(notify_kind) = effect.notify {
+                    let tab_id = self.tabs[tab_idx].id;
+                    let tab_title = self.tabs[tab_idx].title.clone();
+                    let doc_name = if self.tabs[tab_idx].doc_name.trim().is_empty() { self.doc_name.clone() } else { self.tabs[tab_idx].doc_name.clone() };
+                    let notif = crate::agent_notify::AgentNotification::new(tab_id, tab_title, doc_name, notify_kind);
+                    if let Some(denied_msg) = self.notifier.notify_if_background(self.window_focused, tab_visible, notif) {
+                        self.status_msg = Some(denied_msg);
                     }
                 }
             }
@@ -1602,7 +1720,9 @@ impl TerminalState {
         let mut agent_exited = false;
         let mut registry_dirty = false;
         let now_secs = crate::agent_sessions::unix_timestamp_secs();
-        for tab in &mut self.tabs {
+        let active_idx = self.active_tab;
+        let surface_vis = self.surface_visible;
+        for (idx, tab) in self.tabs.iter_mut().enumerate() {
             if tab.is_shell_process() || tab.exited_notice_shown {
                 continue;
             }
@@ -1616,6 +1736,16 @@ impl TerminalState {
                         diag.fix = FixAction::StartNewSession(tab.spawn_preset);
                     }
                     tab.start_failure = Some(diag);
+                }
+                let prev_status = tab.effective_status();
+                if let Some((next_status, _receipt)) = tab.turn_tracker.on_process_exit(now_secs as f64, &prev_status) {
+                    if let Ok(mut st) = tab.agent_status.lock() {
+                        *st = next_status.clone();
+                    }
+                    self.status_changes.push((tab.id, next_status));
+                    if !surface_vis || idx != active_idx {
+                        tab.unread = true;
+                    }
                 }
                 if let Some(entry) = self.session_registry.sessions.iter_mut().find(|s| s.tab_id == tab.id as u64) {
                     entry.last_active_at = now_secs;
@@ -1637,11 +1767,30 @@ impl TerminalState {
         if registry_dirty {
             let _ = crate::agent_sessions::save_registry(&self.session_dir, &self.session_registry);
         }
-        if agent_exited {
+        if agent_exited && self.status_msg.as_deref() != Some("Notifications are off") {
             self.status_msg = Some("Agent exited — this tab no longer accepts input. Open a new tab to continue.".into());
         }
 
         actions
+    }
+
+    /// Records distinct `NodeId`s touched by `doc-patch.jsonl` entries applied during the active turn (`#683` §3.4).
+    pub fn record_touched_layers(&mut self, node_ids: &[u64]) {
+        if node_ids.is_empty() {
+            return;
+        }
+        let mut recorded = false;
+        for tab in &mut self.tabs {
+            if tab.turn_tracker.in_turn {
+                tab.turn_tracker.record_touched_layers(node_ids.iter().copied());
+                recorded = true;
+            }
+        }
+        if !recorded {
+            if let Some(tab) = self.active_tab_mut() {
+                tab.turn_tracker.record_touched_layers(node_ids.iter().copied());
+            }
+        }
     }
 
     /// Dispatches a Figma AI task prompt into the active PTY session (spawning the first installed
@@ -2258,33 +2407,25 @@ pub fn paint_custom_terminal_glyph(p: &Painter, cell_rect: Rect, ch: char, fg: C
     true
 }
 
-/// Renders Orca's Dual-Glyph Live Agent Status (`Working` 12fps `#EAB308` spinner, `WaitingForInput`
-/// `#F97316` ring, `Done`/`Idle` `#10B981` emerald dot) + Provider Color Badge (`Claude` `#D97757`,
-/// `Codex` `#FAFAFA`, `Grok` `#E4E4E7`, `Antigravity` `#60A5FA`, `Shell` `>_`) inside a tab rect.
+/// Renders Orca's Dual-Glyph Live Agent Status (`Working` 12fps `theme::INFO` spinner, `WaitingForInput`
+/// `theme::WARNING` ring, `Done` unread `theme::SUCCESS` dot, `Idle`/`Stopped`/read `theme::TEXT_SECONDARY`,
+/// `Error` `theme::DANGER`) + Provider Color Badge (`Claude` `#D97757`, `Codex` `#FAFAFA`, `Grok` `#E4E4E7`,
+/// `Antigravity` `#60A5FA`, `Shell` `>_`) inside a tab rect (`#683` §5).
 fn paint_orca_tab_status_and_provider(ui: &Ui, p: &Painter, tab: &TerminalTab, t_rect: Rect) {
     let cy = t_rect.center().y;
     let status_center = Pos2::new(t_rect.left() + 7.5, cy);
     let provider_center = Pos2::new(t_rect.left() + 15.0, cy);
 
-    let explicit_status = tab.agent_status.lock().ok().map(|g| g.clone()).unwrap_or_default();
-    let recent_pty_activity = tab.preset != AgentCliPreset::Shell
-        && tab.last_output_at.lock().ok().and_then(|g| *g).is_some_and(|ts| ts.elapsed() < std::time::Duration::from_millis(600));
-
-    let effective_status = match explicit_status {
-        AgentTabStatus::Working(d) => AgentTabStatus::Working(d),
-        AgentTabStatus::WaitingForInput(d) => AgentTabStatus::WaitingForInput(d),
-        other if recent_pty_activity => AgentTabStatus::Working(None),
-        other => other,
-    };
+    let effective_status = tab.effective_status();
 
     match effective_status {
         AgentTabStatus::Working(_) => {
-            // Orca 12fps stepped rotating `#EAB308` arc spinner + 83ms repaint cadence
+            // Orca 12fps stepped rotating `theme::INFO` arc spinner + 83ms repaint cadence
             let step = ((ui.input(|i| i.time) * 12.0).floor() as i32).rem_euclid(12);
             let base_angle = (step as f32) * (std::f32::consts::TAU / 12.0);
             let arc_span = std::f32::consts::TAU * 0.68;
             let radius = 3.2f32;
-            let spin_col = Color32::from_rgb(0xEA, 0xB3, 0x08);
+            let spin_col = theme::INFO;
             let segs = 7usize;
             let mut prev = Pos2::new(status_center.x + radius * base_angle.cos(), status_center.y + radius * base_angle.sin());
             for i in 1..=segs {
@@ -2296,12 +2437,18 @@ fn paint_orca_tab_status_and_provider(ui: &Ui, p: &Painter, tab: &TerminalTab, t
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(83));
         }
         AgentTabStatus::WaitingForInput(_) => {
-            let wait_col = Color32::from_rgb(0xF9, 0x73, 0x16);
+            let wait_col = theme::WARNING;
             p.circle_stroke(status_center, 3.1, Stroke::new(1.3, wait_col));
             p.circle_filled(status_center, 1.2, wait_col);
         }
-        AgentTabStatus::Done | AgentTabStatus::Idle => {
-            p.circle_filled(status_center, 2.7, Color32::from_rgb(0x10, 0xB9, 0x81));
+        AgentTabStatus::Done if tab.unread => {
+            p.circle_filled(status_center, 2.7, theme::SUCCESS);
+        }
+        AgentTabStatus::Error(_) => {
+            p.circle_filled(status_center, 2.7, theme::DANGER);
+        }
+        AgentTabStatus::Done | AgentTabStatus::Idle | AgentTabStatus::Stopped => {
+            p.circle_filled(status_center, 2.7, theme::TEXT_SECONDARY);
         }
     }
 
@@ -2480,9 +2627,12 @@ fn atomic_write_session_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// Shell command that records `state` for the Agents panel (`agent-status.json`, read by `poll_agent_status`).
-fn status_hook_command(status_path: &Path, state: &str) -> String {
-    format!("printf '{{\"state\":\"{state}\"}}\\n' > '{}'", status_path.display())
+/// Shell command that appends one wrapped hook record to `<session_dir>/agent-events.jsonl` (`#683` §3.1)
+/// and updates `agent-status.json` for legacy status readers.
+fn status_hook_command(status_path: &Path, event: &str, state: &str) -> String {
+    let events_path = status_path.parent().map(|p| p.join("agent-events.jsonl")).unwrap_or_else(|| status_path.with_file_name("agent-events.jsonl"));
+    let append_cmd = crate::agent_turn_status::event_append_command(&events_path, event);
+    format!("{append_cmd}; printf '{{\"state\":\"{state}\"}}\\n' > '{}'", status_path.display())
 }
 
 fn command_handler_group(command: String) -> serde_json::Value {
@@ -2496,28 +2646,36 @@ fn command_handler_group(command: String) -> serde_json::Value {
 /// failed hook) and discards an allowing hook's context anyway.
 fn session_hooks_settings(status_path: &Path, context_reply: Option<&Path>) -> serde_json::Value {
     let prompt = match context_reply {
-        Some(reply) => format!("{} && cat '{}'", status_hook_command(status_path, "working"), reply.display()),
-        None => status_hook_command(status_path, "working"),
+        Some(reply) => format!("{} && cat '{}'", status_hook_command(status_path, "UserPromptSubmit", "working"), reply.display()),
+        None => status_hook_command(status_path, "UserPromptSubmit", "working"),
     };
     serde_json::json!({
         "hooks": {
             "UserPromptSubmit": command_handler_group(prompt),
-            "PreToolUse": command_handler_group(status_hook_command(status_path, "working")),
-            "PostToolUse": command_handler_group(status_hook_command(status_path, "working")),
-            "PermissionRequest": command_handler_group(status_hook_command(status_path, "waiting")),
-            "Stop": command_handler_group(status_hook_command(status_path, "done")),
+            "PreToolUse": command_handler_group(status_hook_command(status_path, "PreToolUse", "working")),
+            "PostToolUse": command_handler_group(status_hook_command(status_path, "PostToolUse", "working")),
+            "PostToolUseFailure": command_handler_group(status_hook_command(status_path, "PostToolUseFailure", "working")),
+            "PermissionRequest": command_handler_group(status_hook_command(status_path, "PermissionRequest", "waiting")),
+            "Notification": command_handler_group(status_hook_command(status_path, "Notification", "waiting")),
+            "Stop": command_handler_group(status_hook_command(status_path, "Stop", "done")),
+            "StopFailure": command_handler_group(status_hook_command(status_path, "StopFailure", "error")),
+            "StopCancelled": command_handler_group(status_hook_command(status_path, "StopCancelled", "stopped")),
+            "SessionStart": command_handler_group(status_hook_command(status_path, "SessionStart", "idle")),
         }
     })
 }
 
-/// Antigravity's `<workspace>/.agents/hooks.json`: named hook, flat handlers for the invocation and
-/// stop events. Handlers must answer with a JSON object on stdout.
+/// Antigravity's `<workspace>/.agents/hooks.json`: named hook, flat handlers for the invocation, tool,
+/// and stop events (`#683` §3.1). Handlers must answer with a JSON object on stdout.
 fn agy_session_hooks(status_path: &Path) -> serde_json::Value {
-    let handler = |state: &str| serde_json::json!([{ "type": "command", "command": format!("{}; printf '{{}}'", status_hook_command(status_path, state)) }]);
+    let handler = |event: &str, state: &str| serde_json::json!([{ "type": "command", "command": format!("{}; printf '{{}}'", status_hook_command(status_path, event, state)) }]);
     serde_json::json!({
         "designos-status": {
-            "PreInvocation": handler("working"),
-            "Stop": handler("done"),
+            "PreInvocation": handler("PreInvocation", "working"),
+            "PreToolUse": handler("PreToolUse", "working"),
+            "PostToolUse": handler("PostToolUse", "working"),
+            "PostToolUseFailure": handler("PostToolUseFailure", "working"),
+            "Stop": handler("Stop", "done"),
         }
     })
 }
@@ -2852,8 +3010,16 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
 
         if let Some(idx) = tab_to_select {
             state.active_tab = idx;
+            if let Some(tab) = state.tabs.get_mut(idx) {
+                tab.unread = false;
+            }
             state.viewport_focused = true;
             state.runtime_dropdown_open = false;
+        }
+        if state.surface_visible {
+            if let Some(tab) = state.active_tab_mut() {
+                tab.unread = false;
+            }
         }
         if let Some(idx) = tab_to_close {
             state.close_tab(idx);
@@ -2882,20 +3048,34 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
             state.runtime_dropdown_open = !state.runtime_dropdown_open;
         }
 
-        // Active File + Page Context Strip (20px) so the user & agent always see the bound Page
+        // Active File + Page Context / Live Turn Status Strip (20px) (`#683` §5)
         let ctx_h = 20.0;
         let ctx_r = Rect::from_min_size(Pos2::new(rect.left(), bar_r.bottom()), Vec2::new(rect.width(), ctx_h));
         p.rect_filled(ctx_r, 0.0, TERM_BG_ELEVATED);
         widgets::hline(&p, ctx_r.left(), ctx_r.right(), ctx_r.bottom() - 1.0, TERM_BORDER);
-        let ctx_badge = format!("{} · {}", state.doc_name, state.current_page_name);
-        let ctx_elided = widgets::elide(&p, &ctx_badge, &theme::font_caption(), (ctx_r.width() - 24.0).max(40.0));
-        p.circle_filled(Pos2::new(ctx_r.left() + 10.0, ctx_r.center().y), 2.5, STATUS_INFO_TEXT);
-        p.text(Pos2::new(ctx_r.left() + 17.0, ctx_r.center().y), Align2::LEFT_CENTER, ctx_elided, theme::font_caption(), STATUS_INFO_TEXT);
+        let now_secs = crate::agent_sessions::unix_timestamp_secs();
+        if let Some((dot_col, status_txt)) = state.active_tab().and_then(|t| t.header_status_indicator(now_secs)) {
+            let status_elided = widgets::elide(&p, &status_txt, &theme::font_caption(), (ctx_r.width() - 28.0).max(40.0));
+            p.circle_filled(Pos2::new(ctx_r.left() + 11.0, ctx_r.center().y), 3.0, dot_col);
+            p.text(Pos2::new(ctx_r.left() + 20.0, ctx_r.center().y), Align2::LEFT_CENTER, status_elided, theme::font_caption(), theme::TEXT_SECONDARY);
+            widgets::record(ui, "agents-header-turn-status", ctx_r);
+        } else {
+            let ctx_badge = format!("{} · {}", state.doc_name, state.current_page_name);
+            let ctx_elided = widgets::elide(&p, &ctx_badge, &theme::font_caption(), (ctx_r.width() - 24.0).max(40.0));
+            p.circle_filled(Pos2::new(ctx_r.left() + 10.0, ctx_r.center().y), 2.5, STATUS_INFO_TEXT);
+            p.text(Pos2::new(ctx_r.left() + 17.0, ctx_r.center().y), Align2::LEFT_CENTER, ctx_elided, theme::font_caption(), STATUS_INFO_TEXT);
+        }
 
-        // Live VT100 PTY Terminal Viewport (full height)
-        let vp_r = Rect::from_min_max(Pos2::new(rect.left(), ctx_r.bottom()), rect.max);
+        let active_receipt =
+            state.active_tab().filter(|t| !matches!(t.effective_status(), AgentTabStatus::Working(_))).and_then(|t| t.last_turn_receipt().cloned());
+        let vp_bottom = if active_receipt.is_some() { (rect.bottom() - 24.0).max(ctx_r.bottom()) } else { rect.bottom() };
+        let vp_r = Rect::from_min_max(Pos2::new(rect.left(), ctx_r.bottom()), Pos2::new(rect.right(), vp_bottom));
 
         render_vt100_viewport(state, ui, vp_r, "agents-left-pty");
+        if let Some(receipt) = &active_receipt {
+            let receipt_r = Rect::from_min_max(Pos2::new(rect.left(), vp_bottom), rect.max);
+            paint_turn_receipt_row(ui, &p, receipt_r, receipt);
+        }
         if let Some(fix) = state.pending_start_fix.take() {
             state.apply_start_fix(fix, file_path);
         }
@@ -3618,6 +3798,10 @@ fn render_agent_chat_thread(state: &mut TerminalState, ui: &mut Ui, center_rect:
                 }
             }
         }
+        if let Some(receipt) = state.active_tab().filter(|t| !matches!(t.effective_status(), AgentTabStatus::Working(_))).and_then(|t| t.last_turn_receipt()) {
+            let receipt_r = Rect::from_min_size(Pos2::new(center_rect.left() + 10.0, y), Vec2::new((center_rect.width() - 20.0).max(120.0), 24.0));
+            paint_turn_receipt_row(ui, &p, receipt_r, receipt);
+        }
     });
 
     if let Some(idx) = apply_turn_idx {
@@ -3628,6 +3812,21 @@ fn render_agent_chat_thread(state: &mut TerminalState, ui: &mut Ui, center_rect:
             }
         }
     }
+}
+
+/// Renders the one-line "Worked for" receipt row (`#683` §3.4, §5):
+/// 24px row height, 8px horizontal padding, `theme::font_caption()` in `theme::TEXT_SECONDARY` (`#A1A1AA`),
+/// numbers in `theme::font_mono()`. No background fill, no border, no expand chevron.
+fn paint_turn_receipt_row(ui: &Ui, p: &Painter, row_rect: Rect, receipt: &crate::agent_turn_status::TurnReceipt) {
+    let mut job = egui::text::LayoutJob::default();
+    for (piece, is_mono) in receipt.styled_runs() {
+        let font_id = if is_mono { theme::font_mono() } else { theme::font_caption() };
+        job.append(&piece, 0.0, egui::TextFormat { font_id, color: theme::TEXT_SECONDARY, ..Default::default() });
+    }
+    let galley = p.layout_job(job);
+    let text_pos = Pos2::new(row_rect.left() + 8.0, row_rect.center().y - galley.size().y * 0.5);
+    p.galley(text_pos, galley, theme::TEXT_SECONDARY);
+    widgets::record(ui, "agents-turn-receipt-line", row_rect);
 }
 
 fn paint_agents_grid_plus_badge(p: &egui::Painter, center: Pos2) {
@@ -3844,7 +4043,15 @@ fn render_terminal_surface(state: &mut TerminalState, ui: &mut Ui, rect: Rect, f
 
     if let Some(idx) = tab_to_select {
         state.active_tab = idx;
+        if let Some(tab) = state.tabs.get_mut(idx) {
+            tab.unread = false;
+        }
         state.viewport_focused = true;
+    }
+    if state.surface_visible {
+        if let Some(tab) = state.active_tab_mut() {
+            tab.unread = false;
+        }
     }
     if let Some(idx) = tab_to_close {
         state.close_tab(idx);
@@ -3881,9 +4088,26 @@ fn render_terminal_surface(state: &mut TerminalState, ui: &mut Ui, rect: Rect, f
         left_x = b_rect.right() + 4.0;
     }
 
+    let now_secs = crate::agent_sessions::unix_timestamp_secs();
+    if let Some((dot_col, status_txt)) = state.active_tab().and_then(|t| t.header_status_indicator(now_secs)) {
+        let avail_w = (right_x - left_x - 16.0).max(0.0);
+        if avail_w >= 48.0 {
+            let status_elided = widgets::elide(&p, &status_txt, &theme::font_caption(), avail_w - 14.0);
+            p.circle_filled(Pos2::new(left_x + 7.0, tab_bar_rect.center().y), 3.0, dot_col);
+            p.text(Pos2::new(left_x + 16.0, tab_bar_rect.center().y), Align2::LEFT_CENTER, status_elided, theme::font_caption(), theme::TEXT_SECONDARY);
+        }
+    }
+
     // 2. VT100 Screen Grid Renderer + Raw Keyboard Capture (full height)
-    let viewport_rect = Rect::from_min_max(Pos2::new(rect.left(), tab_bar_rect.bottom()), rect.max);
+    let active_receipt =
+        state.active_tab().filter(|t| !matches!(t.effective_status(), AgentTabStatus::Working(_))).and_then(|t| t.last_turn_receipt().cloned());
+    let vp_bottom = if active_receipt.is_some() { (rect.bottom() - 24.0).max(tab_bar_rect.bottom()) } else { rect.bottom() };
+    let viewport_rect = Rect::from_min_max(Pos2::new(rect.left(), tab_bar_rect.bottom()), Pos2::new(rect.right(), vp_bottom));
     render_vt100_viewport(state, ui, viewport_rect, surface_id);
+    if let Some(receipt) = &active_receipt {
+        let receipt_r = Rect::from_min_max(Pos2::new(rect.left(), vp_bottom), rect.max);
+        paint_turn_receipt_row(ui, &p, receipt_r, receipt);
+    }
     if let Some(fix) = state.pending_start_fix.take() {
         state.apply_start_fix(fix, file_path);
     }
@@ -6092,5 +6316,273 @@ Done!
         assert_eq!(failure.cause, agent_start_failure::StartFailureCause::NotLoggedIn);
         assert_eq!(failure.fix, FixAction::RunLogin("grok login"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn isolated_683_state(tab_id: u64) -> TerminalState {
+        let dir = std::env::temp_dir().join("designos-sessions").join(tab_session_id(&format!("p{}", std::process::id()), tab_id));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        TerminalState::for_tab(tab_id)
+    }
+
+    fn spawn_mock_agent_tab(st: &mut TerminalState, preset: AgentCliPreset, session_uuid: Option<&str>) -> usize {
+        let _ = std::fs::create_dir_all(&st.session_dir);
+        st.spawn_tab(AgentCliPreset::Shell, None).expect("spawn shell backing tab");
+        let idx = st.tabs.len() - 1;
+        let tab = &mut st.tabs[idx];
+        tab.spawn_preset = preset;
+        tab.title = preset.label().to_string();
+        tab.session_uuid = session_uuid.map(str::to_string);
+        idx
+    }
+
+    #[test]
+    fn hook_command_appends_one_wrapped_record() {
+        let tmp = std::env::temp_dir().join(format!("designos-683-hook-cmd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let status_path = tmp.join("agent-status.json");
+        let events_path = tmp.join("agent-events.jsonl");
+        let cmd_str = status_hook_command(&status_path, "PreToolUse", "working");
+
+        let mut child = std::process::Command::new("sh").arg("-c").arg(&cmd_str).stdin(std::process::Stdio::piped()).spawn().expect("spawn hook command");
+        {
+            use std::io::Write;
+            let stdin = child.stdin.as_mut().unwrap();
+            stdin.write_all(b"{\"session_id\":\"s-hook-1\",\"tool_name\":\"Read\"}").unwrap();
+        }
+        let status = child.wait().expect("wait hook command");
+        assert!(status.success());
+
+        let raw = std::fs::read_to_string(&events_path).expect("read agent-events.jsonl");
+        let (records, consumed) = crate::agent_turn_status::parse_streaming_records(&raw);
+        assert_eq!(consumed, raw.len());
+        assert_eq!(records.len(), 1);
+        assert!(records[0].t > 1_700_000_000.0);
+        assert_eq!(records[0].e, "PreToolUse");
+        assert_eq!(records[0].session_id(), Some("s-hook-1"));
+        assert_eq!(records[0].tool_name(), Some("Read"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stub_cli_drives_running_needs_input_done() {
+        let mut st = isolated_683_state(68301);
+        let _ = spawn_mock_agent_tab(&mut st, AgentCliPreset::Claude, Some("sid-drive-1"));
+        let events_path = st.session_dir.join("agent-events.jsonl");
+
+        let write_rec = |line: &str| {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&events_path).unwrap();
+            writeln!(f, "{line}").unwrap();
+        };
+
+        write_rec(r#"{"t":100.0,"e":"UserPromptSubmit","p":{"session_id":"sid-drive-1"}}"#);
+        write_rec(r#"{"t":101.0,"e":"PreToolUse","p":{"session_id":"sid-drive-1","tool_name":"mcp__designos__designos_create_node"}}"#);
+        let _ = st.poll_live_agent_bridge();
+        assert_eq!(st.tabs[0].effective_status(), AgentTabStatus::Working(Some("Editing layers…".to_string())));
+
+        write_rec(r#"{"t":102.0,"e":"PermissionRequest","p":{"session_id":"sid-drive-1","tool_name":"Bash"}}"#);
+        let _ = st.poll_live_agent_bridge();
+        assert_eq!(st.tabs[0].effective_status(), AgentTabStatus::WaitingForInput(Some("Bash".to_string())));
+
+        write_rec(r#"{"t":103.0,"e":"PostToolUse","p":{"session_id":"sid-drive-1","tool_name":"Bash"}}"#);
+        let _ = st.poll_live_agent_bridge();
+        assert_eq!(st.tabs[0].effective_status(), AgentTabStatus::Working(Some("Working…".to_string())));
+
+        write_rec(r#"{"t":106.0,"e":"Stop","p":{"session_id":"sid-drive-1"}}"#);
+        let _ = st.poll_live_agent_bridge();
+        assert_eq!(st.tabs[0].effective_status(), AgentTabStatus::Done);
+        kill_tabs(&mut st);
+    }
+
+    #[test]
+    fn records_route_by_session_id_not_by_active_tab() {
+        let mut st = isolated_683_state(68302);
+        let active_idx = spawn_mock_agent_tab(&mut st, AgentCliPreset::Claude, Some("sid-active"));
+        let bg_idx = spawn_mock_agent_tab(&mut st, AgentCliPreset::Claude, Some("sid-bg"));
+        st.active_tab = active_idx;
+
+        let events_path = st.session_dir.join("agent-events.jsonl");
+        std::fs::write(
+            &events_path,
+            concat!(
+                "{\"t\":200.0,\"e\":\"UserPromptSubmit\",\"p\":{\"session_id\":\"sid-bg\"}}\n",
+                "{\"t\":201.0,\"e\":\"PreToolUse\",\"p\":{\"session_id\":\"sid-bg\",\"tool_name\":\"designos_get_document\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        let _ = st.poll_live_agent_bridge();
+        assert_eq!(st.tabs[active_idx].effective_status(), AgentTabStatus::Idle, "active tab must not receive background tab events");
+        assert_eq!(
+            st.tabs[bg_idx].effective_status(),
+            AgentTabStatus::Working(Some("Reading the file…".to_string())),
+            "background tab must receive its own session events"
+        );
+        kill_tabs(&mut st);
+    }
+
+    #[test]
+    fn receipt_shows_exact_duration_and_counts() {
+        let mut tracker = crate::agent_turn_status::TabTurnTracker::default();
+        let submit = crate::agent_turn_status::AgentEventRecord { t: 100.0, e: "UserPromptSubmit".to_string(), p: serde_json::json!({"session_id": "s1"}) };
+        let _ = tracker.on_event(&submit);
+        for i in 0..12 {
+            let pre = crate::agent_turn_status::AgentEventRecord {
+                t: 101.0 + f64::from(i),
+                e: "PreToolUse".to_string(),
+                p: serde_json::json!({"session_id": "s1", "tool_name": "designos_update_node"}),
+            };
+            let _ = tracker.on_event(&pre);
+        }
+        tracker.record_touched_layers([1, 2, 3, 4, 5, 6, 7]);
+        let stop = crate::agent_turn_status::AgentEventRecord { t: 180.0, e: "Stop".to_string(), p: serde_json::json!({"session_id": "s1"}) };
+        let eff = tracker.on_event(&stop);
+        let receipt = eff.receipt.expect("receipt emitted on Stop");
+        assert_eq!(receipt.format_line(), "Worked for 1m 20s · 12 tool calls · 7 layers changed");
+    }
+
+    #[test]
+    fn duration_rounds_up_with_minimum_one_second() {
+        assert_eq!(crate::agent_turn_status::format_duration_secs(0.2), "1s");
+        assert_eq!(crate::agent_turn_status::format_duration_secs(59.1), "1m 0s");
+        assert_eq!(crate::agent_turn_status::format_duration_secs(60.0), "1m 0s");
+        assert_eq!(crate::agent_turn_status::format_duration_secs(61.0), "1m 1s");
+    }
+
+    #[test]
+    fn no_count_is_invented_without_data() {
+        let mut tracker = crate::agent_turn_status::TabTurnTracker::default();
+        let _ = tracker.on_event(&crate::agent_turn_status::AgentEventRecord { t: 10.0, e: "UserPromptSubmit".to_string(), p: serde_json::json!({}) });
+        let _ =
+            tracker.on_event(&crate::agent_turn_status::AgentEventRecord { t: 11.0, e: "PreToolUse".to_string(), p: serde_json::json!({"tool_name": "Read"}) });
+        let eff = tracker.on_event(&crate::agent_turn_status::AgentEventRecord { t: 15.0, e: "Stop".to_string(), p: serde_json::json!({}) });
+        let receipt = eff.receipt.expect("receipt emitted");
+        assert_eq!(receipt.layers_changed, None);
+        let line = receipt.format_line();
+        assert_eq!(line, "Worked for 5s · 1 tool call");
+        assert!(!line.contains("layer"), "must not invent a layers count: {line}");
+    }
+
+    #[test]
+    fn one_notification_per_turn_when_unfocused() {
+        let mut st = isolated_683_state(68303);
+        let sink = std::sync::Arc::new(crate::agent_notify::StubNotificationSink::new());
+        st.notifier = crate::agent_notify::AgentNotifier::with_sink(sink.clone());
+        let idx = spawn_mock_agent_tab(&mut st, AgentCliPreset::Claude, Some("sid-notify-1"));
+        st.active_tab = idx;
+        st.window_focused = false;
+        st.surface_visible = true;
+
+        let events_path = st.session_dir.join("agent-events.jsonl");
+        std::fs::write(
+            &events_path,
+            concat!(
+                "{\"t\":10.0,\"e\":\"UserPromptSubmit\",\"p\":{\"session_id\":\"sid-notify-1\"}}\n",
+                "{\"t\":14.0,\"e\":\"Stop\",\"p\":{\"session_id\":\"sid-notify-1\"}}\n",
+                "{\"t\":15.0,\"e\":\"Stop\",\"p\":{\"session_id\":\"sid-notify-1\"}}\n",
+            ),
+        )
+        .unwrap();
+        let _ = st.poll_live_agent_bridge();
+        assert_eq!(sink.count(), 1, "unfocused turn must send 1 notification even with duplicate Stop");
+
+        // Now focused and visible: 0 new notifications.
+        st.window_focused = true;
+        st.surface_visible = true;
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&events_path).unwrap();
+            writeln!(f, "{{\"t\":20.0,\"e\":\"UserPromptSubmit\",\"p\":{{\"session_id\":\"sid-notify-1\"}}}}").unwrap();
+            writeln!(f, "{{\"t\":25.0,\"e\":\"Stop\",\"p\":{{\"session_id\":\"sid-notify-1\"}}}}").unwrap();
+        }
+        let _ = st.poll_live_agent_bridge();
+        assert_eq!(sink.count(), 1, "focused and visible active tab must send 0 notifications");
+        kill_tabs(&mut st);
+    }
+
+    #[test]
+    fn notification_when_the_tab_is_hidden_but_window_focused() {
+        let mut st = isolated_683_state(68304);
+        let sink = std::sync::Arc::new(crate::agent_notify::StubNotificationSink::new());
+        st.notifier = crate::agent_notify::AgentNotifier::with_sink(sink.clone());
+        let active_idx = spawn_mock_agent_tab(&mut st, AgentCliPreset::Claude, Some("sid-fg"));
+        let hidden_idx = spawn_mock_agent_tab(&mut st, AgentCliPreset::Grok, Some("sid-hidden"));
+        st.active_tab = active_idx;
+        st.window_focused = true;
+        st.surface_visible = true;
+
+        let events_path = st.session_dir.join("agent-events.jsonl");
+        std::fs::write(
+            &events_path,
+            concat!(
+                "{\"t\":50.0,\"e\":\"UserPromptSubmit\",\"p\":{\"sessionId\":\"sid-hidden\"}}\n",
+                "{\"t\":55.0,\"e\":\"Stop\",\"p\":{\"sessionId\":\"sid-hidden\"}}\n",
+            ),
+        )
+        .unwrap();
+        let _ = st.poll_live_agent_bridge();
+        assert_eq!(sink.count(), 1, "hidden tab finishing while window is focused must notify once");
+        assert!(st.tabs[hidden_idx].unread, "hidden tab must be marked unread");
+        kill_tabs(&mut st);
+    }
+
+    #[test]
+    fn works_for_each_cli_hook_file() {
+        let status_path = std::path::Path::new("/tmp/designos-683-hooks-check/agent-status.json");
+        let claude_grok = session_hooks_settings(status_path, None);
+        for &(event, _) in crate::agent_turn_status::CLAUDE_GROK_HOOK_EVENTS {
+            let cmd = claude_grok["hooks"][event][0]["hooks"][0]["command"].as_str().unwrap_or_default();
+            assert!(cmd.contains("agent-events.jsonl"), "Claude/Grok hook for {event} must append to agent-events.jsonl: {cmd}");
+            assert!(cmd.contains(event), "Claude/Grok hook for {event} must carry event name: {cmd}");
+        }
+
+        let agy = agy_session_hooks(status_path);
+        for &(event, _) in crate::agent_turn_status::AGY_HOOK_EVENTS {
+            let cmd = agy["designos-status"][event][0]["command"].as_str().unwrap_or_default();
+            assert!(cmd.contains("agent-events.jsonl"), "Antigravity hook for {event} must append to agent-events.jsonl: {cmd}");
+            assert!(cmd.contains(event), "Antigravity hook for {event} must carry event name: {cmd}");
+        }
+    }
+
+    #[test]
+    fn codex_uses_the_heuristic() {
+        let mut st = isolated_683_state(68305);
+        let codex_idx = spawn_mock_agent_tab(&mut st, AgentCliPreset::Codex, Some("codex-sid"));
+        st.active_tab = codex_idx;
+
+        // Write an event to agent-events.jsonl: Codex must ignore it.
+        let events_path = st.session_dir.join("agent-events.jsonl");
+        std::fs::write(&events_path, "{\"t\":10.0,\"e\":\"UserPromptSubmit\",\"p\":{\"session_id\":\"codex-sid\"}}\n").unwrap();
+        let _ = st.poll_live_agent_bridge();
+        assert_eq!(st.tabs[codex_idx].effective_status(), AgentTabStatus::Idle);
+
+        // Heuristic / OSC status drives Codex Running -> Done.
+        let (_, working) = parse_osc_agent_status_and_strip("\x1b]9999;working:Thinking\x07");
+        if let Some(next) = working {
+            *st.tabs[codex_idx].agent_status.lock().unwrap() = next;
+        }
+        assert!(matches!(st.tabs[codex_idx].effective_status(), AgentTabStatus::Working(_)));
+        let (_, done) = parse_osc_agent_status_and_strip("\x1b]9999;done\x07");
+        if let Some(next) = done {
+            *st.tabs[codex_idx].agent_status.lock().unwrap() = next;
+        }
+        assert_eq!(st.tabs[codex_idx].effective_status(), AgentTabStatus::Done);
+        kill_tabs(&mut st);
+    }
+
+    #[test]
+    fn theme_has_info_success_warning_in_token_parity() {
+        assert_eq!(theme::INFO, Color32::from_rgb(0x0D, 0x99, 0xFF));
+        assert_eq!(theme::SUCCESS, Color32::from_rgb(0x14, 0xAE, 0x5C));
+        assert_eq!(theme::WARNING, Color32::from_rgb(0xF5, 0x9E, 0x0B));
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = manifest_dir.join("../../scripts/design_os_self_evolve.py");
+        let src = std::fs::read_to_string(&script).expect("read design_os_self_evolve.py");
+        for name in ["\"INFO\"", "\"SUCCESS\"", "\"WARNING\""] {
+            assert!(src.contains(name), "design_os_self_evolve.py missing {name}");
+        }
     }
 }

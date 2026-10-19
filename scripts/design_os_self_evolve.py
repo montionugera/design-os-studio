@@ -97,6 +97,9 @@ CORE_RUST_CONSTANTS = [
     "DEV_READY",
     "DEV_COMPLETED",
     "DEV_CHANGED",
+    "INFO",
+    "SUCCESS",
+    "WARNING",
 ]
 
 # Maps Rust `theme.rs` constants to canonical `design/design.tokens.json` paths under `colors.<key>`
@@ -114,6 +117,9 @@ RUST_TO_DESIGN_TOKEN_MAP: Dict[str, str] = {
     "CANVAS_COMPONENT": "component",
     "DEV_READY": "success",
     "DEV_COMPLETED": "component",
+    "INFO": "info",
+    "SUCCESS": "success",
+    "WARNING": "warning",
 }
 
 EXPECTED_STANDALONE_HEX: Dict[str, str] = {

@@ -109,10 +109,34 @@ pub fn apply_live_patches(app: &mut App, patches: &[LivePatch]) {
     }
 }
 
+fn collect_command_node_ids(cmd: &designos_doc::Command, out: &mut Vec<u64>) {
+    match cmd {
+        designos_doc::Command::Insert { nodes, .. } | designos_doc::Command::InsertPage { nodes, .. } => {
+            out.extend(nodes.iter().map(|n| n.id.0));
+        }
+        designos_doc::Command::Remove { id } | designos_doc::Command::Reparent { id, .. } | designos_doc::Command::RemovePage { id } => {
+            out.push(id.0);
+        }
+        designos_doc::Command::Update { node } => {
+            out.push(node.id.0);
+        }
+        designos_doc::Command::Batch(cmds) => {
+            for c in cmds {
+                collect_command_node_ids(c, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn apply_one(app: &mut App, patch: &LivePatch) -> Result<(LivePatchReport, bool), String> {
     let saved = app.terminal.live_patch.state.clone();
     let mut tx = Tx::new();
-    let replayed = replay_live_patch(&mut app.doc, patch, &mut app.terminal.live_patch.state, &mut |doc, cmd| tx.cmd(doc, cmd));
+    let mut touched_ids = Vec::new();
+    let replayed = replay_live_patch(&mut app.doc, patch, &mut app.terminal.live_patch.state, &mut |doc, cmd| {
+        collect_command_node_ids(&cmd, &mut touched_ids);
+        tx.cmd(doc, cmd)
+    });
     let report = match replayed {
         Ok(r) => r,
         Err(e) => {
@@ -127,6 +151,7 @@ fn apply_one(app: &mut App, patch: &LivePatch) -> Result<(LivePatchReport, bool)
     })?;
     if committed {
         relayout_touched(&mut app.doc, &report.needs_layout);
+        app.terminal.record_touched_layers(&touched_ids);
     }
     Ok((report, committed))
 }
