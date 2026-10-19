@@ -652,13 +652,14 @@ impl ServerHandler for DesignOSServer {
     async fn call_tool(&self, request: CallToolRequestParams, _: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
         let tool_name = request.name.to_string();
         let is_screenshot = matches!(tool_name.as_str(), "designos_get_screenshot" | "get_screenshot");
+        let is_design_context = matches!(tool_name.as_str(), "designos_get_design_context" | "get_design_context");
         let result = self
             .session
             .lock()
             .map_err(|_| "Session unavailable; restart the MCP server".to_string())
             .and_then(|mut session| session.call(&request.name, Value::Object(request.arguments.unwrap_or_default())));
         Ok(match result {
-            Ok(mut value) if is_screenshot => {
+            Ok(mut value) if is_screenshot || is_design_context => {
                 let image_content = value.get("content").and_then(Value::as_array).and_then(|arr| arr.first()).and_then(|item| {
                     let data = item.get("data")?.as_str()?.to_string();
                     let mime_type = item.get("mimeType")?.as_str()?.to_string();
@@ -669,7 +670,13 @@ impl ServerHandler for DesignOSServer {
                 }
                 let mut res = CallToolResult::structured(value);
                 if let Some(img) = image_content {
-                    res.content = vec![img];
+                    if is_design_context {
+                        let mut blocks = vec![img];
+                        blocks.extend(res.content);
+                        res.content = blocks;
+                    } else {
+                        res.content = vec![img];
+                    }
                 }
                 res
             }

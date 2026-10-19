@@ -36,7 +36,7 @@ pub use agent_context::{escape_xml_attr, fmt_f32_2, metadata_xml, structural_lin
 pub use android_xml::android_xml_for;
 pub use bounds::render_bounds;
 pub use codegen::css_var_display as css_variable_reference;
-pub use codegen::{is_vector_asset, vector_assets};
+pub use codegen::{css_var_name, is_vector_asset, vector_assets};
 pub use compose::compose_for;
 pub use css::{css_for, font_family_css, paint_css, text_style_css};
 pub use html::{html_for, html_with, HtmlOptions};
