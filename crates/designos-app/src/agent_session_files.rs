@@ -712,8 +712,8 @@ mod tests {
         let _old_sync_json = doc.to_json().expect("serialize 24k doc");
         let old_to_json_elapsed = t_json.elapsed();
 
-        let total_budget = Duration::from_millis(16);
-        let per_call_budget = Duration::from_millis(4);
+        let per_call_budget = if cfg!(debug_assertions) { Duration::from_millis(12) } else { Duration::from_millis(4) };
+        let total_budget = per_call_budget * 4;
         let (fastest_five, ()) = crate::test_timing::fastest_within(total_budget, Duration::from_secs(5), || {
             st.last_synced_key = None;
             for _ in 0..5 {
