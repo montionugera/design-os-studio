@@ -912,6 +912,7 @@ mod tests {
                 variables: vec!["background".into()],
                 key: None,
                 source_library_key: None,
+                extensions: Default::default(),
             },
         );
         d.variables.insert(
@@ -928,6 +929,8 @@ mod tests {
                 key: None,
 
                 code_syntax: Default::default(),
+                extensions: Default::default(),
+                mode_extensions: Default::default(),
             },
         );
         assert_eq!(collect_colors(&d, id)[0].hex(), "#FFFFFF");
