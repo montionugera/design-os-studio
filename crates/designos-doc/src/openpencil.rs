@@ -1180,7 +1180,7 @@ mod tests {
         let rules_hit = report["summary_by_rule"].as_object().unwrap();
         assert!(rules_hit.contains_key("default-layer-name"));
         assert!(rules_hit.contains_key("tiny-text"));
-        assert!(rules_hit.contains_key("low-contrast-text"));
+        assert!(rules_hit.contains_key("contrast"));
         assert!(rules_hit.contains_key("empty-container"));
 
         let fix_res = lint_fix_document(&mut doc, Some(page), None);

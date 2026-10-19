@@ -3,11 +3,14 @@
 use super::config::LintConfig;
 use super::finding::{Finding, LintReport, LintSummary, SkippedRule};
 use super::registry::{Category, RuleNeeds, RULES};
-use super::rules::{aabb_of_transformed_rect, detached, evaluate_node, severity_rank, NodeEvalCtx};
+use super::rules::{aabb_of_transformed_rect, contrast, detached, evaluate_node, severity_rank, NodeEvalCtx};
 use super::LintEnv;
 use crate::{Affine, Document, Node, NodeId, NodeKind};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
+
+/// Maximum number of pixel-path contrast renders per `lint_subtree` call before yielding a continuation cursor.
+const MAX_PIXEL_EVALS: usize = 2_000;
 
 /// Execution budget for [`lint_subtree`], capping visited nodes and/or wall-clock duration.
 #[derive(Clone, Debug)]
@@ -89,6 +92,7 @@ pub fn lint_subtree(doc: &Document, roots: &[NodeId], config: &LintConfig, env: 
     }
 
     let components = if config.is_enabled("detached-instance") { detached::Components::new(doc) } else { detached::Components::default() };
+    let contrast_bounds = contrast::SubtreeBounds::default();
 
     let active_cursor = budget.cursor.as_deref().or(config.cursor.as_deref());
     let mut page_offset = 0usize;
@@ -130,6 +134,7 @@ pub fn lint_subtree(doc: &Document, roots: &[NodeId], config: &LintConfig, env: 
 
     let mut raw_findings: Vec<Finding> = Vec::new();
     let mut scanned = 0usize;
+    let mut pixel_evals = 0usize;
     let mut complete = true;
     let mut next_cursor: Option<String> = None;
     let loop_start = Instant::now();
@@ -142,7 +147,10 @@ pub fn lint_subtree(doc: &Document, roots: &[NodeId], config: &LintConfig, env: 
             continue;
         }
 
-        if scanned >= budget.max_nodes || budget.max_duration.is_some_and(|max_d| scanned >= 32 && loop_start.elapsed() >= max_d) {
+        if scanned >= budget.max_nodes
+            || pixel_evals >= MAX_PIXEL_EVALS
+            || budget.max_duration.is_some_and(|max_d| scanned >= 32 && loop_start.elapsed() >= max_d)
+        {
             stack.push(item);
             complete = false;
             let remaining: Vec<String> = stack.iter().rev().map(|s| s.id.0.to_string()).collect();
@@ -167,8 +175,11 @@ pub fn lint_subtree(doc: &Document, roots: &[NodeId], config: &LintConfig, env: 
                 config,
                 env,
                 components: &components,
+                contrast_bounds: &contrast_bounds,
             };
-            evaluate_node(&ctx, &mut raw_findings);
+            if evaluate_node(&ctx, &mut raw_findings) {
+                pixel_evals += 1;
+            }
         }
 
         if !budget.shallow_nodes.contains(&item.id) {
