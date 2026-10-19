@@ -249,14 +249,17 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// True only for the four supported agent CLIs (`claude`, `codex`, `grok`, `agy`).
+/// True only for the supported agent CLIs (`claude`, `codex`, `grok`, `agy`, `gemini`, `opencode`).
 /// `Shell` and `DesignOsHelp` tabs are never written to `sessions.json` (`Rule 5`).
 pub fn is_registrable_cli(preset: AgentCliPreset) -> bool {
-    matches!(preset, AgentCliPreset::Claude | AgentCliPreset::Codex | AgentCliPreset::Grok | AgentCliPreset::Antigravity)
+    matches!(
+        preset,
+        AgentCliPreset::Claude | AgentCliPreset::Codex | AgentCliPreset::Grok | AgentCliPreset::Antigravity | AgentCliPreset::Gemini | AgentCliPreset::OpenCode
+    )
 }
 
 /// True for CLIs that accept `--session-id <uuid>` on new start (`Claude` and `Grok`).
-/// `Codex` and `Antigravity` record `session_id: None` (`Rule 6`).
+/// `Codex`, `Antigravity`, `Gemini`, and `OpenCode` record `session_id: None` (`Rule 6`).
 pub fn uses_preassigned_session_id(preset: AgentCliPreset) -> bool {
     matches!(preset, AgentCliPreset::Claude | AgentCliPreset::Grok)
 }
@@ -275,24 +278,29 @@ pub fn build_new_session_command(preset: AgentCliPreset, session_uuid: Option<&s
             Some(uuid) => format!("grok --session-id {uuid} --always-approve --cwd \"$DESIGNOS_SESSION_DIR\""),
             None => AgentCliPreset::Grok.cli_launch_command().to_string(),
         },
-        AgentCliPreset::Codex | AgentCliPreset::Antigravity | AgentCliPreset::Shell | AgentCliPreset::DesignOsHelp => {
-            preset.cli_launch_command().to_string()
-        }
+        AgentCliPreset::Codex
+        | AgentCliPreset::Antigravity
+        | AgentCliPreset::Gemini
+        | AgentCliPreset::OpenCode
+        | AgentCliPreset::Shell
+        | AgentCliPreset::DesignOsHelp => preset.cli_launch_command().to_string(),
     }
 }
 
-/// Maps a recorded `cli` binary string (`"claude"`, `"codex"`, `"grok"`, `"agy"`) back to [`AgentCliPreset`].
+/// Maps a recorded `cli` binary string (`"claude"`, `"codex"`, `"grok"`, `"agy"`, `"gemini"`, `"opencode"`) back to [`AgentCliPreset`].
 pub fn preset_from_cli_name(cli: &str) -> Option<AgentCliPreset> {
     match cli.trim() {
         "claude" => Some(AgentCliPreset::Claude),
         "codex" => Some(AgentCliPreset::Codex),
         "grok" => Some(AgentCliPreset::Grok),
         "agy" => Some(AgentCliPreset::Antigravity),
+        "gemini" => Some(AgentCliPreset::Gemini),
+        "opencode" => Some(AgentCliPreset::OpenCode),
         _ => None,
     }
 }
 
-/// Builds the CLI resume command for `entry` according to §6 of `#653`.
+/// Builds the CLI resume command for `entry` according to §6 of `#653` and §3 of `#679`.
 ///
 /// For `agy` (`AgentCliPreset::Antigravity`), `agy --continue` is only returned when `agy_cwd_scoped`
 /// is `true` (i.e. `agy --continue` has been verified to scope to the current directory); otherwise
@@ -326,6 +334,17 @@ pub fn build_resume_command(entry: &SessionEntry, agy_cwd_scoped: bool) -> Optio
                 return None;
             }
             Some("agy --continue --dangerously-skip-permissions --add-dir \"$DESIGNOS_SESSION_DIR\"".to_string())
+        }
+        AgentCliPreset::Gemini => {
+            let resume_target = entry.session_id.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or("latest");
+            Some(format!("gemini --resume {resume_target} --approval-mode yolo --include-directories \"$DESIGNOS_SESSION_DIR\""))
+        }
+        AgentCliPreset::OpenCode => {
+            let resume_flag = match entry.session_id.as_deref().filter(|s| !s.trim().is_empty()) {
+                Some(id) => format!("--session {id}"),
+                None => "--continue".to_string(),
+            };
+            Some(format!("opencode {resume_flag}"))
         }
         AgentCliPreset::Shell | AgentCliPreset::DesignOsHelp => None,
     }
@@ -497,6 +516,15 @@ mod tests {
         assert!(build_resume_command(&mk("agy", None), false).is_none(), "agy resume must be suppressed unless agy_cwd_scoped is verified");
         let agy_scoped = build_resume_command(&mk("agy", None), true).unwrap();
         assert_eq!(agy_scoped, "agy --continue --dangerously-skip-permissions --add-dir \"$DESIGNOS_SESSION_DIR\"");
+
+        let gemini_latest = build_resume_command(&mk("gemini", None), false).unwrap();
+        assert_eq!(gemini_latest, "gemini --resume latest --approval-mode yolo --include-directories \"$DESIGNOS_SESSION_DIR\"");
+
+        let opencode_last = build_resume_command(&mk("opencode", None), false).unwrap();
+        assert_eq!(opencode_last, "opencode --continue");
+
+        let opencode_with_id = build_resume_command(&mk("opencode", Some("ses_12345")), false).unwrap();
+        assert_eq!(opencode_with_id, "opencode --session ses_12345");
     }
 
     // 5. `shell_and_custom_cli_tabs_are_never_registered`

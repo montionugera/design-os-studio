@@ -30,6 +30,9 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Warning caption shown on `"Other CLI..."` and saved custom CLI rows (`#652` §3 rule 7).
 pub const CUSTOM_CLI_WARNING: &str = "Plain command: Studio tools not connected";
 
+/// Warning caption shown on built-in CLIs that have no project-scoped MCP config (`#679` §3).
+pub const PLAIN_CLI_WARNING: &str = "Plain CLI: Studio tools not connected";
+
 /// Default footer permission caption (`#652` §3 rule 9).
 pub const DEFAULT_PERMISSION_CAPTION: &str = "Skip permissions";
 
@@ -69,7 +72,7 @@ impl CliProbe {
     }
 }
 
-/// Static descriptor for a built-in agent CLI (`#652` §3 rule 1).
+/// Static descriptor for a built-in agent CLI (`#652` §3 rule 1, `#679` §2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CliDescriptor {
     pub preset: AgentCliPreset,
@@ -80,6 +83,7 @@ pub struct CliDescriptor {
     pub sign_in_cmd: Option<&'static [&'static str]>,
     pub install_url: &'static str,
     pub login_command: &'static str,
+    pub caption: Option<&'static str>,
 }
 
 /// Saved custom CLI command in Studio's `settings.json` (`#652` §4).
@@ -89,10 +93,11 @@ pub struct CustomCliEntry {
     pub command: String,
 }
 
-/// Fixed catalog order of the four built-in agent CLIs (`#652` §3 rules 1 & 4).
-pub const CATALOG_PRESETS: [AgentCliPreset; 4] = [AgentCliPreset::Claude, AgentCliPreset::Codex, AgentCliPreset::Grok, AgentCliPreset::Antigravity];
+/// Fixed catalog order of the six built-in agent CLIs (`#652` §3 rules 1 & 4, `#679` §2).
+pub const CATALOG_PRESETS: [AgentCliPreset; 6] =
+    [AgentCliPreset::Claude, AgentCliPreset::Codex, AgentCliPreset::Grok, AgentCliPreset::Antigravity, AgentCliPreset::Gemini, AgentCliPreset::OpenCode];
 
-/// Returns the catalog of built-in CLI descriptors in fixed order (`Claude`, `Codex`, `Grok`, `Antigravity`).
+/// Returns the catalog of built-in CLI descriptors in fixed order (`Claude`, `Codex`, `Grok`, `Antigravity`, `Gemini CLI`, `OpenCode`).
 pub fn catalog() -> Vec<CliDescriptor> {
     vec![
         CliDescriptor {
@@ -104,6 +109,7 @@ pub fn catalog() -> Vec<CliDescriptor> {
             sign_in_cmd: Some(&["claude", "auth", "status"]),
             install_url: install_url(AgentCliPreset::Claude),
             login_command: login_command(AgentCliPreset::Claude),
+            caption: None,
         },
         CliDescriptor {
             preset: AgentCliPreset::Codex,
@@ -114,6 +120,7 @@ pub fn catalog() -> Vec<CliDescriptor> {
             sign_in_cmd: Some(&["codex", "login", "status"]),
             install_url: install_url(AgentCliPreset::Codex),
             login_command: login_command(AgentCliPreset::Codex),
+            caption: None,
         },
         CliDescriptor {
             preset: AgentCliPreset::Grok,
@@ -124,6 +131,7 @@ pub fn catalog() -> Vec<CliDescriptor> {
             sign_in_cmd: None,
             install_url: install_url(AgentCliPreset::Grok),
             login_command: login_command(AgentCliPreset::Grok),
+            caption: None,
         },
         CliDescriptor {
             preset: AgentCliPreset::Antigravity,
@@ -134,6 +142,29 @@ pub fn catalog() -> Vec<CliDescriptor> {
             sign_in_cmd: None,
             install_url: install_url(AgentCliPreset::Antigravity),
             login_command: login_command(AgentCliPreset::Antigravity),
+            caption: None,
+        },
+        CliDescriptor {
+            preset: AgentCliPreset::Gemini,
+            name: "Gemini CLI",
+            binary: "gemini",
+            install_folders: AgentCliPreset::Gemini.install_dirs(),
+            version_cmd: &["gemini", "--version"],
+            sign_in_cmd: None,
+            install_url: install_url(AgentCliPreset::Gemini),
+            login_command: login_command(AgentCliPreset::Gemini),
+            caption: None,
+        },
+        CliDescriptor {
+            preset: AgentCliPreset::OpenCode,
+            name: "OpenCode",
+            binary: "opencode",
+            install_folders: AgentCliPreset::OpenCode.install_dirs(),
+            version_cmd: &["opencode", "--version"],
+            sign_in_cmd: None,
+            install_url: install_url(AgentCliPreset::OpenCode),
+            login_command: login_command(AgentCliPreset::OpenCode),
+            caption: Some(PLAIN_CLI_WARNING),
         },
     ]
 }
@@ -548,6 +579,8 @@ pub fn build_picker_rows(probes: &HashMap<AgentCliPreset, CliProbe>, last_cli: O
             AgentCliPreset::Codex => "agents-dropdown-codex".to_string(),
             AgentCliPreset::Grok => "agents-dropdown-grok".to_string(),
             AgentCliPreset::Antigravity => "agents-dropdown-antigravity".to_string(),
+            AgentCliPreset::Gemini => "agents-dropdown-gemini".to_string(),
+            AgentCliPreset::OpenCode => "agents-dropdown-opencode".to_string(),
             _ => format!("agents-dropdown-{}", desc.binary),
         };
 
@@ -558,7 +591,7 @@ pub fn build_picker_rows(probes: &HashMap<AgentCliPreset, CliProbe>, last_cli: O
                 label: desc.name.to_string(),
                 version: probe.version.clone(),
                 state_label: Some(probe.signed_in.label().to_string()),
-                caption: None,
+                caption: desc.caption.map(str::to_string),
                 selectable: true,
                 is_last_choice: is_last,
                 install_action: None,
@@ -579,7 +612,7 @@ pub fn build_picker_rows(probes: &HashMap<AgentCliPreset, CliProbe>, last_cli: O
                 label: desc.name.to_string(),
                 version: None,
                 state_label: Some("Not installed".to_string()),
-                caption: None,
+                caption: desc.caption.map(str::to_string),
                 selectable: false,
                 is_last_choice: false,
                 install_action: Some(action.clone()),
@@ -667,13 +700,15 @@ mod tests {
     impl FakeRunner {
         fn with_all_installed() -> Self {
             let mut r = Self::default();
-            for bin in ["claude", "codex", "grok", "agy"] {
+            for bin in ["claude", "codex", "grok", "agy", "gemini", "opencode"] {
                 r.installed.insert(bin.to_string(), true);
             }
             r.responses.insert(vec!["claude".into(), "--version".into()], CommandOutput::ok("2.1.302 (Claude Code)\n"));
             r.responses.insert(vec!["codex".into(), "--version".into()], CommandOutput::ok("codex-cli 0.163.0\n"));
             r.responses.insert(vec!["grok".into(), "--version".into()], CommandOutput::ok("grok 1.0.62 (1474f9cbdd91) [stable]\n"));
             r.responses.insert(vec!["agy".into(), "--version".into()], CommandOutput::ok("1.4.2\n"));
+            r.responses.insert(vec!["gemini".into(), "--version".into()], CommandOutput::ok("0.38.2\n"));
+            r.responses.insert(vec!["opencode".into(), "--version".into()], CommandOutput::ok("1.14.19\n"));
             r.responses
                 .insert(vec!["claude".into(), "auth".into(), "status".into()], CommandOutput::ok(r#"{"loggedIn": true, "email": "do-not-store@example.com"}"#));
             r.responses.insert(vec!["codex".into(), "login".into(), "status".into()], CommandOutput::ok("Logged in using ChatGPT\n"));
@@ -711,6 +746,8 @@ mod tests {
         assert_eq!(parse_version("codex-cli 0.163.0").as_deref(), Some("0.163.0"));
         assert_eq!(parse_version("grok 1.0.62 (1474f9cbdd91) [stable]").as_deref(), Some("1.0.62"));
         assert_eq!(parse_version("1.4.2").as_deref(), Some("1.4.2"));
+        assert_eq!(parse_version("0.38.2").as_deref(), Some("0.38.2"));
+        assert_eq!(parse_version("1.14.19").as_deref(), Some("1.14.19"));
     }
 
     // 2. `installed_cli_row_shows_version_and_state`
@@ -725,6 +762,18 @@ mod tests {
         assert_eq!(claude_row.state_label.as_deref(), Some("Signed in"));
         assert!(claude_row.selectable);
         assert!(!format!("{claude_row:?}").contains("do-not-store@example.com"), "account details must never be stored");
+
+        let gemini_row = rows.iter().find(|r| r.label == "Gemini CLI").expect("Gemini CLI row");
+        assert_eq!(gemini_row.version.as_deref(), Some("0.38.2"));
+        assert_eq!(gemini_row.state_label.as_deref(), Some("Sign-in not checked"));
+        assert_eq!(gemini_row.caption, None);
+        assert!(gemini_row.selectable);
+
+        let opencode_row = rows.iter().find(|r| r.label == "OpenCode").expect("OpenCode row");
+        assert_eq!(opencode_row.version.as_deref(), Some("1.14.19"));
+        assert_eq!(opencode_row.state_label.as_deref(), Some("Sign-in not checked"));
+        assert_eq!(opencode_row.caption.as_deref(), Some("Plain CLI: Studio tools not connected"));
+        assert!(opencode_row.selectable);
     }
 
     // 3. `claude_signed_out_json`
@@ -758,12 +807,11 @@ mod tests {
         let cache = CatalogProbeCache::new(runner, PROBE_TIMEOUT);
         cache.refresh_blocking();
         let snap = cache.snapshot();
-        let grok = snap.get(&AgentCliPreset::Grok).expect("grok probe");
-        let agy = snap.get(&AgentCliPreset::Antigravity).expect("agy probe");
-        assert_eq!(grok.signed_in, SignIn::Unknown);
-        assert_eq!(grok.signed_in.label(), "Sign-in not checked");
-        assert_eq!(agy.signed_in, SignIn::Unknown);
-        assert_eq!(agy.signed_in.label(), "Sign-in not checked");
+        for preset in [AgentCliPreset::Grok, AgentCliPreset::Antigravity, AgentCliPreset::Gemini, AgentCliPreset::OpenCode] {
+            let probe = snap.get(&preset).expect("probe");
+            assert_eq!(probe.signed_in, SignIn::Unknown);
+            assert_eq!(probe.signed_in.label(), "Sign-in not checked");
+        }
     }
 
     // 6. `shell_row_is_last_and_other_cli_row_says_studio_tools_not_connected`
@@ -824,11 +872,11 @@ mod tests {
         cache.refresh_blocking();
         let rows = build_picker_rows(&cache.snapshot(), None, &[]);
 
-        // Installed CLIs (Claude, Codex, Antigravity) come before uninstalled (Grok)
+        // Installed CLIs (Claude, Codex, Antigravity, Gemini CLI, OpenCode) come before uninstalled (Grok)
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
-        assert_eq!(&labels[..4], &["Claude", "Codex", "Antigravity", "Grok"]);
+        assert_eq!(&labels[..6], &["Claude", "Codex", "Antigravity", "Gemini CLI", "OpenCode", "Grok"]);
 
-        let grok_row = &rows[3];
+        let grok_row = &rows[5];
         assert_eq!(grok_row.state_label.as_deref(), Some("Not installed"));
         assert!(!grok_row.selectable, "missing binary row must not be selectable");
         assert_eq!(grok_row.install_action, Some(FixAction::OpenInstallPage(install_url(AgentCliPreset::Grok))));
@@ -926,5 +974,27 @@ mod tests {
         file_a.shutdown();
         file_b.shutdown();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // #679 3. `available_only_when_the_probe_finds_the_binary`
+    #[test]
+    fn available_only_when_the_probe_finds_the_binary() {
+        let mut fake = FakeRunner::with_all_installed();
+        fake.installed.insert("gemini".to_string(), false);
+        fake.installed.insert("opencode".to_string(), false);
+        let runner: Arc<dyn RunCommand> = Arc::new(fake);
+        let cache = CatalogProbeCache::new(runner, PROBE_TIMEOUT);
+        cache.refresh_blocking();
+        let rows = build_picker_rows(&cache.snapshot(), None, &[]);
+
+        let gemini_row = rows.iter().find(|r| r.label == "Gemini CLI").expect("Gemini CLI row");
+        assert!(!gemini_row.selectable, "uninstalled Gemini CLI must not be selectable");
+        assert_eq!(gemini_row.state_label.as_deref(), Some("Not installed"));
+        assert_eq!(gemini_row.install_action, Some(FixAction::OpenInstallPage("https://github.com/google-gemini/gemini-cli")));
+
+        let opencode_row = rows.iter().find(|r| r.label == "OpenCode").expect("OpenCode row");
+        assert!(!opencode_row.selectable, "uninstalled OpenCode must not be selectable");
+        assert_eq!(opencode_row.state_label.as_deref(), Some("Not installed"));
+        assert_eq!(opencode_row.install_action, Some(FixAction::OpenInstallPage("https://opencode.ai")));
     }
 }
