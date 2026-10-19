@@ -13,13 +13,15 @@ pub struct Engine {
     /// Edits executed since the last [`Engine::take_live_ops`], recorded while an open editor
     /// mirrors this session (`None` = not recording).
     pub live_ops: Option<Vec<LiveOp>>,
+    /// Per-node lint issue counts cached for `(runtime_id, mutation_epoch)`.
+    pub lint_cache: Option<((u64, u64), std::collections::HashMap<NodeId, u16>)>,
 }
 
 impl Default for Engine {
     fn default() -> Self {
         let mut doc = Document::new("Untitled");
         let page = doc.add_page("Page 1");
-        Self { doc, history: History::default(), active_page_id: Some(page), live_ops: None }
+        Self { doc, history: History::default(), active_page_id: Some(page), live_ops: None, lint_cache: None }
     }
 }
 
@@ -348,20 +350,24 @@ impl Engine {
                 let total = matches.len();
                 Ok(json!({"selector": a.selector, "page_id": root.map(|r| r.0), "nodes": matches, "total": total}))
             }
+            "designos_get_metadata" | "get_metadata" => crate::tools::metadata::call_get_metadata(self, args),
             "designos_lint" | "check_design" => {
                 let a: LintArgs = parse(args)?;
                 let root = a.page_id.map(NodeId).or_else(|| self.resolve_default_page().ok());
                 let mut findings = Vec::new();
+                let mut per_node: std::collections::HashMap<NodeId, u16> = std::collections::HashMap::new();
                 let mut check_node = |n: &Node| {
                     if matches!(n.kind, NodeKind::Page { .. }) {
                         return;
                     }
                     if n.size.x <= 0.0 || n.size.y <= 0.0 {
                         findings.push(json!({"rule": "zero-bounds", "severity": "error", "node_id": n.id.0, "name": n.name, "message": "Layer has zero or negative width/height"}));
+                        *per_node.entry(n.id).or_insert(0) += 1;
                     }
                     let trimmed = n.name.trim();
                     if matches!(trimmed, "Frame" | "Rectangle" | "Ellipse" | "Text" | "Group") {
                         findings.push(json!({"rule": "default-layer-name", "severity": "warning", "node_id": n.id.0, "name": n.name, "message": "Give layer a semantic name"}));
+                        *per_node.entry(n.id).or_insert(0) += 1;
                     }
                 };
                 if let Some(r) = root {
@@ -371,6 +377,8 @@ impl Engine {
                         check_node(n);
                     }
                 }
+                let rev = (self.doc.runtime_id(), self.doc.mutation_epoch());
+                self.lint_cache = Some((rev, per_node));
                 let count = findings.len();
                 Ok(json!({"page_id": root.map(|r| r.0), "findings": findings, "total": count, "passed": count == 0}))
             }
@@ -721,6 +729,14 @@ pub fn tools() -> Vec<Value> {
         "get_document",
         "Summarize the current in-memory document: pages, counts, shared styles (fill, text, effect, grid) with their values, and undo state.",
         json!({}),
+        vec![],
+        true,
+        true,
+    );
+    add(
+        "get_metadata",
+        "Return a sparse XML node hierarchy (IDs, types, names, page-space bounds, layout, component/variant props, text previews, and lint issue counts) for a page or subtree.",
+        crate::tools::metadata::properties_schema(),
         vec![],
         true,
         true,

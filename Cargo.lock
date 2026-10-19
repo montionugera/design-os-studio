@@ -1036,6 +1036,7 @@ dependencies = [
  "designos-export",
  "designos-fig",
  "designos-library",
+ "quick-xml",
  "rmcp",
  "serde",
  "serde_json",
