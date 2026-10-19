@@ -514,6 +514,11 @@ pub fn finish_mutating_call(
         }
         designos_doc::AutoFixMode::On => {
             let mut findings_p1 = lint_findings_for_scope(&engine.doc, touched_roots, &engine.session_options.issues, engine.lint_env());
+            for f in &mut findings_p1 {
+                if baseline.contains(f.rule, f.node) == Some(true) {
+                    f.safe = false;
+                }
+            }
             if let Some(hook) = &engine.test_lint_hook {
                 findings_p1.extend(hook(&engine.doc, touched_roots, 0));
             }
@@ -593,6 +598,11 @@ pub fn finish_mutating_call(
             // Re-lint the scope once; if new safe findings appear, run one more pass (max 2 passes)
             // folded into the same `"Auto-fix"` undo entry (`E15-13` §3.3).
             let mut findings_p2 = lint_findings_for_scope(&engine.doc, touched_roots, &engine.session_options.issues, engine.lint_env());
+            for f in &mut findings_p2 {
+                if baseline.contains(f.rule, f.node) == Some(true) {
+                    f.safe = false;
+                }
+            }
             if let Some(hook) = &engine.test_lint_hook {
                 findings_p2.extend(hook(&engine.doc, touched_roots, 1));
             }
