@@ -15,7 +15,7 @@ mod validate;
 pub use record::live_ops_for_command;
 pub use replay::{replay_live_patch, LivePatchReport, LivePatchState};
 
-use crate::{Comment, CommentAnchor, CommentThread, Node, NodeId};
+use crate::{Comment, CommentAnchor, CommentThread, Node, NodeId, Variable, VariableCollection};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -163,6 +163,19 @@ pub enum LiveOp {
     /// Removes the node and its whole subtree.
     Remove {
         id: NodeId,
+    },
+    /// Variables and collections the agent added, replaced or removed, by id. The agent's copy can
+    /// lack variables the editor has (a scoped canvas), so the editor merges these into its own
+    /// maps instead of taking the agent's maps whole.
+    Variables {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        collections: Vec<VariableCollection>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        variables: Vec<Variable>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        removed_collections: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        removed_variables: Vec<String>,
     },
     /// Comment threads the agent created, edited or deleted, by thread id. The agent's copy can
     /// lack threads the editor has, so ids it picks may already be taken there.

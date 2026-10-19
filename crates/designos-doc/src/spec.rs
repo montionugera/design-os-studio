@@ -1,5 +1,6 @@
 //! Spec-Driven Declarative UI Builder, EaseUI BrainWave 2.0 Token/Preset Engine,
 //! Auto-Layout 5.0 Subtree Solver, and Canvas Comment Pin Target Resolver.
+#![allow(clippy::result_large_err)]
 
 use crate::*;
 use serde::{Deserialize, Serialize};
@@ -7,28 +8,26 @@ use serde::{Deserialize, Serialize};
 fn is_zero_f32(v: &f32) -> bool {
     *v == 0.0
 }
-fn is_one_f32(v: &f32) -> bool {
-    (*v - 1.0).abs() < 1e-6
-}
-fn default_one_f32() -> f32 {
-    1.0
+fn default_one_num_or_var() -> NumberOrVar {
+    NumberOrVar::Num(1.0)
 }
 
-///Declarative Auto-Layout 5.0 specification for a container frame.
+/// Declarative Auto-Layout 5.0 specification for a container frame.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LayoutSpec {
     /// `"row"` / `"horizontal"` or `"column"` / `"vertical"`.
-    #[serde(default, alias = "dir")]
+    #[serde(default)]
     pub direction: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wrap: bool,
-    #[serde(default, skip_serializing_if = "is_zero_f32")]
-    pub gap: f32,
-    #[serde(default, skip_serializing_if = "is_zero_f32")]
-    pub counter_gap: f32,
-    /// `[top, right, bottom, left]` padding in px.
+    #[serde(default, skip_serializing_if = "NumberOrVar::is_zero")]
+    pub gap: NumberOrVar,
+    #[serde(default, skip_serializing_if = "NumberOrVar::is_zero")]
+    pub counter_gap: NumberOrVar,
+    /// `[top, right, bottom, left]` padding in px or `"var:..."` references.
     #[serde(default)]
-    pub padding: [f32; 4],
+    pub padding: [NumberOrVar; 4],
     /// `"start"`, `"center"`, `"end"`, `"space-between"`, `"space-around"`, `"space-evenly"`, or `"baseline"`.
     #[serde(default, alias = "justify", skip_serializing_if = "String::is_empty")]
     pub primary_align: String,
@@ -43,14 +42,30 @@ pub struct LayoutSpec {
 
 /// Declarative node specification used by Agents and CLI/MCP tools (`apply_spec` / `export_spec`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
-    /// `"frame"`, `"rectangle"`, `"ellipse"`, `"text"`, `"section"`, `"component"`.
+    /// `"frame"`, `"rectangle"`, `"ellipse"`, `"text"`, `"section"`, `"component"`, `"instance"`.
     #[serde(default)]
     pub kind: String,
     #[serde(default)]
     pub name: String,
+    /// Component reference for `"instance"` nodes (`"node:<id>"`, component key, or component/library name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
+    /// Variant property selection `{property: value}` for `"instance"` nodes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub variant: BTreeMap<String, String>,
+    /// Component property overrides `{prop_name: value}` on an `"instance"` root.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub props: BTreeMap<String, serde_json::Value>,
+    /// Ordered descendant overrides applied inside an `"instance"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overrides: Vec<OverrideSpec>,
+    /// Slot fills or disable flags `{slot_name: [NodeSpec...] | false}` on an `"instance"` root (E15-2).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub slots: BTreeMap<String, SlotFillSpec>,
     /// Optional EaseUI BrainWave 2.0 preset:
     /// `"easeui-screen"`, `"easeui-panel"`, `"easeui-card"`, `"easeui-button-primary"`,
     /// `"easeui-button-secondary"`, `"easeui-input"`, `"easeui-badge"`, `"easeui-row"`, `"easeui-column"`.
@@ -82,31 +97,39 @@ pub struct NodeSpec {
     pub col_span: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_span: Option<u16>,
-    /// Hex color (`"#18181B"`) or EaseUI token (`"$easeui.bg.panel"`, `"$easeui.accent.orange"`, etc.).
+    /// Hex color (`"#18181B"`), `"var:<collection>/<name>"`, `"style:<name>"`, or EaseUI token (`"$easeui.bg.panel"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill: Option<String>,
-    /// Hex color or EaseUI token for stroke.
+    /// Hex color, `"var:..."`, `"style:..."`, or EaseUI token for stroke.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stroke: Option<String>,
     #[serde(default, alias = "stroke_width", skip_serializing_if = "Option::is_none")]
-    pub stroke_weight: Option<f32>,
+    pub stroke_weight: Option<NumberOrVar>,
     #[serde(default, alias = "radius", skip_serializing_if = "Option::is_none")]
-    pub corner_radius: Option<f32>,
+    pub corner_radius: Option<NumberOrVar>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub corner_radii: Option<[f32; 4]>,
-    #[serde(default = "default_one_f32", skip_serializing_if = "is_one_f32")]
-    pub opacity: f32,
+    pub corner_radii: Option<[NumberOrVar; 4]>,
+    #[serde(default = "default_one_num_or_var", skip_serializing_if = "NumberOrVar::is_one")]
+    pub opacity: NumberOrVar,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clips_content: Option<bool>,
     /// Text content (for `"text"` nodes, or automatically creates a child label if set on a button/badge frame!).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub font_size: Option<f32>,
+    pub font_size: Option<NumberOrVar>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_height: Option<NumberOrVar>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_weight: Option<u16>,
     #[serde(default, alias = "color", skip_serializing_if = "Option::is_none")]
     pub text_color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_style: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_style: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub mode: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<LayoutSpec>,
     /// `"ready"` (`ReadyForDev`) or `"completed"` (`Completed`).
@@ -121,6 +144,154 @@ pub struct NodeSpec {
     pub comments: Vec<ResolvedCommentThread>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<NodeSpec>,
+}
+
+/// Literal `false` used by [`SlotFillSpec::Disabled`] (`slots: {"Actions": false}`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FalseLiteral;
+
+impl Serialize for FalseLiteral {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bool(false)
+    }
+}
+
+impl<'de> Deserialize<'de> for FalseLiteral {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let b = bool::deserialize(deserializer)?;
+        if !b {
+            Ok(FalseLiteral)
+        } else {
+            Err(serde::de::Error::custom("INVALID_SLOT_VALUE: slot value must be false or [NodeSpec...]"))
+        }
+    }
+}
+
+/// Slot fill or disable specification in `NodeSpec::slots` / `OverrideSpec::slots` (E15-2).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum SlotFillSpec {
+    Disabled(FalseLiteral),
+    Fill(Vec<NodeSpec>),
+}
+
+impl<'de> Deserialize<'de> for SlotFillSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(deserializer)?;
+        match v {
+            serde_json::Value::Bool(false) => Ok(SlotFillSpec::Disabled(FalseLiteral)),
+            serde_json::Value::Array(_) => serde_json::from_value::<Vec<NodeSpec>>(v).map(SlotFillSpec::Fill).map_err(serde::de::Error::custom),
+            _ => Err(serde::de::Error::custom("INVALID_SLOT_VALUE: slot value must be false or [NodeSpec...]")),
+        }
+    }
+}
+
+/// Descendant override specification inside a `NodeSpec` of `kind: "instance"`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverrideSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub variant: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub props: BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub slots: BTreeMap<String, SlotFillSpec>,
+}
+
+fn spec_levenshtein(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let n = b_chars.len();
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0usize; n + 1];
+    for (i, &ca) in a_chars.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b_chars.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
+/// Parses a `serde` `unknown field` error string into `(received_field, closest_5_valid_fields)`.
+pub fn extract_unknown_field_options(err_msg: &str) -> Option<(String, Vec<String>)> {
+    let (_, after_prefix) = err_msg.split_once("unknown field `")?;
+    let (bad, rest) = after_prefix.split_once('`')?;
+    let mut raw_fields = Vec::new();
+    if let Some((_, expected_part)) = rest.split_once("expected ") {
+        let mut rem = expected_part;
+        while let Some((_, after_bt)) = rem.split_once('`') {
+            if let Some((tok, tail)) = after_bt.split_once('`') {
+                if !tok.is_empty() && !raw_fields.iter().any(|x: &String| x == tok) {
+                    raw_fields.push(tok.to_string());
+                }
+                rem = tail;
+            } else {
+                break;
+            }
+        }
+    }
+    // Filter out serde aliases when their canonical field name is present.
+    let alias_pairs = [
+        ("dir", "direction"),
+        ("justify", "primary_align"),
+        ("align", "counter_align"),
+        ("stroke_width", "stroke_weight"),
+        ("radius", "corner_radius"),
+        ("color", "text_color"),
+    ];
+    let filtered: Vec<String> = raw_fields
+        .iter()
+        .filter(|cand| !alias_pairs.iter().any(|(alias, canon)| cand.as_str() == *alias && raw_fields.iter().any(|x| x == canon)))
+        .cloned()
+        .collect();
+
+    let bad_lower = bad.to_ascii_lowercase();
+    let mut scored: Vec<(usize, usize, String)> = filtered
+        .into_iter()
+        .take(10_000)
+        .enumerate()
+        .map(|(idx, cand)| {
+            let dist = spec_levenshtein(&bad_lower, &cand.to_ascii_lowercase());
+            (dist, idx, cand)
+        })
+        .collect();
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let valid_options: Vec<String> = scored.into_iter().take(5).map(|(_, _, c)| c).collect();
+    Some((bad.to_string(), valid_options))
+}
+
+/// Formats a `NodeSpec` / `LayoutSpec` / `OverrideSpec` `serde_json::Error` with `UNKNOWN_FIELD`
+/// and the 5 closest valid field names so Studio's live-spec toast and CLI/MCP share the same diagnostic.
+pub fn format_spec_serde_error(err: &serde_json::Error) -> String {
+    let msg = err.to_string();
+    if let Some((bad, valid)) = extract_unknown_field_options(&msg) {
+        if valid.is_empty() {
+            format!("UNKNOWN_FIELD: unknown field `{bad}`")
+        } else {
+            format!("UNKNOWN_FIELD: unknown field `{bad}` (valid_options: {})", valid.join(", "))
+        }
+    } else {
+        msg
+    }
 }
 
 /// A canvas comment thread enriched with its resolved world position and the
@@ -144,32 +315,16 @@ pub struct ResolvedCommentThread {
 /// Resolves an EaseUI BrainWave 2.0 design token (`$easeui.*`) or `#RRGGBB[AA]` hex string.
 pub fn resolve_easeui_color(spec: &str) -> Option<Color> {
     let s = spec.trim();
+    if let Some((_, c)) = crate::lookup_easeui_token(s) {
+        return Some(c);
+    }
     match s {
-        "$easeui.bg.canvas" | "$easeui.bg" => Some(Color::rgb(0x12, 0x12, 0x15)),
-        "$easeui.bg.panel" | "$easeui.panel" => Some(Color::rgb(0x18, 0x18, 0x1B)),
-        "$easeui.bg.surface" | "$easeui.surface" => Some(Color::rgb(0x27, 0x27, 0x2A)),
-        "$easeui.bg.elevated" | "$easeui.elevated" => Some(Color::rgb(0x30, 0x30, 0x36)),
-        "$easeui.border" => Some(Color::rgb(0x27, 0x27, 0x2A)),
-        "$easeui.border.subtle" => Some(Color::rgb(0x3F, 0x3F, 0x46)),
-        "$easeui.text.primary" | "$easeui.text" => Some(Color::rgb(0xF4, 0xF4, 0xF5)),
-        "$easeui.text.secondary" => Some(Color::rgb(0xA1, 0xA1, 0xAA)),
-        "$easeui.text.muted" => Some(Color::rgb(0x71, 0x71, 0x7A)),
-        "$easeui.accent.orange" | "$easeui.brand" | "$easeui.primary" => Some(Color::rgb(0xE3, 0x63, 0x23)),
-        "$easeui.accent.blue" | "$easeui.selection" => Some(Color::rgb(0x35, 0x82, 0xFF)),
-        "$easeui.accent.violet" | "$easeui.component" => Some(Color::rgb(0x87, 0x55, 0xE9)),
-        "$easeui.accent.emerald" | "$easeui.status.success" | "$easeui.success" => Some(Color::rgb(0x18, 0xB3, 0x68)),
-        "$easeui.status.warning" | "$easeui.warning" => Some(Color::rgb(0xF5, 0x9E, 0x0B)),
-        "$easeui.status.danger" | "$easeui.danger" => Some(Color::rgb(0xEF, 0x44, 0x44)),
-        "$easeui.light.bg" => Some(Color::rgb(0xFA, 0xFA, 0xFA)),
-        "$easeui.light.surface" => Some(Color::rgb(0xFF, 0xFF, 0xFF)),
-        "$easeui.light.border" => Some(Color::rgb(0xE4, 0xE4, 0xE7)),
-        "$easeui.light.text" => Some(Color::rgb(0x18, 0x18, 0x1B)),
         "transparent" | "none" => Some(Color::TRANSPARENT),
         _ => Color::from_hex(s),
     }
 }
 
-fn parse_sizing(s: &str) -> Sizing {
+pub(crate) fn parse_sizing(s: &str) -> Sizing {
     match s.trim().to_ascii_lowercase().as_str() {
         "hug" | "auto" => Sizing::Hug,
         "fill" | "stretch" | "100%" => Sizing::Fill,
@@ -177,7 +332,7 @@ fn parse_sizing(s: &str) -> Sizing {
     }
 }
 
-fn parse_align(s: &str) -> LayoutAlign {
+pub(crate) fn parse_align(s: &str) -> LayoutAlign {
     match s.trim().to_ascii_lowercase().as_str() {
         "center" | "middle" => LayoutAlign::Center,
         "end" | "right" | "bottom" => LayoutAlign::End,
@@ -189,7 +344,7 @@ fn parse_align(s: &str) -> LayoutAlign {
     }
 }
 
-fn parse_direction(s: &str) -> LayoutDirection {
+pub(crate) fn parse_direction(s: &str) -> LayoutDirection {
     match s.trim().to_ascii_lowercase().as_str() {
         "column" | "col" | "vertical" | "v" => LayoutDirection::Vertical,
         "grid" | "g" => LayoutDirection::Grid,
@@ -358,26 +513,30 @@ impl Document {
     /// Materializes a declarative [`NodeSpec`] subtree under `parent` and runs
     /// Auto-Layout 5.0 reflow across the created hierarchy.
     pub fn apply_spec(&mut self, parent: NodeId, spec: &NodeSpec) -> Result<NodeId, String> {
-        let pnode = self.get(parent).ok_or_else(|| format!("Parent node {} not found", parent.0))?;
-        if !pnode.kind.is_container() {
-            return Err(format!("Parent node {} is not a container", parent.0));
-        }
-        let root_id = self.build_spec_node(parent, spec)?;
-        // Run Auto-Layout 5.0 reflow from parent (if parent has auto-layout) or root_id
-        let relayout_root = if self.get(parent).and_then(|n| n.kind.frame_props()).and_then(|f| f.auto_layout.as_ref()).is_some() { parent } else { root_id };
-        self.relayout_subtree(relayout_root);
-        Ok(root_id)
+        self.apply_spec_with_libraries(parent, spec, &[]).map(|r| r.root_node_id).map_err(|e| e.to_string())
     }
 
-    fn build_spec_node(&mut self, parent: NodeId, spec: &NodeSpec) -> Result<NodeId, String> {
-        let id = self.try_alloc_id().ok_or("Document has exhausted node IDs")?;
-        let w = spec.width.unwrap_or(if spec.kind.eq_ignore_ascii_case("text") { 120.0 } else { 200.0 });
-        let h = spec.height.unwrap_or(if spec.kind.eq_ignore_ascii_case("text") { 24.0 } else { 100.0 });
-        let rect = Rect::new(spec.x, spec.y, w.max(0.0), h.max(0.0));
+    /// Materializes `spec` under `parent`, resolving `var:`, `style:`, `mode`, and `$easeui.*`
+    /// references against local document tokens/styles and returning a [`SpecApplyReport`].
+    pub fn apply_spec_with_report(&mut self, parent: NodeId, spec: &NodeSpec) -> Result<SpecApplyReport, SpecBindError> {
+        let r = self.apply_spec_with_libraries(parent, spec, &[]).map_err(SpecBindError::from)?;
+        Ok(SpecApplyReport { root_node_id: r.root_node_id, bindings_created: r.bindings_created, styles_linked: r.styles_linked, warnings: r.warnings })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn build_spec_node_with_ctx(
+        &mut self,
+        parent: NodeId,
+        spec: &NodeSpec,
+        path: &str,
+        ctx: &mut crate::spec_instance::SpecBuildCtx<'_>,
+    ) -> Result<NodeId, crate::spec_instance::SpecError> {
         let kind_str = if spec.kind.is_empty() {
-            if spec.preset.is_some() || spec.layout.is_some() || !spec.children.is_empty() {
+            if spec.component.is_some() {
+                "instance"
+            } else if spec.preset.is_some() || spec.layout.is_some() || !spec.children.is_empty() {
                 "frame"
-            } else if spec.text.is_some() {
+            } else if spec.text.is_some() || spec.text_style.is_some() || spec.font_size.is_some() || spec.line_height.is_some() {
                 "text"
             } else {
                 "frame"
@@ -385,6 +544,39 @@ impl Document {
         } else {
             spec.kind.as_str()
         };
+
+        if kind_str.eq_ignore_ascii_case("instance") {
+            return self.build_instance_spec_node(parent, spec, ctx).map_err(|mut e| {
+                if !path.is_empty() && path != "spec" && !e.path.starts_with("spec.") && !e.path.starts_with(path) {
+                    e.path = if e.path.is_empty() { path.to_string() } else { format!("{path}.{}", e.path) };
+                }
+                e
+            });
+        }
+        if !spec.slots.is_empty() {
+            return Err(crate::spec_instance::SpecError::named(
+                "OVERRIDE_FIELD_NOT_APPLICABLE",
+                "slots can only be set on instance nodes",
+                Some(format!("{path}.slots")),
+                Vec::new(),
+                None,
+            ));
+        }
+
+        let id = self.try_alloc_id().ok_or_else(|| SpecBindError {
+            code: "ID_EXHAUSTED".to_string(),
+            message: "Document has exhausted node IDs".to_string(),
+            path: path.to_string(),
+            received: None,
+            expected: None,
+            valid_options: Vec::new(),
+            corrected_example: None,
+            safe_to_retry: true,
+        })?;
+        let is_text_kind = kind_str.eq_ignore_ascii_case("text");
+        let w = spec.width.unwrap_or(if is_text_kind { 120.0 } else { 200.0 });
+        let h = spec.height.unwrap_or(if is_text_kind { 24.0 } else { 100.0 });
+        let rect = Rect::new(spec.x, spec.y, w.max(0.0), h.max(0.0));
 
         let mut node = match kind_str.to_ascii_lowercase().as_str() {
             "frame" => Node::frame(id, rect),
@@ -404,13 +596,32 @@ impl Document {
             "ellipse" | "circle" => Node::ellipse(id, rect),
             "text" => {
                 let mut style = TextStyle::default();
-                style.font_size = spec.font_size.unwrap_or(14.0);
+                style.font_size = spec.font_size.as_ref().and_then(NumberOrVar::as_num).unwrap_or(14.0);
                 style.font_weight = spec.font_weight.unwrap_or(400);
-                let col = spec.text_color.as_deref().or(spec.fill.as_deref()).and_then(resolve_easeui_color).unwrap_or_else(|| Color::rgb(0xF4, 0xF4, 0xF5));
-                style.fills = vec![Paint::solid(col)];
+                style.fills = vec![Paint::solid(Color::rgb(0xF4, 0xF4, 0xF5))];
                 Node::text(id, rect, spec.text.clone().unwrap_or_default(), style)
             }
-            other => return Err(format!("Unsupported spec node kind: {other}")),
+            other => {
+                return Err(SpecBindError {
+                    code: "UNSUPPORTED_NODE_KIND".to_string(),
+                    message: format!("Unsupported spec node kind: {other}"),
+                    path: format!("{path}.kind"),
+                    received: Some(other.to_string()),
+                    expected: Some("frame, rectangle, ellipse, text, section, component, instance".to_string()),
+                    valid_options: vec![
+                        "frame".into(),
+                        "rectangle".into(),
+                        "ellipse".into(),
+                        "text".into(),
+                        "section".into(),
+                        "component".into(),
+                        "instance".into(),
+                    ],
+                    corrected_example: None,
+                    safe_to_retry: true,
+                }
+                .into())
+            }
         };
 
         if let Some(preset) = &spec.preset {
@@ -423,7 +634,8 @@ impl Document {
         } else if let Some(t) = &spec.text {
             node.name = t.chars().take(32).collect();
         }
-        // LayoutSpec on frame (applied BEFORE width/height sizing so al.direction is final)
+
+        // LayoutSpec on frame (applied BEFORE width/height sizing & before variable bindings so auto_layout exists)
         if let Some(ls) = &spec.layout {
             if let Some(f) = node.kind.frame_props_mut() {
                 let mut al = f.auto_layout.take().unwrap_or_else(AutoLayout::v1);
@@ -431,10 +643,16 @@ impl Document {
                     al.direction = parse_direction(&ls.direction);
                 }
                 al.wrap = ls.wrap;
-                al.item_spacing = ls.gap;
-                al.counter_spacing = ls.counter_gap;
-                if ls.padding != [0.0; 4] {
-                    al.padding = ls.padding;
+                if let Some(g) = ls.gap.as_num() {
+                    al.item_spacing = g;
+                }
+                if let Some(cg) = ls.counter_gap.as_num() {
+                    al.counter_spacing = cg;
+                }
+                let pad_nums = [ls.padding[0].unwrap_or(0.0), ls.padding[1].unwrap_or(0.0), ls.padding[2].unwrap_or(0.0), ls.padding[3].unwrap_or(0.0)];
+                let any_pad_set = ls.padding.iter().any(|p| !p.is_zero());
+                if any_pad_set {
+                    al.padding = pad_nums;
                 }
                 if !ls.primary_align.is_empty() {
                     al.primary_align = parse_align(&ls.primary_align);
@@ -476,30 +694,8 @@ impl Document {
                 }
             }
         }
-        node.opacity = spec.opacity.clamp(0.0, 1.0);
-
-        if let Some(fill_str) = &spec.fill {
-            if !matches!(node.kind, NodeKind::Text(_)) {
-                if fill_str.eq_ignore_ascii_case("none") || fill_str.eq_ignore_ascii_case("transparent") {
-                    node.fills.clear();
-                } else if let Some(c) = resolve_easeui_color(fill_str) {
-                    node.fills = vec![Paint::solid(c)];
-                }
-            }
-        }
-        if let Some(stroke_str) = &spec.stroke {
-            if let Some(c) = resolve_easeui_color(stroke_str) {
-                node.stroke.paints = vec![Paint::solid(c)];
-            }
-        }
-        if let Some(sw) = spec.stroke_weight {
-            node.stroke.weight = sw.max(0.0);
-        }
-        if let Some(r) = spec.corner_radius {
-            node.corner_radii = [r.max(0.0); 4];
-        }
-        if let Some(radii) = spec.corner_radii {
-            node.corner_radii = radii;
+        if let Some(op) = spec.opacity.as_num() {
+            node.opacity = op.clamp(0.0, 1.0);
         }
         if let Some(clips) = spec.clips_content {
             if let Some(f) = node.kind.frame_props_mut() {
@@ -562,100 +758,743 @@ impl Document {
             }
         }
 
-        // Estimate intrinsic text bounds for text nodes
-        if let NodeKind::Text(tp) = &mut node.kind {
-            let est = estimate_intrinsic_text_size(tp);
-            if spec.width.is_some() || spec.width_sizing.as_deref() == Some("fill") {
-                tp.auto_resize = TextAutoResize::Height;
-                if spec.height.is_none() {
-                    let lines = (est.x / node.size.x.max(20.0)).ceil().max(1.0);
-                    node.size.y = (lines * tp.style.font_size.max(8.0) * 1.45).ceil();
+        // Resolve explicit variable modes on this node BEFORE inserting and resolving bindings
+        if !spec.mode.is_empty() {
+            node.variables.modes = crate::resolve_mode_map(self, &spec.mode, path)?;
+        }
+
+        let node_kind = node.kind.clone();
+        self.insert(parent, node).map_err(|e| SpecBindError {
+            code: "INSERT_FAILED".to_string(),
+            message: e.to_string(),
+            path: path.to_string(),
+            received: None,
+            expected: None,
+            valid_options: Vec::new(),
+            corrected_example: None,
+            safe_to_retry: true,
+        })?;
+
+        let libraries = ctx.snapshots;
+
+        // 1. Bind preset EaseUI colours (before explicit fill/stroke overrides)
+        if let Some(preset) = &spec.preset {
+            let (fill_tok, stroke_tok) = crate::preset_easeui_tokens(preset);
+            if fill_tok.is_some() || stroke_tok.is_some() {
+                let coll_name = crate::ensure_easeui_deprecated_collection(self);
+                ctx.bind_index.ensure_easeui_indexed(self);
+                if let Some((canonical, token_str)) = fill_tok {
+                    let var_id = format!("{EASEUI_DEPRECATED_COLLECTION_ID}/{canonical}");
+                    ctx.bind_report.bindings_created +=
+                        crate::apply_variable_binding(self, id, &["fills/0"], &var_id, &format!("{path}.preset"), &mut ctx.bind_report.warnings);
+                    ctx.bind_report.warnings.push(SpecWarning {
+                        code: "DEPRECATED_EASEUI_TOKEN".to_string(),
+                        path: format!("{path}.preset"),
+                        token: Some(token_str.to_string()),
+                        replacement: Some(format!("var:{coll_name}/{canonical}")),
+                        message: None,
+                    });
                 }
-            } else {
-                if spec.width.is_none() {
-                    node.size.x = est.x;
-                }
-                if spec.height.is_none() {
-                    node.size.y = est.y;
+                if let Some((canonical, token_str)) = stroke_tok {
+                    let var_id = format!("{EASEUI_DEPRECATED_COLLECTION_ID}/{canonical}");
+                    ctx.bind_report.bindings_created +=
+                        crate::apply_variable_binding(self, id, &["strokes/0"], &var_id, &format!("{path}.preset"), &mut ctx.bind_report.warnings);
+                    ctx.bind_report.warnings.push(SpecWarning {
+                        code: "DEPRECATED_EASEUI_TOKEN".to_string(),
+                        path: format!("{path}.preset"),
+                        token: Some(token_str.to_string()),
+                        replacement: Some(format!("var:{coll_name}/{canonical}")),
+                        message: None,
+                    });
                 }
             }
         }
 
-        self.insert(parent, node).map_err(|e| e.to_string())?;
+        // 2. Effect style link
+        if let Some(eff_ref) = &spec.effect_style {
+            let style_key = crate::resolve_style_ref(
+                self,
+                &mut ctx.bind_index,
+                libraries,
+                eff_ref,
+                StyleProperty::Effect,
+                "effect_style",
+                &format!("{path}.effect_style"),
+            )?;
+            if let Some(style) = self.styles.get(&style_key).cloned() {
+                if let Some(n) = self.get_mut(id) {
+                    n.style_refs.insert("effect".to_string(), style_key.clone());
+                    crate::apply_style_values(n, &style, &style_key);
+                    ctx.bind_report.styles_linked += 1;
+                }
+            }
+        }
+
+        // 3. Text style link (on text nodes)
+        if is_text_kind {
+            if let Some(ts_ref) = &spec.text_style {
+                let style_key =
+                    crate::resolve_style_ref(self, &mut ctx.bind_index, libraries, ts_ref, StyleProperty::Text, "text_style", &format!("{path}.text_style"))?;
+                if let Some(style) = self.styles.get(&style_key).cloned() {
+                    if let Some(n) = self.get_mut(id) {
+                        n.style_refs.insert("text".to_string(), style_key.clone());
+                        crate::apply_style_values(n, &style, &style_key);
+                        ctx.bind_report.styles_linked += 1;
+                    }
+                }
+            }
+        }
+
+        // 4. Fill / text_color
+        if is_text_kind {
+            let col_input = spec.text_color.as_deref().map(|s| ("text_color", s)).or_else(|| spec.fill.as_deref().map(|s| ("fill", s)));
+            if let Some((field_name, raw_col)) = col_input {
+                let fpath = format!("{path}.{field_name}");
+                let resolved = crate::resolve_colour_ref(
+                    self,
+                    &mut ctx.bind_index,
+                    libraries,
+                    id,
+                    &node_kind,
+                    "fills/0",
+                    field_name,
+                    raw_col,
+                    &fpath,
+                    &mut ctx.bind_report.warnings,
+                )?;
+                match resolved {
+                    ResolvedColourRef::NoneOrTransparent => {
+                        if let Some(n) = self.get_mut(id) {
+                            n.variables.bindings.remove("fills/0");
+                            n.style_refs.remove("fill");
+                            if let NodeKind::Text(tp) = &mut n.kind {
+                                tp.style.fills.clear();
+                            }
+                        }
+                    }
+                    ResolvedColourRef::Literal(c) => {
+                        if let Some(n) = self.get_mut(id) {
+                            n.variables.bindings.remove("fills/0");
+                            n.style_refs.remove("fill");
+                            if let NodeKind::Text(tp) = &mut n.kind {
+                                tp.style.fills = vec![Paint::solid(c)];
+                            }
+                        }
+                    }
+                    ResolvedColourRef::Variable { var_id, .. } => {
+                        if let Some(n) = self.get_mut(id) {
+                            n.style_refs.remove("fill");
+                        }
+                        ctx.bind_report.bindings_created +=
+                            crate::apply_variable_binding(self, id, &["fills/0"], &var_id, &fpath, &mut ctx.bind_report.warnings);
+                    }
+                    ResolvedColourRef::Style { style_key, .. } => {
+                        if let Some(style) = self.styles.get(&style_key).cloned() {
+                            if let Some(n) = self.get_mut(id) {
+                                n.variables.bindings.remove("fills/0");
+                                n.style_refs.insert("fill".to_string(), style_key.clone());
+                                crate::apply_style_values(n, &style, &style_key);
+                                ctx.bind_report.styles_linked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Some(fill_str) = &spec.fill {
+            let fpath = format!("{path}.fill");
+            let resolved = crate::resolve_colour_ref(
+                self,
+                &mut ctx.bind_index,
+                libraries,
+                id,
+                &node_kind,
+                "fills/0",
+                "fill",
+                fill_str,
+                &fpath,
+                &mut ctx.bind_report.warnings,
+            )?;
+            match resolved {
+                ResolvedColourRef::NoneOrTransparent => {
+                    if let Some(n) = self.get_mut(id) {
+                        n.variables.bindings.remove("fills/0");
+                        n.style_refs.remove("fill");
+                        n.fills.clear();
+                    }
+                }
+                ResolvedColourRef::Literal(c) => {
+                    if let Some(n) = self.get_mut(id) {
+                        n.variables.bindings.remove("fills/0");
+                        n.style_refs.remove("fill");
+                        n.fills = vec![Paint::solid(c)];
+                    }
+                }
+                ResolvedColourRef::Variable { var_id, .. } => {
+                    if let Some(n) = self.get_mut(id) {
+                        n.style_refs.remove("fill");
+                    }
+                    ctx.bind_report.bindings_created += crate::apply_variable_binding(self, id, &["fills/0"], &var_id, &fpath, &mut ctx.bind_report.warnings);
+                }
+                ResolvedColourRef::Style { style_key, .. } => {
+                    if let Some(style) = self.styles.get(&style_key).cloned() {
+                        if let Some(n) = self.get_mut(id) {
+                            n.variables.bindings.remove("fills/0");
+                            n.style_refs.insert("fill".to_string(), style_key.clone());
+                            crate::apply_style_values(n, &style, &style_key);
+                            ctx.bind_report.styles_linked += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. Stroke colour
+        if let Some(stroke_str) = &spec.stroke {
+            let fpath = format!("{path}.stroke");
+            let resolved = crate::resolve_colour_ref(
+                self,
+                &mut ctx.bind_index,
+                libraries,
+                id,
+                &node_kind,
+                "strokes/0",
+                "stroke",
+                stroke_str,
+                &fpath,
+                &mut ctx.bind_report.warnings,
+            )?;
+            match resolved {
+                ResolvedColourRef::NoneOrTransparent => {
+                    if let Some(n) = self.get_mut(id) {
+                        n.variables.bindings.remove("strokes/0");
+                        n.style_refs.remove("stroke");
+                        n.stroke.paints.clear();
+                    }
+                }
+                ResolvedColourRef::Literal(c) => {
+                    if let Some(n) = self.get_mut(id) {
+                        n.variables.bindings.remove("strokes/0");
+                        n.style_refs.remove("stroke");
+                        n.stroke.paints = vec![Paint::solid(c)];
+                    }
+                }
+                ResolvedColourRef::Variable { var_id, .. } => {
+                    if let Some(n) = self.get_mut(id) {
+                        n.style_refs.remove("stroke");
+                    }
+                    ctx.bind_report.bindings_created += crate::apply_variable_binding(self, id, &["strokes/0"], &var_id, &fpath, &mut ctx.bind_report.warnings);
+                }
+                ResolvedColourRef::Style { style_key, .. } => {
+                    if let Some(style) = self.styles.get(&style_key).cloned() {
+                        if let Some(n) = self.get_mut(id) {
+                            n.variables.bindings.remove("strokes/0");
+                            n.style_refs.insert("stroke".to_string(), style_key.clone());
+                            crate::apply_style_values(n, &style, &style_key);
+                            ctx.bind_report.styles_linked += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 6. Bindable numeric properties
+        if let Some(sw) = &spec.stroke_weight {
+            if let Some(v) = self.bind_or_eval_number(
+                id,
+                &node_kind,
+                sw,
+                &["strokeWeight"],
+                "stroke_weight",
+                format!("{path}.stroke_weight"),
+                &mut ctx.bind_index,
+                libraries,
+                &mut ctx.bind_report,
+            )? {
+                if let Some(n) = self.get_mut(id) {
+                    n.stroke.weight = v.max(0.0);
+                }
+            }
+        }
+        if let Some(cr) = &spec.corner_radius {
+            if let Some(v) = self.bind_or_eval_number(
+                id,
+                &node_kind,
+                cr,
+                &["topLeftRadius", "topRightRadius", "bottomRightRadius", "bottomLeftRadius"],
+                "corner_radius",
+                format!("{path}.corner_radius"),
+                &mut ctx.bind_index,
+                libraries,
+                &mut ctx.bind_report,
+            )? {
+                if let Some(n) = self.get_mut(id) {
+                    n.corner_radii = [v.max(0.0); 4];
+                }
+            }
+        }
+        if let Some(radii) = &spec.corner_radii {
+            let corner_keys = ["topLeftRadius", "topRightRadius", "bottomRightRadius", "bottomLeftRadius"];
+            for (i, r_item) in radii.iter().enumerate() {
+                if let Some(v) = self.bind_or_eval_number(
+                    id,
+                    &node_kind,
+                    r_item,
+                    &[corner_keys[i]],
+                    "corner_radii",
+                    format!("{path}.corner_radii[{i}]"),
+                    &mut ctx.bind_index,
+                    libraries,
+                    &mut ctx.bind_report,
+                )? {
+                    if let Some(n) = self.get_mut(id) {
+                        n.corner_radii[i] = v.max(0.0);
+                    }
+                }
+            }
+        }
+        if let NumberOrVar::Ref(_) = &spec.opacity {
+            let _ = self.bind_or_eval_number(
+                id,
+                &node_kind,
+                &spec.opacity,
+                &["opacity"],
+                "opacity",
+                format!("{path}.opacity"),
+                &mut ctx.bind_index,
+                libraries,
+                &mut ctx.bind_report,
+            )?;
+        }
+        if let Some(ls) = &spec.layout {
+            if let NumberOrVar::Ref(_) = &ls.gap {
+                let _ = self.bind_or_eval_number(
+                    id,
+                    &node_kind,
+                    &ls.gap,
+                    &["itemSpacing"],
+                    "gap",
+                    format!("{path}.layout.gap"),
+                    &mut ctx.bind_index,
+                    libraries,
+                    &mut ctx.bind_report,
+                )?;
+            }
+            if let NumberOrVar::Ref(_) = &ls.counter_gap {
+                let _ = self.bind_or_eval_number(
+                    id,
+                    &node_kind,
+                    &ls.counter_gap,
+                    &["counterAxisSpacing"],
+                    "counter_gap",
+                    format!("{path}.layout.counter_gap"),
+                    &mut ctx.bind_index,
+                    libraries,
+                    &mut ctx.bind_report,
+                )?;
+            }
+            let pad_keys = ["paddingTop", "paddingRight", "paddingBottom", "paddingLeft"];
+            for (i, p_item) in ls.padding.iter().enumerate() {
+                if let NumberOrVar::Ref(_) = p_item {
+                    let _ = self.bind_or_eval_number(
+                        id,
+                        &node_kind,
+                        p_item,
+                        &[pad_keys[i]],
+                        "padding",
+                        format!("{path}.layout.padding[{i}]"),
+                        &mut ctx.bind_index,
+                        libraries,
+                        &mut ctx.bind_report,
+                    )?;
+                }
+            }
+        }
+
+        // 7. Font size, line height and weight on Text nodes (or when spec.text is None)
+        if is_text_kind || spec.text.is_none() {
+            self.apply_text_overrides(id, &node_kind, spec, path, &mut ctx.bind_index, libraries, &mut ctx.bind_report)?;
+        }
+
+        // Re-estimate intrinsic text bounds after text_style / font_size / line_height application
+        if let Some(n) = self.get_mut(id) {
+            if let NodeKind::Text(tp) = &mut n.kind {
+                let est = estimate_intrinsic_text_size(tp);
+                if spec.width.is_some() || spec.width_sizing.as_deref() == Some("fill") {
+                    tp.auto_resize = TextAutoResize::Height;
+                    if spec.height.is_none() {
+                        let lines = (est.x / n.size.x.max(20.0)).ceil().max(1.0);
+                        n.size.y = (lines * tp.style.font_size.max(8.0) * 1.45).ceil();
+                    }
+                } else {
+                    if spec.width.is_none() {
+                        n.size.x = est.x;
+                    }
+                    if spec.height.is_none() {
+                        n.size.y = est.y;
+                    }
+                }
+            }
+        }
 
         // Convenience: if a frame/preset (like easeui-button-primary or easeui-badge) specifies `text`,
         // automatically insert a child Text node inside it!
-        if !matches!(kind_str.to_ascii_lowercase().as_str(), "text") {
+        if !is_text_kind {
             if let Some(label) = &spec.text {
-                let tid = self.try_alloc_id().ok_or("Document has exhausted node IDs")?;
+                let tid = self.try_alloc_id().ok_or_else(|| SpecBindError {
+                    code: "ID_EXHAUSTED".to_string(),
+                    message: "Document has exhausted node IDs".to_string(),
+                    path: format!("{path}.text"),
+                    received: None,
+                    expected: None,
+                    valid_options: Vec::new(),
+                    corrected_example: None,
+                    safe_to_retry: true,
+                })?;
                 let mut style = TextStyle::default();
-                style.font_size = spec.font_size.unwrap_or(13.0);
+                style.font_size = spec.font_size.as_ref().and_then(NumberOrVar::as_num).unwrap_or(13.0);
                 style.font_weight = spec.font_weight.unwrap_or(500);
-                let col = spec.text_color.as_deref().and_then(resolve_easeui_color).unwrap_or_else(|| Color::rgb(0xF4, 0xF4, 0xF5));
-                style.fills = vec![Paint::solid(col)];
+                style.fills = vec![Paint::solid(Color::rgb(0xF4, 0xF4, 0xF5))];
                 let mut tnode = Node::text(tid, Rect::new(0.0, 0.0, 60.0, 18.0), label.clone(), style);
                 tnode.name = label.clone();
-                if let NodeKind::Text(tp) = &tnode.kind {
-                    tnode.size = estimate_intrinsic_text_size(tp);
+                let tkind = tnode.kind.clone();
+                self.insert(id, tnode).map_err(|e| SpecBindError {
+                    code: "INSERT_FAILED".to_string(),
+                    message: e.to_string(),
+                    path: format!("{path}.text"),
+                    received: None,
+                    expected: None,
+                    valid_options: Vec::new(),
+                    corrected_example: None,
+                    safe_to_retry: true,
+                })?;
+
+                if let Some(ts_ref) = &spec.text_style {
+                    let style_key = crate::resolve_style_ref(
+                        self,
+                        &mut ctx.bind_index,
+                        libraries,
+                        ts_ref,
+                        StyleProperty::Text,
+                        "text_style",
+                        &format!("{path}.text_style"),
+                    )?;
+                    if let Some(s) = self.styles.get(&style_key).cloned() {
+                        if let Some(tn) = self.get_mut(tid) {
+                            tn.style_refs.insert("text".to_string(), style_key.clone());
+                            crate::apply_style_values(tn, &s, &style_key);
+                            ctx.bind_report.styles_linked += 1;
+                        }
+                    }
                 }
-                self.insert(id, tnode).map_err(|e| e.to_string())?;
+                if let Some(raw_tc) = &spec.text_color {
+                    let fpath = format!("{path}.text_color");
+                    let resolved = crate::resolve_colour_ref(
+                        self,
+                        &mut ctx.bind_index,
+                        libraries,
+                        tid,
+                        &tkind,
+                        "fills/0",
+                        "text_color",
+                        raw_tc,
+                        &fpath,
+                        &mut ctx.bind_report.warnings,
+                    )?;
+                    match resolved {
+                        ResolvedColourRef::NoneOrTransparent => {
+                            if let Some(tn) = self.get_mut(tid) {
+                                if let NodeKind::Text(tp) = &mut tn.kind {
+                                    tp.style.fills.clear();
+                                }
+                            }
+                        }
+                        ResolvedColourRef::Literal(c) => {
+                            if let Some(tn) = self.get_mut(tid) {
+                                if let NodeKind::Text(tp) = &mut tn.kind {
+                                    tp.style.fills = vec![Paint::solid(c)];
+                                }
+                            }
+                        }
+                        ResolvedColourRef::Variable { var_id, .. } => {
+                            ctx.bind_report.bindings_created +=
+                                crate::apply_variable_binding(self, tid, &["fills/0"], &var_id, &fpath, &mut ctx.bind_report.warnings);
+                        }
+                        ResolvedColourRef::Style { style_key, .. } => {
+                            if let Some(s) = self.styles.get(&style_key).cloned() {
+                                if let Some(tn) = self.get_mut(tid) {
+                                    tn.style_refs.insert("fill".to_string(), style_key.clone());
+                                    crate::apply_style_values(tn, &s, &style_key);
+                                    ctx.bind_report.styles_linked += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                // The generated label takes the same explicit overrides a text node does, after its style.
+                self.apply_text_overrides(tid, &tkind, spec, path, &mut ctx.bind_index, libraries, &mut ctx.bind_report)?;
+                if let Some(tn) = self.get_mut(tid) {
+                    if let NodeKind::Text(tp) = &tn.kind {
+                        tn.size = estimate_intrinsic_text_size(tp);
+                    }
+                }
             }
         }
 
-        for child_spec in &spec.children {
-            self.build_spec_node(id, child_spec)?;
+        for (i, child_spec) in spec.children.iter().enumerate() {
+            let child_path = format!("{path}.children[{i}]");
+            self.build_spec_node_with_ctx(id, child_spec, &child_path, ctx)?;
         }
 
         Ok(id)
     }
 
+    /// Applies the explicit `font_size`, `line_height` and `font_weight` of `spec` to the text node
+    /// `id` after its text style, so they override the style. An explicit `font_size` together with
+    /// `text_style` also detaches the style link (`STYLE_DETACHED_BY_SPEC`).
+    #[allow(clippy::too_many_arguments)]
+    fn apply_text_overrides(
+        &mut self,
+        id: NodeId,
+        node_kind: &NodeKind,
+        spec: &NodeSpec,
+        path: &str,
+        index: &mut SpecBindIndex,
+        libraries: &[LibrarySnapshot],
+        report: &mut SpecApplyReport,
+    ) -> Result<(), SpecBindError> {
+        if let Some(fs) = &spec.font_size {
+            if let Some(v) = self.bind_or_eval_number(id, node_kind, fs, &["fontSize"], "font_size", format!("{path}.font_size"), index, libraries, report)? {
+                if let Some(n) = self.get_mut(id) {
+                    if let NodeKind::Text(tp) = &mut n.kind {
+                        tp.style.font_size = v.max(1.0);
+                    }
+                }
+            }
+            if spec.text_style.is_some() {
+                if let Some(n) = self.get_mut(id) {
+                    if n.style_refs.remove("text").is_some() {
+                        report.warnings.push(SpecWarning {
+                            code: "STYLE_DETACHED_BY_SPEC".to_string(),
+                            path: format!("{path}.font_size"),
+                            token: spec.text_style.clone(),
+                            replacement: None,
+                            message: Some("Explicit font_size overrides and detaches text_style.".to_string()),
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(lh) = &spec.line_height {
+            if let Some(v) =
+                self.bind_or_eval_number(id, node_kind, lh, &["lineHeight"], "line_height", format!("{path}.line_height"), index, libraries, report)?
+            {
+                if let Some(n) = self.get_mut(id) {
+                    if let NodeKind::Text(tp) = &mut n.kind {
+                        tp.style.line_height = LineHeight::Pixels(v.max(0.0));
+                    }
+                }
+            }
+        }
+        if let Some(fw) = spec.font_weight {
+            if let Some(n) = self.get_mut(id) {
+                if let NodeKind::Text(tp) = &mut n.kind {
+                    tp.style.font_weight = fw;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_or_eval_number(
+        &mut self,
+        id: NodeId,
+        node_kind: &NodeKind,
+        nv: &NumberOrVar,
+        keys: &[&str],
+        fname: &str,
+        fpath: String,
+        index: &mut SpecBindIndex,
+        libraries: &[LibrarySnapshot],
+        report: &mut SpecApplyReport,
+    ) -> Result<Option<f32>, SpecBindError> {
+        match nv {
+            NumberOrVar::Num(v) => Ok(Some(*v)),
+            NumberOrVar::Ref(raw_ref) => {
+                let var_id = crate::resolve_variable_ref(self, index, libraries, raw_ref, fname, &fpath)?;
+                crate::validate_variable_binding_for_keys(self, index, &var_id, keys, node_kind, raw_ref, fname, &fpath)?;
+                report.bindings_created += crate::apply_variable_binding(self, id, keys, &var_id, &fpath, &mut report.warnings);
+                Ok(None)
+            }
+        }
+    }
+
+    fn export_var_ref(&self, var_id: &str) -> Option<String> {
+        let v = self.variables.get(var_id)?;
+        let c = self.variable_collections.get(&v.collection)?;
+        Some(format!("var:{}/{}", c.name, v.name))
+    }
+
+    fn export_style_ref(&self, style_key: &str, with_prefix: bool) -> Option<String> {
+        let name = self
+            .style_meta
+            .get(style_key)
+            .map(|m| m.name.as_str())
+            .filter(|n| !n.is_empty())
+            .or_else(|| self.styles.contains_key(style_key).then_some(style_key))?;
+        Some(if with_prefix { format!("style:{name}") } else { name.to_string() })
+    }
+
     /// Exports `root` and its descendants into a declarative [`NodeSpec`] tree,
-    /// including any Dev Annotations and Canvas Comment Threads pinned within `root`.
+    /// including variable bindings (`var:`), style links (`style:` / `text_style` / `effect_style`),
+    /// explicit variable modes (`mode`), Dev Annotations, and Canvas Comment Threads pinned within `root`.
     pub fn export_spec(&self, root: NodeId) -> Result<NodeSpec, String> {
         let all_comments = self.resolve_comment_targets();
         self.export_spec_inner(root, &all_comments)
     }
 
-    fn export_spec_inner(&self, id: NodeId, all_comments: &[ResolvedCommentThread]) -> Result<NodeSpec, String> {
+    pub(crate) fn export_spec_inner(&self, id: NodeId, all_comments: &[ResolvedCommentThread]) -> Result<NodeSpec, String> {
         let n = self.get(id).ok_or_else(|| format!("Node {} not found", id.0))?;
-        let fill = n.fills.first().and_then(|p| match &p.kind {
-            PaintKind::Solid(c) => Some(format!("#{}", c.to_hex())),
-            _ => None,
-        });
-        let stroke = n.stroke.paints.first().and_then(|p| match &p.kind {
-            PaintKind::Solid(c) => Some(format!("#{}", c.to_hex())),
-            _ => None,
-        });
-        let stroke_weight = (!n.stroke.paints.is_empty()).then_some(n.stroke.weight);
-        let corner_radius = (n.corner_radii != [0.0; 4] && n.corner_radii.iter().all(|r| *r == n.corner_radii[0])).then_some(n.corner_radii[0]);
-        let corner_radii = (n.corner_radii != [0.0; 4] && corner_radius.is_none()).then_some(n.corner_radii);
-        let (text, font_size, font_weight, text_color) = match &n.kind {
-            NodeKind::Text(tp) => (
-                Some(tp.content.clone()),
-                Some(tp.style.font_size),
-                Some(tp.style.font_weight),
-                tp.style.fills.first().and_then(|p| match &p.kind {
-                    PaintKind::Solid(c) => Some(format!("#{}", c.to_hex())),
-                    _ => None,
-                }),
-            ),
-            _ => (None, None, None, None),
+        if matches!(n.kind, NodeKind::Instance { .. }) {
+            return self.export_instance_spec_node(id, all_comments);
+        }
+        let is_text = matches!(n.kind, NodeKind::Text(_));
+
+        let fill = if is_text {
+            None
+        } else if let Some(skey) = n.style_refs.get("fill") {
+            self.export_style_ref(skey, true)
+        } else if let Some(vid) = n.variables.bindings.get("fills/0") {
+            self.export_var_ref(vid)
+        } else {
+            n.fills.first().and_then(|p| match &p.kind {
+                PaintKind::Solid(c) => Some(format!("#{}", c.to_hex())),
+                _ => None,
+            })
         };
-        let layout = n.kind.frame_props().and_then(|f| f.auto_layout.as_ref()).map(|al| LayoutSpec {
-            direction: match al.direction {
-                LayoutDirection::Horizontal => "row".into(),
-                LayoutDirection::Vertical => "column".into(),
-                LayoutDirection::Grid => "grid".into(),
-            },
-            wrap: al.wrap,
-            gap: al.item_spacing,
-            counter_gap: al.counter_spacing,
-            padding: al.padding,
-            primary_align: format!("{:?}", al.primary_align).to_ascii_lowercase(),
-            counter_align: format!("{:?}", al.counter_align).to_ascii_lowercase(),
-            grid_columns: (al.grid_columns > 0).then_some(al.grid_columns),
-            grid_rows: (al.grid_rows > 0).then_some(al.grid_rows),
+
+        let stroke = if let Some(skey) = n.style_refs.get("stroke") {
+            self.export_style_ref(skey, true)
+        } else if let Some(vid) = n.variables.bindings.get("strokes/0") {
+            self.export_var_ref(vid)
+        } else {
+            n.stroke.paints.first().and_then(|p| match &p.kind {
+                PaintKind::Solid(c) => Some(format!("#{}", c.to_hex())),
+                _ => None,
+            })
+        };
+
+        let stroke_weight = if let Some(vid) = n.variables.bindings.get("strokeWeight") {
+            self.export_var_ref(vid).map(NumberOrVar::Ref)
+        } else {
+            (!n.stroke.paints.is_empty()).then_some(NumberOrVar::Num(n.stroke.weight))
+        };
+
+        let corner_keys = ["topLeftRadius", "topRightRadius", "bottomRightRadius", "bottomLeftRadius"];
+        let corner_vars: [Option<String>; 4] = std::array::from_fn(|i| n.variables.bindings.get(corner_keys[i]).and_then(|vid| self.export_var_ref(vid)));
+        let (corner_radius, corner_radii) = if corner_vars.iter().all(|v| v.is_some() && *v == corner_vars[0]) {
+            (corner_vars[0].clone().map(NumberOrVar::Ref), None)
+        } else if corner_vars.iter().any(|v| v.is_some()) {
+            let arr: [NumberOrVar; 4] =
+                std::array::from_fn(|i| corner_vars[i].clone().map(NumberOrVar::Ref).unwrap_or_else(|| NumberOrVar::Num(n.corner_radii[i])));
+            (None, Some(arr))
+        } else {
+            let uniform = (n.corner_radii != [0.0; 4] && n.corner_radii.iter().all(|r| *r == n.corner_radii[0])).then_some(NumberOrVar::Num(n.corner_radii[0]));
+            let per_corner = (n.corner_radii != [0.0; 4] && uniform.is_none()).then(|| n.corner_radii.map(NumberOrVar::Num));
+            (uniform, per_corner)
+        };
+
+        let opacity =
+            n.variables.bindings.get("opacity").and_then(|vid| self.export_var_ref(vid)).map(NumberOrVar::Ref).unwrap_or_else(|| NumberOrVar::Num(n.opacity));
+
+        let text_style = n.style_refs.get("text").and_then(|k| self.export_style_ref(k, false));
+        let effect_style = n.style_refs.get("effect").and_then(|k| self.export_style_ref(k, false));
+
+        let (text, font_size, line_height, font_weight, text_color) = match &n.kind {
+            NodeKind::Text(tp) => {
+                let fs = if let Some(vid) = n.variables.bindings.get("fontSize") {
+                    self.export_var_ref(vid).map(NumberOrVar::Ref)
+                } else if text_style.is_none() {
+                    Some(NumberOrVar::Num(tp.style.font_size))
+                } else {
+                    None
+                };
+                let lh = if let Some(vid) = n.variables.bindings.get("lineHeight") {
+                    self.export_var_ref(vid).map(NumberOrVar::Ref)
+                } else if text_style.is_none() {
+                    match tp.style.line_height {
+                        LineHeight::Pixels(px) => Some(NumberOrVar::Num(px)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let fw = text_style.is_none().then_some(tp.style.font_weight);
+                let tc = if let Some(skey) = n.style_refs.get("fill") {
+                    self.export_style_ref(skey, true)
+                } else if let Some(vid) = n.variables.bindings.get("fills/0") {
+                    self.export_var_ref(vid)
+                } else {
+                    tp.style.fills.first().and_then(|p| match &p.kind {
+                        PaintKind::Solid(c) => Some(format!("#{}", c.to_hex())),
+                        _ => None,
+                    })
+                };
+                (Some(tp.content.clone()), fs, lh, fw, tc)
+            }
+            _ => (None, None, None, None, None),
+        };
+
+        let layout = n.kind.frame_props().and_then(|f| f.auto_layout.as_ref()).map(|al| {
+            let gap = n
+                .variables
+                .bindings
+                .get("itemSpacing")
+                .and_then(|vid| self.export_var_ref(vid))
+                .map(NumberOrVar::Ref)
+                .unwrap_or_else(|| NumberOrVar::Num(al.item_spacing));
+            let counter_gap = n
+                .variables
+                .bindings
+                .get("counterAxisSpacing")
+                .and_then(|vid| self.export_var_ref(vid))
+                .map(NumberOrVar::Ref)
+                .unwrap_or_else(|| NumberOrVar::Num(al.counter_spacing));
+            let pad_keys = ["paddingTop", "paddingRight", "paddingBottom", "paddingLeft"];
+            let padding: [NumberOrVar; 4] = std::array::from_fn(|i| {
+                n.variables
+                    .bindings
+                    .get(pad_keys[i])
+                    .and_then(|vid| self.export_var_ref(vid))
+                    .map(NumberOrVar::Ref)
+                    .unwrap_or_else(|| NumberOrVar::Num(al.padding[i]))
+            });
+            LayoutSpec {
+                direction: match al.direction {
+                    LayoutDirection::Horizontal => "row".into(),
+                    LayoutDirection::Vertical => "column".into(),
+                    LayoutDirection::Grid => "grid".into(),
+                },
+                wrap: al.wrap,
+                gap,
+                counter_gap,
+                padding,
+                primary_align: format!("{:?}", al.primary_align).to_ascii_lowercase(),
+                counter_align: format!("{:?}", al.counter_align).to_ascii_lowercase(),
+                grid_columns: (al.grid_columns > 0).then_some(al.grid_columns),
+                grid_rows: (al.grid_rows > 0).then_some(al.grid_rows),
+            }
         });
+
+        let mut mode = std::collections::BTreeMap::new();
+        for (cid, mid) in &n.variables.modes {
+            if let Some(coll) = self.variable_collections.get(cid) {
+                if let Some(m) = coll.modes.iter().find(|m| m.id == *mid) {
+                    mode.insert(coll.name.clone(), m.name.clone());
+                }
+            }
+        }
+
         let dev_status = n.dev.status.map(|s| s.label().to_string());
         let annotations: Vec<String> = n.dev.annotations.iter().map(|a| a.text.clone()).collect();
         let comments: Vec<ResolvedCommentThread> = all_comments
@@ -673,6 +1512,11 @@ impl Document {
             id: Some(id.0),
             kind: n.kind.default_name().to_ascii_lowercase(),
             name: n.name.clone(),
+            component: None,
+            variant: BTreeMap::new(),
+            props: BTreeMap::new(),
+            overrides: Vec::new(),
+            slots: BTreeMap::new(),
             preset: None,
             x: n.transform.tx,
             y: n.transform.ty,
@@ -691,12 +1535,16 @@ impl Document {
             stroke_weight,
             corner_radius,
             corner_radii,
-            opacity: n.opacity,
+            opacity,
             clips_content: n.kind.frame_props().and_then(|f| f.clips_content.then_some(true)),
             text,
             font_size,
+            line_height,
             font_weight,
             text_color,
+            text_style,
+            effect_style,
+            mode,
             layout,
             dev_status,
             annotation: None,
@@ -770,7 +1618,7 @@ impl Document {
     }
 }
 
-fn estimate_intrinsic_text_size(tp: &TextProps) -> Vec2 {
+pub(crate) fn estimate_intrinsic_text_size(tp: &TextProps) -> Vec2 {
     let lines: Vec<&str> = tp.content.split('\n').collect();
     let fs = tp.style.font_size.max(8.0);
     let weight_boost = if tp.style.font_weight >= 600 { 1.05 } else { 1.0 };

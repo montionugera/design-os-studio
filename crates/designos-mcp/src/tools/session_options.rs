@@ -5,6 +5,7 @@
 //! `<session_dir>/session-options.json` when a session directory is configured and resets
 //! on document switch (`designos_open_file`, `designos_new_document`).
 
+use crate::tools::errors::{tool_output_schema, ErrorCode, ToolError};
 use designos_doc::lint::LintConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -151,24 +152,45 @@ impl SessionOptions {
     }
 
     /// Validates and applies a `designos_configure_session` payload, returning the full effective options JSON.
-    pub fn apply_patch(&mut self, args: Value) -> Result<Value, String> {
+    pub fn apply_patch(&mut self, args: Value) -> Result<Value, ToolError> {
         let patch: ConfigureSessionArgs =
-            serde_json::from_value(args).map_err(|e| format!("INVALID_ARGUMENTS: invalid arguments: {e} (safe_to_retry: true)"))?;
+            serde_json::from_value(args).map_err(|e| crate::tools::errors::from_serde_error(&e, "", false))?;
 
         let mut next = self.clone();
         if let Some(issues_patch) = patch.issues {
             if let Some(max_items) = issues_patch.max_items {
                 if !(1..=100).contains(&max_items) {
-                    return Err(format!("VALUE_OUT_OF_RANGE: issues.max_items must be between 1 and 100, got {max_items} (safe_to_retry: true)"));
+                    return Err(ToolError::new(
+                        ErrorCode::ValueOutOfRange,
+                        "/issues/max_items",
+                        format!("VALUE_OUT_OF_RANGE: issues.max_items must be between 1 and 100, got {max_items} (safe_to_retry: true)"),
+                    )
+                    .with_received(json!(max_items))
+                    .with_expected("1..=100"));
                 }
                 next.issues.max_items = max_items as usize;
             }
             if let Some(preset) = issues_patch.preset {
                 let trimmed = preset.trim();
                 if trimmed.is_empty() {
-                    return Err("UNKNOWN_PRESET: issues.preset must not be empty (safe_to_retry: true)".to_string());
+                    return Err(ToolError::new(
+                        ErrorCode::InvalidArguments,
+                        "/issues/preset",
+                        "UNKNOWN_PRESET: issues.preset must not be empty (safe_to_retry: true)",
+                    ));
                 }
-                LintConfig::from_preset_str(trimmed).map_err(|e| e.to_string())?;
+                LintConfig::from_preset_str(trimmed).map_err(|e| match &e {
+                    designos_doc::lint::LintConfigError::UnknownPreset { received, valid_options } => {
+                        ToolError::new(ErrorCode::InvalidArguments, "/issues/preset", e.to_string())
+                            .with_received(json!(received))
+                            .with_valid_options(valid_options.iter().copied())
+                    }
+                    designos_doc::lint::LintConfigError::UnknownRule { received, valid_options } => {
+                        ToolError::new(ErrorCode::InvalidArguments, "/issues/preset", e.to_string())
+                            .with_received(json!(received))
+                            .with_valid_options(valid_options.iter().copied())
+                    }
+                })?;
                 next.issues.preset = trimmed.to_string();
             }
             if let Some(mode) = issues_patch.mode {
@@ -183,8 +205,10 @@ impl SessionOptions {
             if let Some(rules) = af_patch.rules {
                 for (k, v) in rules {
                     let Some(spec) = designos_doc::lint::resolve_rule(&k) else {
-                        let err = designos_doc::lint::LintConfigError::UnknownRule { received: k, valid_options: designos_doc::lint::all_rule_ids() };
-                        return Err(err.to_string());
+                        let err = designos_doc::lint::LintConfigError::UnknownRule { received: k.clone(), valid_options: designos_doc::lint::all_rule_ids() };
+                        return Err(ToolError::new(ErrorCode::UnknownField, format!("/auto_fix/rules/{k}"), err.to_string())
+                            .with_received(json!(k))
+                            .with_valid_options(designos_doc::lint::all_rule_ids().iter().copied()));
                     };
                     next.auto_fix.rules.insert(spec.id.to_string(), v);
                 }
@@ -192,7 +216,7 @@ impl SessionOptions {
         }
 
         *self = next;
-        serde_json::to_value(&*self).map_err(|e| e.to_string())
+        serde_json::to_value(&*self).map_err(|e| ToolError::new(ErrorCode::InternalError, "", e.to_string()))
     }
 }
 
@@ -228,6 +252,13 @@ pub fn tool_descriptor() -> Value {
                 }
             }
         },
+        "outputSchema": tool_output_schema(
+            json!({
+                "issues": { "type": "object" },
+                "auto_fix": { "type": "object" }
+            }),
+            &["issues", "auto_fix"]
+        ),
         "annotations": {
             "readOnlyHint": false,
             "destructiveHint": false,

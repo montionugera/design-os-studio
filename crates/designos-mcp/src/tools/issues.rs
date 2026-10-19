@@ -331,6 +331,20 @@ pub fn attach_issues_block(
         return;
     }
 
+    let existing_issues: Vec<Value> = reply
+        .get("issues")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|item| match mode {
+                    IssuesMode::ErrorsOnly => item.get("severity").and_then(|s| s.as_str()) == Some("error"),
+                    IssuesMode::Preset | IssuesMode::Off => true,
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+
     let scope = compute_lint_scope(doc, touched_roots);
     let cfg = LintConfig::from_preset_str(&options.preset).unwrap_or_default();
     let max_items = options.max_items.clamp(1, 100);
@@ -356,12 +370,13 @@ pub fn attach_issues_block(
     // Sort by severity, then rule order in the registry/preset, then paint order (stable sort).
     findings.sort_by_key(|f| (severity_rank(f.severity), rule_order_index(f.rule)));
 
-    let issues_total = findings.len();
+    let issues_total = existing_issues.len() + findings.len();
     let issues_truncated = issues_total > max_items || !report.complete;
 
+    let remaining_cap = max_items.saturating_sub(existing_issues.len());
     let items: Vec<IssueItem> = findings
         .into_iter()
-        .take(max_items)
+        .take(remaining_cap)
         .map(|f| {
             let preexisting = baseline.contains(f.rule, f.node);
             let auto_fixable = is_safe_tier_auto_fixable(&f);
@@ -380,8 +395,15 @@ pub fn attach_issues_block(
         })
         .collect();
 
+    let mut combined_issues: Vec<Value> = existing_issues.into_iter().take(max_items).collect();
+    for item in items {
+        if let Ok(v) = serde_json::to_value(item) {
+            combined_issues.push(v);
+        }
+    }
+
     if let Some(obj) = reply.as_object_mut() {
-        obj.insert("issues".into(), serde_json::to_value(items).unwrap_or_else(|_| json!([])));
+        obj.insert("issues".into(), Value::Array(combined_issues));
         obj.insert("issues_total".into(), json!(issues_total));
         obj.insert("issues_truncated".into(), json!(issues_truncated));
         if !report.complete {

@@ -3,7 +3,7 @@
 use super::replay_comments::{resolve_comments, CommentRemap};
 use super::validate::insert_problem;
 use super::{LiveOp, LivePatch, SiblingHint, LIVE_PATCH_VERSION, STRUCTURAL_FIELDS};
-use crate::{Command, DocError, Document, Node, NodeId, NodeKind};
+use crate::{Command, DocError, Document, Node, NodeId, NodeKind, Variable, VariableCollection};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,6 +23,10 @@ pub struct LivePatchState {
     /// shape builder's remainder of a layer). Used only while the old id is gone, so undoing the
     /// replacement sends edits back to the restored layer.
     replaced: BTreeMap<NodeId, NodeId>,
+    /// Variable and collection ids this session's replays added to the editor. An agent undo
+    /// removes only these; anything the editor had before is left alone.
+    introduced_variables: BTreeSet<String>,
+    introduced_collections: BTreeSet<String>,
 }
 
 impl LivePatchState {
@@ -93,6 +97,10 @@ pub fn replay_live_patch(
         // now send its edits to the wrong node or thread.
         state.remap.clear();
         state.comments = CommentRemap::default();
+        // The reloaded canvas already carries what earlier replays added, and the editor's own
+        // layers may use it by now, so an undo of an older edit must not remove it.
+        state.introduced_variables.clear();
+        state.introduced_collections.clear();
         // Its replaced layers are gone from that canvas, so their old ids mean nothing there. The
         // first patch of a session has no earlier canvas to be newer than.
         if state.base.is_some() {
@@ -214,12 +222,64 @@ fn resolve(doc: &mut Document, op: &LiveOp, state: &mut LivePatchState, report: 
             report.needs_layout.push(parent);
             Some(Command::Remove { id })
         }
+        LiveOp::Variables { collections, variables, removed_collections, removed_variables } => {
+            resolve_variables(doc, collections, variables, removed_collections, removed_variables, state, report)
+        }
         LiveOp::Comments { added, changed, removed } => {
             let (remap, replaced) = (&state.remap, &state.replaced);
             let node = |id: NodeId| resolve_id(remap, replaced, doc, id).0;
             resolve_comments(doc, added, changed, removed, &mut state.comments, &node, report)
         }
     }
+}
+
+/// The agent's variable and collection changes merged into the editor's own maps, which can hold
+/// more than the agent's copy did. Only ids the editor lacks are added, and only ids added here
+/// are ever removed again (an agent undo): data the editor already had, or the user edited, is
+/// never overwritten or deleted by an agent edit. Entries without an id are refused: the log is a
+/// file any local process can write.
+fn resolve_variables(
+    doc: &Document,
+    collections: &[VariableCollection],
+    variables: &[Variable],
+    removed_collections: &[String],
+    removed_variables: &[String],
+    state: &mut LivePatchState,
+    report: &mut LivePatchReport,
+) -> Option<Command> {
+    let mut merged_vars = doc.variables.clone();
+    let mut merged_colls = doc.variable_collections.clone();
+    for id in removed_variables {
+        if state.introduced_variables.remove(id) {
+            merged_vars.remove(id);
+        }
+    }
+    for id in removed_collections {
+        if state.introduced_collections.remove(id) {
+            merged_colls.remove(id);
+        }
+    }
+    for v in variables {
+        if v.id.is_empty() {
+            report.skipped.push("a variable without an id was not replayed".to_string());
+        } else if !merged_vars.contains_key(&v.id) {
+            merged_vars.insert(v.id.clone(), v.clone());
+            state.introduced_variables.insert(v.id.clone());
+        }
+    }
+    for c in collections {
+        if c.id.is_empty() {
+            report.skipped.push("a variable collection without an id was not replayed".to_string());
+        } else if !merged_colls.contains_key(&c.id) {
+            merged_colls.insert(c.id.clone(), c.clone());
+            state.introduced_collections.insert(c.id.clone());
+        }
+    }
+    if merged_vars == doc.variables && merged_colls == doc.variable_collections {
+        report.duplicates += 1;
+        return None;
+    }
+    Some(Command::SetVariables { variables: merged_vars, collections: merged_colls })
 }
 
 /// `set` and `unset` of an edit to a replaced layer without the shape fields, each of which is
