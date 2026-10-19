@@ -204,6 +204,7 @@ pub fn tool_descriptor() -> Value {
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
+            "required": [],
             "properties": {
                 "issues": {
                     "type": "object",

@@ -86,6 +86,7 @@
     "properties": [
       "height",
       "kind",
+      "lint",
       "name",
       "parent_id",
       "text",
@@ -108,6 +109,7 @@
     ],
     "properties": [
       "height",
+      "lint",
       "name",
       "node_id",
       "opacity",
@@ -131,6 +133,7 @@
       "node_id"
     ],
     "properties": [
+      "lint",
       "node_id"
     ],
     "annotations": {
@@ -221,6 +224,7 @@
       "spec"
     ],
     "properties": [
+      "lint",
       "parent_id",
       "spec"
     ],
@@ -299,10 +303,32 @@
   },
   {
     "name": "designos_lint",
-    "description": "Audit layers on a page for zero-bounds geometry and default layer names, returning structured findings and pass status.",
+    "description": "Run the unified solver-backed geometric, text, token, and structural design linter on a page, specific node subtrees, or the active page.",
     "required": [],
     "properties": [
-      "page_id"
+      "cursor",
+      "include_ignored",
+      "limit",
+      "node_ids",
+      "page_id",
+      "preset",
+      "rules"
+    ],
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "designos_get_guidelines",
+    "description": "List available design guideline topics or return the guideline document for a topic ('design-system', surface guides, 'archetypes', 'archetype:<id>', or 'rules').",
+    "required": [],
+    "properties": [
+      "max_tokens",
+      "platform",
+      "topic"
     ],
     "annotations": {
       "destructiveHint": false,
@@ -331,6 +357,41 @@
     "annotations": {
       "destructiveHint": true,
       "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "designos_apply_batch",
+    "description": "Execute 1..=200 write operations (apply_spec, insert, update, move, delete, set_variables, set_style) as a single atomic transaction and one undo group. Later ops may reference nodes created by earlier ops via '@<as>' or '@<as>/<name path>'. With dry_run=true, computes and returns created IDs, name_to_id map, touched_roots, and touched_bounds without mutating the document or publishing a live patch. Note: in a live Studio session, if the editor remaps a colliding ID on replay, the reply holds the session IDs until the next canvas reload.",
+    "required": [
+      "ops"
+    ],
+    "properties": [
+      "diff_image",
+      "dry_run",
+      "idempotency_key",
+      "lint",
+      "ops"
+    ],
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "designos_configure_session",
+    "description": "Configure per-session MCP options for the automatic mutating-call lint issues block (issues.mode: preset | errors_only | off, issues.preset, issues.max_items: 1..=100) and auto_fix settings. Persists across reconnects in the session directory and resets on document switch.",
+    "required": [],
+    "properties": [
+      "auto_fix",
+      "issues"
+    ],
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
       "openWorldHint": false,
       "readOnlyHint": false
     }

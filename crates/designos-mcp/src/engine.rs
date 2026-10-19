@@ -20,6 +20,8 @@ pub struct Engine {
     /// When `true` (used by headless tests), disables the text-shaping engine so text rules are
     /// reported in `issues_skipped_rules` (`E15-12` §8.5).
     pub disable_text_lint_engine: bool,
+    /// Optional set of enabled canonical tool names from `designos.enabled_tools` (`E15-15` §8.5).
+    pub enabled_tools: Option<std::collections::BTreeSet<String>>,
 }
 
 impl Default for Engine {
@@ -35,6 +37,7 @@ impl Default for Engine {
             owned_frames: None,
             session_options: crate::tools::session_options::SessionOptions::default(),
             disable_text_lint_engine: false,
+            enabled_tools: None,
         }
     }
 }
@@ -62,7 +65,6 @@ pub const DISPATCHED: &[&str] = &[
     "query_nodes",
     "designos_lint",
     "check_design",
-    "designos_lint_fix",
     "designos_apply_batch",
     "designos_configure_session",
     "designos_get_guidelines",
@@ -72,13 +74,7 @@ pub const DISPATCHED: &[&str] = &[
 ];
 
 /// Non-prefixed compatibility aliases accepted by [`Engine::call`].
-pub const ALIASES: &[&str] = &[
-    "export_fig_file",
-    "query_nodes",
-    "check_design",
-    "designos_lint_fix",
-    "get_guidelines",
-];
+pub const ALIASES: &[&str] = &["export_fig_file", "query_nodes", "check_design", "get_guidelines"];
 
 impl Engine {
     pub const DISPATCHED: &[&str] = DISPATCHED;
@@ -516,7 +512,12 @@ impl Engine {
             }
             "designos_apply_batch" => crate::tools::batch::apply(self, args),
             "designos_configure_session" => self.session_options.apply_patch(args),
-            "designos_get_guidelines" | "get_guidelines" => crate::tools::guidelines::call_get_guidelines(&self.doc, args),
+            "designos_get_guidelines" | "get_guidelines" => crate::tools::guidelines::call_get_guidelines_with_enabled_tools(
+                &self.doc,
+                args,
+                &crate::tools::guidelines::guidelines_dir(),
+                self.enabled_tools.as_ref(),
+            ),
             "designos_undo" | "designos_redo" => {
                 let _: Empty = parse(args)?;
                 let undo = name == "designos_undo";

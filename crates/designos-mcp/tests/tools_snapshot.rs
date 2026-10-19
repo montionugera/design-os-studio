@@ -20,7 +20,7 @@ fn tool_list_matches_snapshot() {
         .unwrap_or_else(|e| panic!("missing {} ({e}); run `cargo run -p designos-mcp --bin gen-tool-docs`", snapshot_path.display()));
 
     let snapshots = build_tool_snapshots();
-    assert_eq!(snapshots.len(), 24, "expected 24 declared tools (4 session + 20 engine)");
+    assert_eq!(snapshots.len(), 27, "expected 27 declared tools (4 session + 23 engine)");
     let expected = render_tools_snapshot_json(&snapshots);
     assert_eq!(on_disk, expected, "tests/snapshots/tools.json is out of date; run `cargo run -p designos-mcp --bin gen-tool-docs`");
 }
@@ -76,6 +76,18 @@ fn docs_blocks_are_current() {
     let on_disk_parity_md =
         fs::read_to_string(root.join("docs/mcp-parity.md")).expect("read docs/mcp-parity.md; run `cargo run -p designos-mcp --bin gen-tool-docs`");
     assert_eq!(on_disk_parity_md, expected_parity_md, "docs/mcp-parity.md is out of date; run `cargo run -p designos-mcp --bin gen-tool-docs`");
+
+    let expected_rules_md = designos_mcp::rules::generate_default_rules_pack().expect("generate default rules pack");
+    let on_disk_generated_rules = fs::read_to_string(crate_dir.join("generated/rules.md"))
+        .expect("read crates/designos-mcp/generated/rules.md; run `cargo run -p designos-mcp --bin gen-tool-docs`");
+    assert_eq!(
+        on_disk_generated_rules, expected_rules_md,
+        "crates/designos-mcp/generated/rules.md is out of date; run `cargo run -p designos-mcp --bin gen-tool-docs`"
+    );
+
+    let on_disk_skill_rules = fs::read_to_string(root.join("skills/design-os-studio/rules.md"))
+        .expect("read skills/design-os-studio/rules.md; run `cargo run -p designos-mcp --bin gen-tool-docs`");
+    assert_eq!(on_disk_skill_rules, expected_rules_md, "skills/design-os-studio/rules.md is out of date; run `cargo run -p designos-mcp --bin gen-tool-docs`");
 }
 
 fn collect_known_roadmap_tasks(root: &Path) -> BTreeSet<String> {

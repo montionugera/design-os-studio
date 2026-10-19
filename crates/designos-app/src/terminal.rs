@@ -914,6 +914,7 @@ impl TerminalState {
             let _ = atomic_write_session_file(&self.session_dir.join(".agents").join("hooks.json"), &bytes);
         }
 
+        let rules_body = include_str!("../../designos-mcp/generated/rules.md").trim_start();
         let skill_md = format!(
             "---\n\
              name: designos-studio\n\
@@ -929,7 +930,8 @@ impl TerminalState {
              - **Live Edit Log**: `{doc_patch}` (`$DESIGNOS_LIVE_DOC_PATCH`; written by `designos-mcp`, replayed by Studio in order, with a mark wherever you open another document)\n\n\
              ## Automatic Current-Page Delivery Rules\n\
              1. Every `designos-mcp` tool call (`designos_apply_spec`, `designos_create_node`, `designos_update_node`, `designos_query_xpath`, `designos_lint`, `designos_add_comment`) is already bound to **`{doc_name}`** and automatically targets the user's currently selected page **`{page_name}` (`NodeId({page_id})`)** when `parent_id` / `page_id` is omitted.\n\
-             2. Or write a declarative `NodeSpec` JSON tree directly to `$DESIGNOS_LIVE_SPEC` (`{spec}`) — DESIGN:OS Studio hot-applies it onto **`{page_name}`** in `< 50ms`.\n",
+             2. Or write a declarative `NodeSpec` JSON tree directly to `$DESIGNOS_LIVE_SPEC` (`{spec}`) — DESIGN:OS Studio hot-applies it onto **`{page_name}`** in `< 50ms`.\n\n\
+             {rules_body}",
             doc_name = self.doc_name,
             page_name = self.current_page_name,
             session_id = self.session_id,
@@ -5494,9 +5496,10 @@ Done!
         let mut doc = Document::new("Skill Layout File");
         let page = doc.add_page("Page 1");
         st.sync_live_file_context(&doc, page, &[], None);
-        for rel in [".claude/skills/designos-studio/SKILL.md", ".agents/skills/designos-studio/SKILL.md", "AGENTS.md"] {
+        for rel in ["SKILL.md", ".claude/skills/designos-studio/SKILL.md", ".agents/skills/designos-studio/SKILL.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(st.session_dir.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
             assert!(text.contains("designos-studio") && text.contains("Skill Layout File"), "{rel}: {text}");
+            assert!(text.ends_with(designos_mcp::rules::GENERATED_RULES_MD.trim_start()), "{rel} must include the generated rules pack");
         }
     }
 
