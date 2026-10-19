@@ -49,6 +49,18 @@ impl View {
         let cy = bounds.y + bounds.h / 2.0;
         View { zoom: z, offset: Vec2::new(cx - size.x / 2.0 / z, cy - size.y / 2.0 / z) }
     }
+    /// Fits `bounds` (page space) into a canvas of `size` px with a fractional margin on each side.
+    pub fn fit_with_margin(bounds: designos_doc::Rect, size: egui::Vec2, margin_fraction: f32) -> View {
+        let frac = margin_fraction.clamp(0.0, 0.45);
+        let avail_w = (size.x * (1.0 - 2.0 * frac)).max(10.0);
+        let avail_h = (size.y * (1.0 - 2.0 * frac)).max(10.0);
+        let zw = avail_w / bounds.w.max(1.0);
+        let zh = avail_h / bounds.h.max(1.0);
+        let z = zw.min(zh).clamp(theme::ZOOM_MIN, theme::ZOOM_MAX);
+        let cx = bounds.x + bounds.w / 2.0;
+        let cy = bounds.y + bounds.h / 2.0;
+        View { zoom: z, offset: Vec2::new(cx - size.x / 2.0 / z, cy - size.y / 2.0 / z) }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,6 +207,8 @@ pub struct App {
     pub terminal: crate::terminal::TerminalState,
     /// Per-session agent cursors and write-flash outlines on the canvas (`#682`).
     pub agent_presence: crate::agent_presence::AgentPresence,
+    /// Edge-anchored "N changes -> Show" chips for off-screen agent turns (`#695`).
+    pub agent_changes_chip: crate::canvas::agent_changes_chip::AgentChangesChips,
     /// In-Canvas Cmd+K Agent & Design Gate Bar state.
     pub cmdk: crate::cmdk::CmdKState,
     /// Check designs panel: hard-coded values, contrast and detached instances.
@@ -258,6 +272,7 @@ impl App {
             specs: Default::default(),
             terminal: Default::default(),
             agent_presence: Default::default(),
+            agent_changes_chip: Default::default(),
             cmdk: Default::default(),
             check_designs: Default::default(),
             tabs: Default::default(),
