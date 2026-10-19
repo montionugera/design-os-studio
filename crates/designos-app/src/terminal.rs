@@ -1410,7 +1410,7 @@ impl TerminalState {
                 label: run_id.to_string(),
                 runtime: self.active_runtime.binary_name().to_string(),
                 frames: lease.frames.iter().map(|f| f.0).collect(),
-                purpose: lease.purpose.clone(),
+                purpose: lease.purpose,
                 status: "running".to_string(),
                 edits: 1,
                 tab_id: None,
@@ -1618,7 +1618,7 @@ impl TerminalState {
             };
             match req {
                 SpawnControlRequest::Spawn { request_id, run_id, name, runtime, frames, purpose, prompt, bootstrap_path, .. } => {
-                    let lease = designos_doc::live_patch::Lease::new(run_id.clone(), frames.clone(), purpose.clone());
+                    let lease = designos_doc::live_patch::Lease::new(run_id.clone(), frames.clone(), purpose);
                     let _ = self.leases.grant(lease);
                     self.live_patch.state.leases = self.leases.clone();
                     self.persist_leases_to_disk();
@@ -5647,7 +5647,7 @@ Done!
     #[test]
     fn export_selection_pastes_fixed_sentence_only() {
         let mut st = TerminalState::default();
-        st.bind_session(format!("p{}-export-sel", std::process::id()));
+        st.bind_session(&format!("p{}-export-sel", std::process::id()));
         st.spawn_tab(AgentCliPreset::Shell, None).expect("spawn");
         st.active_tab_mut().unwrap().spawn_preset = AgentCliPreset::Claude;
         let rec = attach_recorder(st.active_tab_mut().unwrap());
@@ -5704,7 +5704,7 @@ Done!
         let _ = std::fs::remove_file(&marker);
 
         let mut st = TerminalState::default();
-        st.bind_session(format!("p{pid}-dead-agent"));
+        st.bind_session(&format!("p{pid}-dead-agent"));
         spawn_stub_exiting_agent_into(&mut st);
         assert!(wait_until_tab_exits(&mut st, 8), "stub agent must exit");
         assert!(!st.active_tab_mut().unwrap().is_alive());

@@ -613,6 +613,7 @@ fn resolve_node_ref(doc: &Document, alias_roots: &BTreeMap<String, NodeId>, r: &
 }
 
 /// Checks RD-3 frame ownership lock when `engine.leases`, `engine.owned_frames`, or `DESIGNOS_OWNED_FRAMES` is active (§3.2, §13).
+#[allow(clippy::too_many_arguments)]
 fn check_lease_guard(
     doc: &Document,
     leases: &designos_doc::live_patch::LeaseTable,

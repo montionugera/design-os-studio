@@ -483,6 +483,7 @@ fn append_spawn_request(session_dir: &Path, req: &SpawnControlRequest) -> Result
     f.write_all(line.as_bytes()).and_then(|_| f.flush()).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_bootstrap_files(
     session_dir: &Path,
     doc: &Document,
@@ -907,7 +908,7 @@ pub fn spawn_agents(engine: &mut Engine, guard: &mut LeaseGuard, caller_run_id: 
             let mut spawned_json = Vec::with_capacity(created_frames.len());
             let mut created_frame_ids = Vec::with_capacity(created_frames.len());
 
-            for (_v_idx, (frame_id, v_name, v_prompt)) in created_frames.into_iter().enumerate() {
+            for (frame_id, v_name, v_prompt) in created_frames.into_iter() {
                 created_frame_ids.push(frame_id.0);
                 let run_id = alloc_run_id(&mut agents_state, &guard.table);
                 let purpose = LeasePurpose::SideBySide;

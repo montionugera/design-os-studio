@@ -238,11 +238,7 @@ pub fn compute_tool_affected_set(doc: &Document, default_page: Option<NodeId>, t
             Some((AffectedSet::for_nodes([node_id]), "/node_id".to_string()))
         }
         "designos_add_comment" => {
-            if let Some(nid) = args.get("node_id").and_then(Value::as_u64).filter(|&id| id != 0) {
-                Some((AffectedSet::for_nodes([NodeId(nid)]), "/node_id".to_string()))
-            } else {
-                None
-            }
+            args.get("node_id").and_then(Value::as_u64).filter(|&id| id != 0).map(|nid| (AffectedSet::for_nodes([NodeId(nid)]), "/node_id".to_string()))
         }
         "designos_reply_comment" | "designos_resolve_comment" => {
             let tid = args.get("thread_id").and_then(Value::as_str)?;
