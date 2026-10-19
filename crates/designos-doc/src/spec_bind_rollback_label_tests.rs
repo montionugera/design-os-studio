@@ -1,7 +1,6 @@
 //! `apply_spec` rollback of document data on error, and explicit text overrides on the label
 //! of a frame that carries `text` (preset buttons, badges).
 
-use crate::spec_bind::fixtures;
 use crate::*;
 use std::collections::BTreeMap;
 

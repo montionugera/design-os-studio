@@ -1224,7 +1224,7 @@ mod tests {
 
     #[test]
     fn apply_spec_instance_round_trips_designos_and_fig_and_exports_spec() {
-        let mut e = Engine { doc: designos_doc::fixtures::button_library(), history: History::default(), active_page_id: None, live_ops: None };
+        let mut e = Engine { doc: designos_doc::fixtures::button_library(), ..Engine::default() };
         let page = e.doc.pages[0];
         e.active_page_id = Some(page);
 
@@ -1294,7 +1294,7 @@ mod tests {
 
     #[test]
     fn apply_spec_slots_issues_and_fig_round_trip() {
-        let mut e = Engine { doc: designos_doc::fixtures::card_with_slots(), history: History::default(), active_page_id: None, live_ops: None };
+        let mut e = Engine { doc: designos_doc::fixtures::card_with_slots(), ..Engine::default() };
         let page = e.doc.pages[0];
         e.active_page_id = Some(page);
 

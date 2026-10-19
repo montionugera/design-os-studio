@@ -950,7 +950,7 @@ pub fn apply_variable_binding(
 }
 
 /// Test fixtures for E15-3 (`fixtures::tokens_doc()`).
-pub mod fixtures {
+pub mod bind_fixtures {
     use crate::*;
     use std::collections::BTreeMap;
 

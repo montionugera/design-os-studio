@@ -81,6 +81,10 @@ pub use settings::*;
 pub use spec::*;
 pub use spec_bind::*;
 pub use spec_instance::*;
+pub mod fixtures {
+    pub use crate::spec_bind::bind_fixtures::*;
+    pub use crate::spec_instance::instance_fixtures::*;
+}
 pub use styles_ops::*;
 pub use text_fills::set_text_fills_everywhere;
 pub use textmodel::*;

@@ -2389,7 +2389,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 }
 
 /// Code-built fixtures for E15-1 component instance tests (§10).
-pub mod fixtures {
+pub mod instance_fixtures {
     use crate::*;
 
     /// Returns a `Document` containing:

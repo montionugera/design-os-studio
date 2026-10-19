@@ -2,41 +2,7 @@
 //! style metadata and library bookkeeping. Used to roll a failed apply back and to commit a
 //! successful one as undoable commands.
 
-use crate::{Command, Document, LibraryState, NodeId, Style, StyleMeta, Variable, VariableCollection};
-use std::collections::BTreeMap;
-
-/// Copy of the non-node data a spec apply may change.
-#[derive(Clone, Debug)]
-pub(crate) struct SpecDataSnapshot {
-    variables: BTreeMap<String, Variable>,
-    variable_collections: BTreeMap<String, VariableCollection>,
-    styles: BTreeMap<String, Style>,
-    style_meta: BTreeMap<String, StyleMeta>,
-    library: LibraryState,
-    library_page: Option<NodeId>,
-}
-
-impl SpecDataSnapshot {
-    pub(crate) fn of(doc: &Document) -> Self {
-        Self {
-            variables: doc.variables.clone(),
-            variable_collections: doc.variable_collections.clone(),
-            styles: doc.styles.clone(),
-            style_meta: doc.style_meta.clone(),
-            library: doc.library.clone(),
-            library_page: doc.library_page,
-        }
-    }
-
-    pub(crate) fn restore(self, doc: &mut Document) {
-        doc.variables = self.variables;
-        doc.variable_collections = self.variable_collections;
-        doc.styles = self.styles;
-        doc.style_meta = self.style_meta;
-        doc.library = self.library;
-        doc.library_page = self.library_page;
-    }
-}
+use crate::{Command, Document};
 
 impl Document {
     /// Commands that bring `self`'s variables, styles and library state to those of `applied`
