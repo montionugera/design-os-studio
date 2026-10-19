@@ -45,14 +45,7 @@ pub struct LivePatch {
 
 impl LivePatch {
     pub fn new(ops: Vec<LiveOp>) -> Self {
-        Self {
-            v: LIVE_PATCH_VERSION,
-            base: None,
-            session_id: None,
-            agent_label: None,
-            label: None,
-            ops,
-        }
+        Self { v: LIVE_PATCH_VERSION, base: None, session_id: None, agent_label: None, label: None, ops }
     }
 
     pub fn with_base(mut self, base: Option<u64>) -> Self {
