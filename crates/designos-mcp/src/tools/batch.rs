@@ -87,7 +87,14 @@ pub fn tool_descriptor() -> Value {
                 },
                 "dry_run": { "type": "boolean", "default": false },
                 "idempotency_key": { "type": "string", "maxLength": 128 },
-                "diff_image": { "type": "boolean", "default": false }
+                "diff_image": { "type": "boolean", "default": false },
+                "lint": {
+                    "anyOf": [
+                        { "type": "boolean" },
+                        { "type": "string", "enum": ["preset", "errors_only", "off"] }
+                    ],
+                    "description": "Optional per-call lint override (false or 'off' skips the per-call lint pass)."
+                }
             }
         },
         "annotations": {
@@ -116,6 +123,8 @@ struct BatchArgs {
     #[serde(default)]
     #[allow(dead_code)]
     diff_image: bool,
+    #[serde(default)]
+    lint: Option<crate::tools::session_options::PerCallLintOverride>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -1401,6 +1410,15 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
 
     let touched_bounds_rect = union_bounds.unwrap_or(Rect::new(0.0, 0.0, 0.0, 0.0));
     let undo_label = agent_undo_label();
+    let touched_root_ids: Vec<NodeId> = touched_records.iter().map(|r| r.node_id).collect();
+    let baseline = crate::tools::issues::PreCallBaseline::capture_from_post_doc(
+        &engine.doc,
+        &trial,
+        &touched_root_ids,
+        &engine.session_options.issues,
+        batch_args.lint,
+        engine.lint_env(),
+    );
 
     // Step 4: Dry run returns the trial result without committing or publishing (§3.2.4).
     // Step 5 & Edge case 5: Empty effective change skips commit, undo entry, and patch line (§8.5).
@@ -1420,7 +1438,8 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
         );
     }
 
-    Ok(json!({
+    trial.flush_pending_relayout();
+    let mut reply = json!({
         "dry_run": batch_args.dry_run,
         "created": created_root_ids,
         "created_count": created_count,
@@ -1429,9 +1448,17 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
         "touched_roots": touched_roots_json,
         "touched_bounds": bounds_json(touched_bounds_rect),
         "undo_label": undo_label,
-        "issues": [],
-        "issues_total": 0
-    }))
+    });
+    crate::tools::issues::attach_issues_block(
+        &trial,
+        &touched_root_ids,
+        &engine.session_options.issues,
+        batch_args.lint,
+        &baseline,
+        engine.lint_env(),
+        &mut reply,
+    );
+    Ok(reply)
 }
 
 /// Zero-allocation streaming hash of the document state (never calls `to_json`, CLAUDE.md §4.1).
@@ -2146,8 +2173,15 @@ mod tests {
         for (target_nodes, budget_ms) in cases {
             let (doc, page, target_board) = build_synthetic_document(target_nodes);
             let approx_doc_bytes = doc.nodes.len() * std::mem::size_of::<Node>();
-            let mut engine =
-                Engine { doc, history: Default::default(), active_page_id: Some(page), live_ops: None, live_patch_label: None, owned_frames: None };
+            let mut engine = Engine {
+                doc,
+                history: Default::default(),
+                active_page_id: Some(page),
+                live_ops: None,
+                live_patch_label: None,
+                owned_frames: None,
+                ..Engine::default()
+            };
 
             let pre_hash = batch_state_hash(&engine.doc, &[page, target_board]);
             let pre_len = engine.doc.nodes.len();

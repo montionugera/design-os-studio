@@ -6,7 +6,7 @@ use super::registry::{Category, RuleNeeds, RULES};
 use super::rules::{aabb_of_transformed_rect, detached, evaluate_node, severity_rank, NodeEvalCtx};
 use super::LintEnv;
 use crate::{Affine, Document, Node, NodeId, NodeKind};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 /// Execution budget for [`lint_subtree`], capping visited nodes and/or wall-clock duration.
@@ -15,6 +15,8 @@ pub struct Budget {
     pub max_nodes: usize,
     pub max_duration: Option<Duration>,
     pub cursor: Option<String>,
+    /// Nodes whose own rules are evaluated when visited, without descending into their children.
+    pub shallow_nodes: BTreeSet<NodeId>,
 }
 
 impl Default for Budget {
@@ -25,11 +27,11 @@ impl Default for Budget {
 
 impl Budget {
     pub fn unlimited() -> Self {
-        Self { max_nodes: usize::MAX, max_duration: None, cursor: None }
+        Self { max_nodes: usize::MAX, max_duration: None, cursor: None, shallow_nodes: BTreeSet::new() }
     }
 
     pub fn with_limits(max_nodes: usize, max_duration: Option<Duration>) -> Self {
-        Self { max_nodes, max_duration, cursor: None }
+        Self { max_nodes, max_duration, cursor: None, shallow_nodes: BTreeSet::new() }
     }
 }
 
@@ -169,7 +171,9 @@ pub fn lint_subtree(doc: &Document, roots: &[NodeId], config: &LintConfig, env: 
             evaluate_node(&ctx, &mut raw_findings);
         }
 
-        push_children(n, node_world, item.depth, item.in_component, &mut stack);
+        if !budget.shallow_nodes.contains(&item.id) {
+            push_children(n, node_world, item.depth, item.in_component, &mut stack);
+        }
     }
 
     // Filter or mark ignored findings.

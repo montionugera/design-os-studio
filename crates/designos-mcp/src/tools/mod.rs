@@ -1,6 +1,9 @@
-//! Shared tool validation helpers and batched transaction dispatcher (`tools::batch`).
+//! Shared tool validation helpers, batched transaction dispatcher (`tools::batch`),
+//! per-call lint issues block (`tools::issues`), and session options (`tools::session_options`).
 
 pub mod batch;
+pub mod issues;
+pub mod session_options;
 
 use designos_doc::{Document, Node, NodeId, NodeKind, Rect, TextStyle};
 

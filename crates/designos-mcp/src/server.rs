@@ -172,6 +172,9 @@ impl Session {
             return Err("Workspace must be a directory".into());
         }
         let mut s = Self { engine: Engine::default(), root, dirty: false, history_dropped: false, bridge: LiveSessionBridge::from_env() };
+        if let Some(dir) = &s.bridge.session_dir {
+            s.engine.session_options = crate::tools::session_options::SessionOptions::load_from_dir(dir);
+        }
         s.record_live_ops();
         s.sync_from_live_canvas_if_newer();
         Ok(s)
@@ -184,6 +187,9 @@ impl Session {
             return Err("Workspace must be a directory".into());
         }
         let mut s = Self { engine: Engine::default(), root, dirty: false, history_dropped: false, bridge: LiveSessionBridge::for_session_dir(session_dir) };
+        if let Some(dir) = &s.bridge.session_dir {
+            s.engine.session_options = crate::tools::session_options::SessionOptions::load_from_dir(dir);
+        }
         s.record_live_ops();
         s.sync_from_live_canvas_if_newer();
         Ok(s)
@@ -415,6 +421,9 @@ impl Session {
                 self.engine = Engine::default();
                 self.engine.active_page_id = doc.pages.first().copied();
                 self.engine.doc = doc;
+                if let Some(dir) = &self.bridge.session_dir {
+                    let _ = self.engine.session_options.save_to_dir(dir);
+                }
                 self.record_live_ops();
                 self.dirty = false;
                 self.publish_live_doc_sync()
@@ -439,6 +448,9 @@ impl Session {
                 }
                 self.engine = Engine::default();
                 self.engine.doc.name = a.name;
+                if let Some(dir) = &self.bridge.session_dir {
+                    let _ = self.engine.session_options.save_to_dir(dir);
+                }
                 self.record_live_ops();
                 self.dirty = true;
                 self.publish_live_doc_sync()
@@ -532,6 +544,11 @@ impl Session {
                     redo_steps: self.engine.history.redo_steps(),
                 });
                 let mut result = self.engine.call(name, args)?;
+                if name == "designos_configure_session" {
+                    if let Some(dir) = &self.bridge.session_dir {
+                        let _ = self.engine.session_options.save_to_dir(dir);
+                    }
+                }
                 let is_dry_run = result.get("dry_run").and_then(Value::as_bool) == Some(true);
                 let changed = !is_dry_run
                     && match result.get("changed") {
