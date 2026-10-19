@@ -338,10 +338,15 @@ fn untitled_ui_pie_chart_resized_instances_match() {
         return;
     };
     let mut doc = import_fig(&bytes).expect("import untitled-ui.fig");
-    for page in doc.pages.clone() {
+    let pie_set = doc.nodes.values().find(|n| n.source_id.as_deref() == Some("1084:114")).map(|n| n.id).unwrap_or_else(|| {
+        for page in doc.pages.clone() {
+            doc.ensure_page_hydrated(page);
+        }
+        doc.nodes.values().find(|n| n.source_id.as_deref() == Some("1084:114")).expect("Pie chart component set (1084:114)").id
+    });
+    if let Some(page) = doc.page_of(pie_set) {
         doc.ensure_page_hydrated(page);
     }
-    let pie_set = doc.nodes.values().find(|n| n.source_id.as_deref() == Some("1084:114")).expect("Pie chart component set (1084:114)").id;
     let mut count = 0usize;
     for n in subtree(&doc, pie_set) {
         if matches!(n.kind, NodeKind::Instance { .. }) && n.name == "_Pie chart" {
@@ -369,4 +374,36 @@ fn untitled_ui_pie_chart_resized_instances_match() {
         }
     }
     assert_eq!(count, 10, "expected all 10 _Pie chart instances across the 10 variants of 1084:114");
+}
+
+#[test]
+#[ignore = "needs private reference .fig kits"]
+fn kit_resized_instances_match_shared_constraint_solver() {
+    let Some(bytes) = reference("shadcn-ui.fig").or_else(|| reference("private-ui-kit.fig")) else {
+        eprintln!("reference kit not found: skipped");
+        return;
+    };
+    let mut doc = import_fig(&bytes).expect("import kit");
+    doc.hydrate_all_pages();
+    let mut checked = 0usize;
+    for inst in doc.nodes.values().filter(|n| matches!(n.kind, NodeKind::Instance { .. })) {
+        let Some(comp_id) = instance_component(inst) else { continue };
+        let Some(comp) = doc.get(comp_id) else { continue };
+        if comp.kind.frame_props().and_then(|f| f.auto_layout.as_ref()).is_some() {
+            continue;
+        }
+        if (inst.size.x - comp.size.x).abs() <= 1e-4 && (inst.size.y - comp.size.y).abs() <= 1e-4 {
+            continue;
+        }
+        let plan = plan_constraint_pass(&doc, comp_id, comp.size, inst.size, 1);
+        for ((_, _, expected_sz), &inst_child_id) in plan.iter().zip(inst.children.iter()) {
+            let Some(inst_child) = doc.get(inst_child_id) else { continue };
+            if inst_child.component.overrides.is_empty() {
+                checked += 1;
+                let err = (inst_child.size.x - expected_sz.x).abs().max((inst_child.size.y - expected_sz.y).abs());
+                assert!(err < 2e-3, "child {:?} size {:?} vs solver {:?}", inst_child.name, inst_child.size, expected_sz);
+            }
+        }
+    }
+    eprintln!("checked {checked} resized-instance child rows");
 }

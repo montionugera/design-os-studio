@@ -6,7 +6,7 @@
 
 use crate::edit::Edit;
 use crate::util::{aabb_of, rect_corners, v2};
-use designos_doc::{resolve_node, Constraint, Document, LayoutDirection, NodeId, NodeKind, Rect, Sizing, TextAutoResize, TextProps, Vec2};
+use designos_doc::{resolve_node, Document, LayoutDirection, NodeId, NodeKind, Rect, Sizing, TextAutoResize, TextProps, Vec2};
 
 use designos_doc::layout_solver::{compute_with_stroke, ChildIn, SizeLimits};
 
@@ -178,54 +178,16 @@ pub fn relayout_around(doc: &mut Document, ed: &mut Edit, id: NodeId) {
 /// Applies children constraints when a (non auto-layout) frame is resized.
 pub fn apply_constraints(doc: &mut Document, ed: &mut Edit, frame: NodeId, old: Vec2, new: Vec2) {
     let Some(f) = doc.get(frame) else { return };
-    if f.kind.frame_props().map(|p| p.auto_layout.is_some()).unwrap_or(false) || matches!(f.kind, NodeKind::Group) {
+    if matches!(f.kind, NodeKind::Group) {
         return;
     }
-    let dw = new.x - old.x;
-    let dh = new.y - old.y;
-    if dw.abs() < 1e-4 && dh.abs() < 1e-4 {
+    if (new.x - old.x).abs() < 1e-4 && (new.y - old.y).abs() < 1e-4 {
         return;
     }
-    for c in f.children.clone() {
-        let Some(k) = doc.get(c) else { continue };
-        if k.transform.b.abs() > 1e-4 || k.transform.c.abs() > 1e-4 {
-            continue;
-        }
-        let (mut x, mut w) = (k.transform.tx, k.size.x);
-        let (mut y, mut h) = (k.transform.ty, k.size.y);
-        let old_child = k.size;
-        let cons = k.constraints;
-        let rx = if old.x > 0.0 { new.x / old.x } else { 1.0 };
-        let ry = if old.y > 0.0 { new.y / old.y } else { 1.0 };
-        match cons.horizontal {
-            Constraint::Min => {}
-            Constraint::Max => x += dw,
-            Constraint::Center => x += dw / 2.0,
-            Constraint::Stretch => w += dw,
-            Constraint::Scale => {
-                x *= rx;
-                w *= rx;
-            }
-        }
-        match cons.vertical {
-            Constraint::Min => {}
-            Constraint::Max => y += dh,
-            Constraint::Center => y += dh / 2.0,
-            Constraint::Stretch => h += dh,
-            Constraint::Scale => {
-                y *= ry;
-                h *= ry;
-            }
-        }
-        let w = w.max(1.0);
-        let h = h.max(1.0);
+    for (c, new_transform, new_size) in designos_doc::plan_constraint_pass(doc, frame, old, new, 16) {
         if let Some(k) = ed.node(doc, c) {
-            k.transform.tx = x;
-            k.transform.ty = y;
-            k.size = v2(w, h);
-        }
-        if (w - old_child.x).abs() > 1e-4 || (h - old_child.y).abs() > 1e-4 {
-            apply_constraints(doc, ed, c, old_child, v2(w, h));
+            k.transform = new_transform;
+            k.size = new_size;
         }
     }
 }
@@ -233,7 +195,7 @@ pub fn apply_constraints(doc: &mut Document, ed: &mut Edit, frame: NodeId, old: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use designos_doc::{AutoLayout, CounterAlignContent, FrameProps, LayoutAlign, Node};
+    use designos_doc::{Affine, AutoLayout, Constraint, CounterAlignContent, FrameProps, LayoutAlign, Node};
 
     fn kid(w: f32, h: f32) -> ChildIn {
         ChildIn { size: v2(w, h), ..Default::default() }
@@ -594,6 +556,61 @@ mod tests {
         let n = d.get(r).unwrap();
         assert_eq!(n.transform.tx, 130.0);
         assert_eq!(n.size.y, 30.0);
+    }
+
+    #[test]
+    fn editor_no_longer_skips_rotated_children() {
+        let mut d = Document::new("t");
+        let page = d.add_page("p");
+        let fid = d.alloc_id();
+        let f = d.insert(page, Node::frame(fid, Rect::new(0.0, 0.0, 200.0, 200.0))).unwrap();
+        let rid = d.alloc_id();
+        let r = d.insert(f, Node::rectangle(rid, Rect::new(0.0, 0.0, 100.0, 40.0))).unwrap();
+        {
+            let n = d.get_mut(r).unwrap();
+            n.transform = Affine::rotate(30.0_f32.to_radians());
+            n.constraints.horizontal = Constraint::Stretch;
+            n.constraints.vertical = Constraint::Stretch;
+        }
+        let mut ed = Edit::new();
+        apply_constraints(&mut d, &mut ed, f, v2(200.0, 200.0), v2(300.0, 200.0));
+        let n = d.get(r).unwrap();
+        assert!((n.size.x - 175.130).abs() < 1e-3, "got w={}", n.size.x);
+        assert!((n.size.y - 44.266).abs() < 1e-3, "got h={}", n.size.y);
+    }
+
+    #[test]
+    fn editor_and_importer_call_the_shared_pass() {
+        let pairs = [
+            (Constraint::Min, Constraint::Min, 0.0_f32),
+            (Constraint::Max, Constraint::Center, 0.0_f32),
+            (Constraint::Center, Constraint::Max, 45.0_f32),
+            (Constraint::Stretch, Constraint::Stretch, 30.0_f32),
+            (Constraint::Scale, Constraint::Scale, 60.0_f32),
+        ];
+        let mut d = Document::new("t");
+        let page = d.add_page("p");
+        let fid = d.alloc_id();
+        let f = d.insert(page, Node::frame(fid, Rect::new(0.0, 0.0, 200.0, 200.0))).unwrap();
+        let mut ids = Vec::new();
+        for (hc, vc, deg) in pairs {
+            let cid = d.alloc_id();
+            let c = d.insert(f, Node::rectangle(cid, Rect::new(20.0, 30.0, 80.0, 40.0))).unwrap();
+            let n = d.get_mut(c).unwrap();
+            let rot = Affine::rotate(deg.to_radians());
+            n.transform = Affine::translate(20.0, 30.0) * rot;
+            n.constraints = designos_doc::Constraints { horizontal: hc, vertical: vc };
+            ids.push(c);
+        }
+        let planned = designos_doc::plan_constraint_pass(&d, f, v2(200.0, 200.0), v2(310.0, 260.0), 16);
+        let mut ed = Edit::new();
+        apply_constraints(&mut d, &mut ed, f, v2(200.0, 200.0), v2(310.0, 260.0));
+        assert_eq!(planned.len(), ids.len());
+        for (id, expected_t, expected_sz) in planned {
+            let actual = d.get(id).unwrap();
+            assert_eq!(actual.transform, expected_t);
+            assert_eq!(actual.size, expected_sz);
+        }
     }
 
     #[test]
