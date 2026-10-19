@@ -2627,7 +2627,7 @@ pub fn drop_spec_card_onto_canvas(app: &mut App, pkg: &SpecPackage) {
         "dev_status": "ready",
         "annotation": format!("Figma Specs · Markdown as a Medium · {}", pkg.contract_id),
         "layout": {
-            "dir": "column",
+            "direction": "column",
             "padding": [28.0, 32.0, 28.0, 32.0],
             "gap": 16.0,
             "align": "start",
@@ -2668,7 +2668,7 @@ pub fn drop_spec_card_onto_canvas(app: &mut App, pkg: &SpecPackage) {
                 "stroke_width": 1.0,
                 "radius": 8.0,
                 "layout": {
-                    "dir": "row",
+                    "direction": "row",
                     "padding": [14.0, 16.0, 14.0, 16.0],
                     "gap": 12.0,
                     "align": "center",
