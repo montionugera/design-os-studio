@@ -7,8 +7,7 @@
 use crate::engine::Engine;
 use designos_doc::NodeId;
 use designos_export::agent_context::{
-    bootstrap, BootstrapOptions, ALL_TOOL_NAMES, DEFAULT_BOOTSTRAP_MAX_TOKENS, DEFAULT_RULES_PACK,
-    MAX_BOOTSTRAP_MAX_TOKENS, MIN_BOOTSTRAP_MAX_TOKENS,
+    bootstrap, BootstrapOptions, ALL_TOOL_NAMES, DEFAULT_BOOTSTRAP_MAX_TOKENS, DEFAULT_RULES_PACK, MAX_BOOTSTRAP_MAX_TOKENS, MIN_BOOTSTRAP_MAX_TOKENS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -82,9 +81,7 @@ pub fn call_get_app_state(engine: &Engine, args: Value) -> Result<Value, String>
 
     let max_tokens = match parsed.max_tokens {
         Some(v) if v < MIN_BOOTSTRAP_MAX_TOKENS as i64 || v > MAX_BOOTSTRAP_MAX_TOKENS as i64 => {
-            return Err(format!(
-                "VALUE_OUT_OF_RANGE: max_tokens must be between {MIN_BOOTSTRAP_MAX_TOKENS} and {MAX_BOOTSTRAP_MAX_TOKENS} (got {v})"
-            ));
+            return Err(format!("VALUE_OUT_OF_RANGE: max_tokens must be between {MIN_BOOTSTRAP_MAX_TOKENS} and {MAX_BOOTSTRAP_MAX_TOKENS} (got {v})"));
         }
         Some(v) => v as usize,
         None => DEFAULT_BOOTSTRAP_MAX_TOKENS,
@@ -93,10 +90,7 @@ pub fn call_get_app_state(engine: &Engine, args: Value) -> Result<Value, String>
     let mut target_node_ids = Vec::new();
     if let Some(raw_ids) = parsed.target_node_ids {
         if raw_ids.len() > 50 {
-            return Err(format!(
-                "VALUE_OUT_OF_RANGE: target_node_ids may contain at most 50 items (got {})",
-                raw_ids.len()
-            ));
+            return Err(format!("VALUE_OUT_OF_RANGE: target_node_ids may contain at most 50 items (got {})", raw_ids.len()));
         }
         for raw_id in raw_ids {
             if raw_id < 1 {
@@ -119,22 +113,12 @@ pub fn call_get_app_state(engine: &Engine, args: Value) -> Result<Value, String>
     }
 
     let current_page_id = engine.resolve_default_page().ok();
-    let enabled_tools: Vec<String> = engine
-        .enabled_tools
-        .clone()
-        .unwrap_or_else(|| ALL_TOOL_NAMES.iter().map(|s| (*s).to_string()).collect());
+    let enabled_tools: Vec<String> = engine.enabled_tools.clone().unwrap_or_else(|| ALL_TOOL_NAMES.iter().map(|s| (*s).to_string()).collect());
 
     let local_mutations = engine.history.undo_depth() as u64;
-    let doc_revision = engine
-        .base_doc_revision
-        .map(|base| base.saturating_add(local_mutations))
-        .unwrap_or_else(|| engine.doc.mutation_epoch());
+    let doc_revision = engine.base_doc_revision.map(|base| base.saturating_add(local_mutations)).unwrap_or_else(|| engine.doc.mutation_epoch());
 
-    let generated_at = if local_mutations == 0 {
-        engine.bootstrap_generated_at.clone()
-    } else {
-        None
-    };
+    let generated_at = if local_mutations == 0 { engine.bootstrap_generated_at.clone() } else { None };
 
     let opts = BootstrapOptions {
         file_path: engine.file_path.clone(),
@@ -143,11 +127,7 @@ pub fn call_get_app_state(engine: &Engine, args: Value) -> Result<Value, String>
         max_tokens,
         sections: parsed.sections,
         include_selection: parsed.include_selection,
-        selected_node_ids: if parsed.include_selection {
-            engine.selected_node_ids.clone()
-        } else {
-            Vec::new()
-        },
+        selected_node_ids: if parsed.include_selection { engine.selected_node_ids.clone() } else { Vec::new() },
         scoped: engine.scoped,
         generated_at,
         doc_revision: Some(doc_revision),
@@ -218,43 +198,21 @@ mod tests {
         // Default (include_selection omitted / false): no selection section.
         let res_default = call_get_app_state(&engine, json!({})).expect("default call succeeds");
         let secs_default = res_default["sections"].as_array().expect("sections array");
-        assert!(
-            !secs_default.iter().any(|s| s["id"] == "selection"),
-            "default call must not include selection section"
-        );
-        assert!(
-            !res_default["markdown"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("## Selection"),
-            "default markdown must not include ## Selection"
-        );
+        assert!(!secs_default.iter().any(|s| s["id"] == "selection"), "default call must not include selection section");
+        assert!(!res_default["markdown"].as_str().unwrap_or_default().contains("## Selection"), "default markdown must not include ## Selection");
 
         // Explicit include_selection: true -> includes selection section.
-        let res_with_sel =
-            call_get_app_state(&engine, json!({ "include_selection": true })).expect("call with selection");
+        let res_with_sel = call_get_app_state(&engine, json!({ "include_selection": true })).expect("call with selection");
         let secs_with_sel = res_with_sel["sections"].as_array().expect("sections array");
-        let sel_sec = secs_with_sel
-            .iter()
-            .find(|s| s["id"] == "selection")
-            .expect("selection section present when include_selection=true");
-        assert!(
-            sel_sec["content"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("Hero Card"),
-            "selection content must include selected node name"
-        );
+        let sel_sec = secs_with_sel.iter().find(|s| s["id"] == "selection").expect("selection section present when include_selection=true");
+        assert!(sel_sec["content"].as_str().unwrap_or_default().contains("Hero Card"), "selection content must include selected node name");
     }
 
     #[test]
     fn app_state_tool_matches_studio_block() {
         let mut engine = make_engine_with_selection();
         // Reset mutation_epoch effect by building Studio's bootstrap with the same doc_revision.
-        let doc_rev = engine
-            .base_doc_revision
-            .unwrap()
-            .saturating_add(engine.doc.mutation_epoch());
+        let doc_rev = engine.base_doc_revision.unwrap().saturating_add(engine.doc.mutation_epoch());
         let studio_opts = BootstrapOptions {
             file_path: engine.file_path.clone(),
             current_page_id: engine.resolve_default_page().ok(),
@@ -262,12 +220,7 @@ mod tests {
             generated_at: Some("2026-06-21T10:00:00Z".into()),
             ..BootstrapOptions::default()
         };
-        let studio_boot = bootstrap(
-            &engine.doc,
-            &studio_opts,
-            &engine.doc.library.enabled,
-            DEFAULT_RULES_PACK,
-        );
+        let studio_boot = bootstrap(&engine.doc, &studio_opts, &engine.doc.library.enabled, DEFAULT_RULES_PACK);
 
         // Simulate synced engine where doc.mutation_epoch() == 0 and base_doc_revision == doc_rev
         let mut synced = Engine::default();
@@ -297,4 +250,3 @@ mod tests {
         assert!(err_node.contains("NODE_NOT_FOUND"));
     }
 }
-

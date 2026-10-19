@@ -753,11 +753,7 @@ fn serialize_bootstrap_json(boot: &designos_export::agent_context::Bootstrap) ->
     })
 }
 
-fn write_bootstrap_artifacts(
-    session_dir: &Path,
-    boot: &designos_export::agent_context::Bootstrap,
-    page_context: &serde_json::Value,
-) {
+fn write_bootstrap_artifacts(session_dir: &Path, boot: &designos_export::agent_context::Bootstrap, page_context: &serde_json::Value) {
     let _ = atomic_write_session_file(&session_dir.join("bootstrap.md"), boot.markdown.as_bytes());
     if let Ok(json_bytes) = serde_json::to_vec_pretty(&serialize_bootstrap_json(boot)) {
         let _ = atomic_write_session_file(&session_dir.join("bootstrap.json"), &json_bytes);
@@ -902,13 +898,7 @@ impl TerminalState {
 
     /// Spawns a background bootstrap build job (`E15-16 §3.2`, `§8.5`, `§11`) with an immediate
     /// `compact_bootstrap` fallback if `resolve_bootstrap_markdown` times out at `500 ms`.
-    pub fn start_bootstrap_job(
-        &mut self,
-        doc: Document,
-        page: NodeId,
-        file_path: Option<PathBuf>,
-        simulated_delay: Option<std::time::Duration>,
-    ) {
+    pub fn start_bootstrap_job(&mut self, doc: Document, page: NodeId, file_path: Option<PathBuf>, simulated_delay: Option<std::time::Duration>) {
         let opts = designos_export::agent_context::BootstrapOptions {
             file_path: file_path.as_ref().map(|p| p.display().to_string()),
             current_page_id: Some(page),
@@ -924,15 +914,8 @@ impl TerminalState {
             enabled_tools: None,
             in_progress: Default::default(),
         };
-        let compact = designos_export::agent_context::compact_bootstrap(
-            &doc,
-            &opts,
-            designos_export::agent_context::DEFAULT_RULES_PACK,
-        );
-        let state = Arc::new((
-            Mutex::new(BootstrapJobState { done: false, markdown: None }),
-            std::sync::Condvar::new(),
-        ));
+        let compact = designos_export::agent_context::compact_bootstrap(&doc, &opts, designos_export::agent_context::DEFAULT_RULES_PACK);
+        let state = Arc::new((Mutex::new(BootstrapJobState { done: false, markdown: None }), std::sync::Condvar::new()));
         let state_bg = Arc::clone(&state);
         let session_dir = self.session_dir.clone();
         let page_ctx = self.page_context_value(file_path.as_deref());
@@ -940,12 +923,7 @@ impl TerminalState {
             if let Some(d) = simulated_delay {
                 std::thread::sleep(d);
             }
-            let boot = designos_export::agent_context::bootstrap(
-                &doc,
-                &opts,
-                &doc.library.enabled,
-                designos_export::agent_context::DEFAULT_RULES_PACK,
-            );
+            let boot = designos_export::agent_context::bootstrap(&doc, &opts, &doc.library.enabled, designos_export::agent_context::DEFAULT_RULES_PACK);
             write_bootstrap_artifacts(&session_dir, &boot, &page_ctx);
             if let Ok(mut guard) = state_bg.0.lock() {
                 guard.done = true;
@@ -953,10 +931,7 @@ impl TerminalState {
                 state_bg.1.notify_all();
             }
         });
-        self.bootstrap_job = Some(BootstrapJobHandle {
-            state,
-            compact_fallback_markdown: compact.markdown,
-        });
+        self.bootstrap_job = Some(BootstrapJobHandle { state, compact_fallback_markdown: compact.markdown });
     }
 
     /// Resolves the `bootstrap.md` text for the first turn of a run, waiting up to `timeout` (`500 ms`)
@@ -986,16 +961,9 @@ impl TerminalState {
         }
         let mut fallback_doc = Document::new(&self.doc_name);
         let pid = fallback_doc.add_page(&self.current_page_name);
-        let opts = designos_export::agent_context::BootstrapOptions {
-            current_page_id: Some(pid),
-            ..Default::default()
-        };
-        let boot = designos_export::agent_context::bootstrap(
-            &fallback_doc,
-            &opts,
-            &fallback_doc.library.enabled,
-            designos_export::agent_context::DEFAULT_RULES_PACK,
-        );
+        let opts = designos_export::agent_context::BootstrapOptions { current_page_id: Some(pid), ..Default::default() };
+        let boot =
+            designos_export::agent_context::bootstrap(&fallback_doc, &opts, &fallback_doc.library.enabled, designos_export::agent_context::DEFAULT_RULES_PACK);
         self.bootstrap_markdown = Some(boot.markdown.clone());
         boot.markdown
     }
@@ -1074,12 +1042,7 @@ impl TerminalState {
                     enabled_tools: None,
                     in_progress: Default::default(),
                 };
-                let boot = designos_export::agent_context::bootstrap(
-                    doc,
-                    &opts,
-                    &doc.library.enabled,
-                    designos_export::agent_context::DEFAULT_RULES_PACK,
-                );
+                let boot = designos_export::agent_context::bootstrap(doc, &opts, &doc.library.enabled, designos_export::agent_context::DEFAULT_RULES_PACK);
                 let page_ctx = self.page_context_value(file_path);
                 write_bootstrap_artifacts(&self.session_dir, &boot, &page_ctx);
                 self.bootstrap_markdown = Some(boot.markdown);
@@ -1137,10 +1100,9 @@ impl TerminalState {
         let bootstrap_reply_path = self.session_dir.join("bootstrap-context-reply.json");
         let delivered_marker_path = self.session_dir.join(format!("bootstrap.delivered.{}", self.run_id));
         let status_path = self.session_dir.join("agent-status.json");
-        if let Ok(bytes) = serde_json::to_vec_pretty(&session_hooks_settings(
-            &status_path,
-            Some((&context_reply_path, &bootstrap_reply_path, &delivered_marker_path)),
-        )) {
+        if let Ok(bytes) =
+            serde_json::to_vec_pretty(&session_hooks_settings(&status_path, Some((&context_reply_path, &bootstrap_reply_path, &delivered_marker_path))))
+        {
             let _ = atomic_write_session_file(&self.session_dir.join("hooks.json"), &bytes);
         }
         if let Ok(bytes) = serde_json::to_vec_pretty(&session_hooks_settings(&status_path, None)) {
@@ -1307,24 +1269,14 @@ impl TerminalState {
         } else if self.prompt_bootstrap_delivered_run != Some(self.run_id) {
             self.prompt_bootstrap_delivered_run = Some(self.run_id);
             let boot_md = self.resolve_bootstrap_markdown(std::time::Duration::from_millis(500));
-            (
-                format!("```designos-context\n{}\n```\n\n{trimmed}", boot_md.trim_end()),
-                true,
-            )
+            (format!("```designos-context\n{}\n```\n\n{trimmed}", boot_md.trim_end()), true)
         } else {
             let page_ctx = self.page_context_value(file_path);
-            (
-                format!("```designos-context\nDESIGN:OS Studio page context: {page_ctx}\n```\n\n{trimmed}"),
-                false,
-            )
+            (format!("```designos-context\nDESIGN:OS Studio page context: {page_ctx}\n```\n\n{trimmed}"), false)
         };
 
         let selection_path = self.selection_spec_path.clone();
-        let cli_prompt_arg = if !is_raw_shell && runtime != AgentCliPreset::Claude {
-            dispatched_prompt.as_str()
-        } else {
-            trimmed
-        };
+        let cli_prompt_arg = if !is_raw_shell && runtime != AgentCliPreset::Claude { dispatched_prompt.as_str() } else { trimmed };
         let real_cli_cmd = build_real_cli_command(runtime, cli_prompt_arg, &self.live_spec_path, &selection_path);
         let display_cmd = if is_raw_shell { raw_cmd.clone() } else { real_cli_cmd.clone() };
 
@@ -1420,18 +1372,10 @@ impl TerminalState {
     pub fn open_bootstrap_in_raw_terminal(&mut self) {
         self.side_panel_pty_open = true;
         self.chat_mode = false;
-        let text = self
-            .bootstrap_markdown
-            .clone()
-            .or_else(|| std::fs::read_to_string(&self.bootstrap_md_path).ok())
-            .unwrap_or_default();
+        let text = self.bootstrap_markdown.clone().or_else(|| std::fs::read_to_string(&self.bootstrap_md_path).ok()).unwrap_or_default();
         if !text.is_empty() {
             if let Some(tab) = self.active_tab() {
-                let formatted = format!(
-                    "\r\n--- {} ---\r\n{}\r\n",
-                    self.bootstrap_md_path.display(),
-                    text.replace('\n', "\r\n")
-                );
+                let formatted = format!("\r\n--- {} ---\r\n{}\r\n", self.bootstrap_md_path.display(), text.replace('\n', "\r\n"));
                 if let Ok(mut parser) = tab.parser.lock() {
                     parser.process(formatted.as_bytes());
                 }
@@ -3553,13 +3497,7 @@ fn render_agent_chat_thread(state: &mut TerminalState, ui: &mut Ui, center_rect:
                     if turn.context_attached {
                         let cap_r = Rect::from_min_size(Pos2::new(card_r.left(), y), Vec2::new(card_w, theme::LINE_CAPTION));
                         let cap_resp = ui.interact(cap_r, Id::new(("agents-chat-context-attached", turn.id)), Sense::click());
-                        p.text(
-                            Pos2::new(cap_r.left(), cap_r.center().y),
-                            Align2::LEFT_CENTER,
-                            "Context attached",
-                            font.clone(),
-                            theme::TEXT_SECONDARY,
-                        );
+                        p.text(Pos2::new(cap_r.left(), cap_r.center().y), Align2::LEFT_CENTER, "Context attached", font.clone(), theme::TEXT_SECONDARY);
                         widgets::record(ui, &format!("agents-chat-context-attached-{}", turn.id), cap_r);
                         if cap_resp.clicked() {
                             open_bootstrap_in_terminal = true;
@@ -6058,8 +5996,8 @@ Done!
     mod bootstrap {
         use super::*;
         use designos_doc::{
-            Color, ComponentLink, FrameProps, LibraryRef, Node, NodeKind, Rect as DocRect,
-            Variable, VariableCollection, VariableKind, VariableMode, VariableValue,
+            Color, ComponentLink, FrameProps, LibraryRef, Node, NodeKind, Rect as DocRect, Variable, VariableCollection, VariableKind, VariableMode,
+            VariableValue,
         };
         use serde_json::json;
 
@@ -6140,10 +6078,7 @@ Done!
                 VariableCollection {
                     id: "col-primitives".into(),
                     name: "Primitives".into(),
-                    modes: vec![
-                        VariableMode { id: "mode-light".into(), name: "Light".into() },
-                        VariableMode { id: "mode-dark".into(), name: "Dark".into() },
-                    ],
+                    modes: vec![VariableMode { id: "mode-light".into(), name: "Light".into() }, VariableMode { id: "mode-dark".into(), name: "Dark".into() }],
                     default_mode: "mode-light".into(),
                     variables: var_ids,
                     key: None,
@@ -6164,11 +6099,7 @@ Done!
             }
 
             // 1 active enabled library
-            doc.library.enabled.push(LibraryRef {
-                id: "lib-core-ui".into(),
-                name: "Core UI Kit".into(),
-                version: 1,
-            });
+            doc.library.enabled.push(LibraryRef { id: "lib-core-ui".into(), name: "Core UI Kit".into(), version: 1 });
 
             BootstrapFixture { doc, page1, page2, frame_ids, component_ids, selected_ids }
         }
@@ -6230,10 +6161,7 @@ Done!
             // 1. Check bootstrap.json and bootstrap.md on disk
             let boot_json = read_json(&st.bootstrap_json_path);
             let sections = boot_json["sections"].as_array().expect("sections array");
-            assert!(
-                !sections.iter().any(|s| s["id"] == "selection"),
-                "bootstrap.json must never contain a selection section"
-            );
+            assert!(!sections.iter().any(|s| s["id"] == "selection"), "bootstrap.json must never contain a selection section");
             let boot_md = std::fs::read_to_string(&st.bootstrap_md_path).expect("read bootstrap.md");
             assert!(!boot_md.contains("## Selection") && !boot_md.contains("selected_node_ids"));
             for (i, sid) in fx.selected_ids.iter().enumerate() {
@@ -6286,19 +6214,13 @@ Done!
             assert!(!secs_default.iter().any(|s| s["id"] == "selection"));
 
             // Explicit include_selection: true -> selection section lists the 3 selected nodes
-            let res_sel = mcp
-                .call("designos_get_app_state", json!({ "include_selection": true }))
-                .expect("explicit selection get_app_state");
+            let res_sel = mcp.call("designos_get_app_state", json!({ "include_selection": true })).expect("explicit selection get_app_state");
             let secs_sel = res_sel["sections"].as_array().unwrap();
             let sel_sec = secs_sel.iter().find(|s| s["id"] == "selection").expect("selection section present");
             let content = sel_sec["content"].as_str().unwrap();
             for (i, sid) in fx.selected_ids.iter().enumerate() {
                 let sname = format!("Selected Secret Leaf {}", i + 1);
-                assert!(
-                    content.contains(&sid.0.to_string()) && content.contains(&sname),
-                    "selection section must list {sname} ({}):\n{content}",
-                    sid.0
-                );
+                assert!(content.contains(&sid.0.to_string()) && content.contains(&sname), "selection section must list {sname} ({}):\n{content}", sid.0);
             }
             kill_tabs(&mut st);
         }
@@ -6364,10 +6286,7 @@ Done!
 
             let boot_json = read_json(&st.bootstrap_json_path);
             let total_tokens = boot_json["total_tokens"].as_u64().unwrap();
-            assert!(
-                total_tokens <= designos_export::agent_context::DEFAULT_BOOTSTRAP_MAX_TOKENS as u64,
-                "total_tokens {total_tokens} exceeds 12000 budget"
-            );
+            assert!(total_tokens <= designos_export::agent_context::DEFAULT_BOOTSTRAP_MAX_TOKENS as u64, "total_tokens {total_tokens} exceeds 12000 budget");
             let sections = boot_json["sections"].as_array().unwrap();
             let outline = sections.iter().find(|s| s["id"] == "outline").unwrap();
             assert_eq!(outline["truncated"], json!(true), "25-frame outline must be truncated to 12 frames");
@@ -6486,12 +6405,7 @@ Done!
             let fx = build_tokens_fixture();
             let mut st = TerminalState::for_tab(8608);
             st.sync_live_file_context(&fx.doc, fx.page1, &[], None);
-            st.start_bootstrap_job(
-                fx.doc.clone(),
-                fx.page1,
-                None,
-                Some(std::time::Duration::from_millis(1200)),
-            );
+            st.start_bootstrap_job(fx.doc.clone(), fx.page1, None, Some(std::time::Duration::from_millis(1200)));
 
             let t0 = std::time::Instant::now();
             st.submit_chat_prompt("Prompt while slow bootstrap is still indexing", None);
@@ -6499,10 +6413,7 @@ Done!
             assert!(waited_ms < 900.0, "submit_chat_prompt must bound wait to ~500ms (took {waited_ms:.1}ms)");
             let prompt_sent = &st.chat_turns[0].dispatched_prompt;
             assert!(prompt_sent.contains("## 1. Freshness") && prompt_sent.contains("## 2. Document") && prompt_sent.contains("## 7. Rules"));
-            assert!(
-                prompt_sent.contains("Bootstrap build exceeded 500 ms; call designos_get_app_state"),
-                "compact fallback note missing:\n{prompt_sent}"
-            );
+            assert!(prompt_sent.contains("Bootstrap build exceeded 500 ms; call designos_get_app_state"), "compact fallback note missing:\n{prompt_sent}");
 
             // Clicking `Context attached` switches to raw terminal view and renders bootstrap.md
             st.open_bootstrap_in_raw_terminal();

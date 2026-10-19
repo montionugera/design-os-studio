@@ -847,9 +847,7 @@ pub fn bootstrap(doc: &Document, options: &BootstrapOptions, libraries: &[Librar
 
     // 1. Freshness header (cap: 60 tokens; never truncated below its content)
     if want_section("freshness") || options.sections.is_none() {
-        let content = format!(
-            "Generated: {generated_at} | Revision: {doc_revision} — current as of now; do not re-read; your tool replies report changes."
-        );
+        let content = format!("Generated: {generated_at} | Revision: {doc_revision} — current as of now; do not re-read; your tool replies report changes.");
         sections.push(BootstrapSection {
             id: "freshness".to_string(),
             title: "1. Freshness".to_string(),
@@ -861,10 +859,7 @@ pub fn bootstrap(doc: &Document, options: &BootstrapOptions, libraries: &[Librar
     }
 
     // 2. Document summary (cap: 300 tokens; never truncated below its content)
-    let current_page = options
-        .current_page_id
-        .filter(|id| doc.pages.contains(id))
-        .or_else(|| doc.pages.first().copied());
+    let current_page = options.current_page_id.filter(|id| doc.pages.contains(id)).or_else(|| doc.pages.first().copied());
 
     if want_section("document") {
         let content = build_document_section(doc, options.file_path.as_deref(), current_page);
@@ -1044,13 +1039,7 @@ fn build_outline_section(doc: &Document, current_page: Option<NodeId>, options: 
     let mut remaining_nodes = 0usize;
 
     for (idx, &tid) in targets.iter().enumerate() {
-        let meta_opts = MetadataOptions {
-            depth: 3,
-            max_nodes: 500,
-            include_hidden: true,
-            scoped: false,
-            in_progress: options.in_progress.clone(),
-        };
+        let meta_opts = MetadataOptions { depth: 3, max_nodes: 500, include_hidden: true, scoped: false, in_progress: options.in_progress.clone() };
         let meta = metadata_xml(doc, tid, &meta_opts, None);
         let chunk_chars = meta.xml.chars().count();
         let sep_chars = if xml_chunks.is_empty() { 0 } else { 1 };
@@ -1166,19 +1155,9 @@ fn build_variables_section(doc: &Document, cap_tokens: usize) -> BootstrapSectio
 
     for col in doc.variable_collections.values() {
         let mode_names: Vec<&str> = col.modes.iter().map(|m| m.name.as_str()).collect();
-        let default_mode_name = col
-            .modes
-            .iter()
-            .find(|m| m.id == col.default_mode)
-            .map(|m| m.name.as_str())
-            .unwrap_or(col.default_mode.as_str());
-        let header = format!(
-            "- Collection `{}` (modes: [{}], default: `{}`, count: {}):",
-            col.name,
-            mode_names.join(", "),
-            default_mode_name,
-            col.variables.len()
-        );
+        let default_mode_name = col.modes.iter().find(|m| m.id == col.default_mode).map(|m| m.name.as_str()).unwrap_or(col.default_mode.as_str());
+        let header =
+            format!("- Collection `{}` (modes: [{}], default: `{}`, count: {}):", col.name, mode_names.join(", "), default_mode_name, col.variables.len());
         let sep = if lines.is_empty() { 0 } else { 1 };
         if used_chars + sep + header.chars().count() > body_budget_chars {
             truncated = true;
@@ -1222,12 +1201,7 @@ fn build_variables_section(doc: &Document, cap_tokens: usize) -> BootstrapSectio
                 truncated = true;
                 break;
             }
-            let val_str = var
-                .values
-                .values()
-                .next()
-                .map(|v| format_variable_value(doc, v))
-                .unwrap_or_else(|| "unset".to_string());
+            let val_str = var.values.values().next().map(|v| format_variable_value(doc, v)).unwrap_or_else(|| "unset".to_string());
             let row = format!("- `{}` = `{}`", var.name, val_str);
             if used_chars + 1 + row.chars().count() > body_budget_chars {
                 truncated = true;
@@ -1386,10 +1360,7 @@ fn build_components_section(doc: &Document, libraries: &[LibraryRef], cap_tokens
 
     let mut content = lines.join("\n");
     let truncation_note = if truncated {
-        let note = format!(
-            "{} more components; call designos_list_nodes {{\"query\":\"\"}}",
-            format_thousands(omitted_components.max(1))
-        );
+        let note = format!("{} more components; call designos_list_nodes {{\"query\":\"\"}}", format_thousands(omitted_components.max(1)));
         if !content.is_empty() {
             content.push('\n');
         }
@@ -1415,13 +1386,9 @@ fn build_style_section(doc: &Document, current_page: Option<NodeId>, explicit_st
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .or_else(|| {
-            current_page.and_then(|pid| doc.get(pid)).and_then(|p| {
-                p.plugin_data
-                    .get("archetype")
-                    .or_else(|| p.plugin_data.get("active_style"))
-                    .or_else(|| p.fig_metadata.get("archetype"))
-                    .cloned()
-            })
+            current_page
+                .and_then(|pid| doc.get(pid))
+                .and_then(|p| p.plugin_data.get("archetype").or_else(|| p.plugin_data.get("active_style")).or_else(|| p.fig_metadata.get("archetype")).cloned())
         })
         .unwrap_or_else(|| "none".to_string());
 
@@ -1561,10 +1528,7 @@ mod tests {
             VariableCollection {
                 id: "col_brand".into(),
                 name: "Brand Tokens".into(),
-                modes: vec![
-                    VariableMode { id: "light".into(), name: "Light".into() },
-                    VariableMode { id: "dark".into(), name: "Dark".into() },
-                ],
+                modes: vec![VariableMode { id: "light".into(), name: "Light".into() }, VariableMode { id: "dark".into(), name: "Dark".into() }],
                 default_mode: "light".into(),
                 variables: vec!["v_bg".into(), "v_fg".into()],
                 key: None,
@@ -1645,11 +1609,7 @@ mod tests {
     #[test]
     fn first_turn_contains_every_section() {
         let (doc, page, _) = sample_tokens_doc();
-        let opts = BootstrapOptions {
-            file_path: Some("/workspace/tokens.designos".into()),
-            current_page_id: Some(page),
-            ..BootstrapOptions::default()
-        };
+        let opts = BootstrapOptions { file_path: Some("/workspace/tokens.designos".into()), current_page_id: Some(page), ..BootstrapOptions::default() };
         let boot = bootstrap(&doc, &opts, &doc.library.enabled, DEFAULT_RULES_PACK);
         assert_eq!(boot.sections.len(), 7);
         let ids: Vec<&str> = boot.sections.iter().map(|s| s.id.as_str()).collect();
@@ -1675,17 +1635,10 @@ mod tests {
     #[test]
     fn selection_never_injected_unless_explicitly_requested() {
         let (doc, page, selected) = sample_tokens_doc();
-        let mut opts = BootstrapOptions {
-            current_page_id: Some(page),
-            selected_node_ids: selected.clone(),
-            include_selection: false,
-            ..BootstrapOptions::default()
-        };
+        let mut opts =
+            BootstrapOptions { current_page_id: Some(page), selected_node_ids: selected.clone(), include_selection: false, ..BootstrapOptions::default() };
         let boot_default = bootstrap(&doc, &opts, &doc.library.enabled, DEFAULT_RULES_PACK);
-        assert!(
-            !boot_default.sections.iter().any(|s| s.id == "selection"),
-            "default bootstrap must never contain a selection section"
-        );
+        assert!(!boot_default.sections.iter().any(|s| s.id == "selection"), "default bootstrap must never contain a selection section");
         assert!(!boot_default.to_json().contains("\"id\": \"selection\""));
         // Outline targets are the page's top-level frames (`Button` component set + `HeroFrame`).
         let outline = boot_default.sections.iter().find(|s| s.id == "outline").unwrap();
@@ -1718,12 +1671,7 @@ mod tests {
         let boot = bootstrap(&doc, &opts, &[], DEFAULT_RULES_PACK);
         let elapsed = start.elapsed();
 
-        assert!(
-            boot.total_tokens <= DEFAULT_BOOTSTRAP_MAX_TOKENS,
-            "total_tokens {} exceeded {}",
-            boot.total_tokens,
-            DEFAULT_BOOTSTRAP_MAX_TOKENS
-        );
+        assert!(boot.total_tokens <= DEFAULT_BOOTSTRAP_MAX_TOKENS, "total_tokens {} exceeded {}", boot.total_tokens, DEFAULT_BOOTSTRAP_MAX_TOKENS);
         let outline = boot.sections.iter().find(|s| s.id == "outline").expect("outline section");
         assert!(outline.truncated, "5000-frame outline must be marked truncated");
         let note = outline.truncation_note.as_deref().expect("truncation_note required");
@@ -1737,11 +1685,7 @@ mod tests {
         let mut doc = Document::new("Empty Doc");
         let page = doc.add_page("Page 1");
         let enabled = vec!["designos_get_document".to_string(), "designos_apply_spec".to_string()];
-        let opts = BootstrapOptions {
-            current_page_id: Some(page),
-            enabled_tools: Some(enabled),
-            ..BootstrapOptions::default()
-        };
+        let opts = BootstrapOptions { current_page_id: Some(page), enabled_tools: Some(enabled), ..BootstrapOptions::default() };
         let boot = bootstrap(&doc, &opts, &[], DEFAULT_RULES_PACK);
         let vars = boot.sections.iter().find(|s| s.id == "variables").unwrap();
         assert_eq!(vars.content, "No variables in this file.");
