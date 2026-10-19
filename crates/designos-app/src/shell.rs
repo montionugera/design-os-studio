@@ -3208,13 +3208,13 @@ fn paint_micro_seq_hud(ui: &egui::Ui, app: &App, canvas_rect: Rect, _right_rect:
         let tw = widgets::text_width(&p, &hud.badge_text, &font);
         let pill_w = tw + 24.0;
         let pill_h = 28.0;
-        let mut px = (tip.x + 22.0).min(canvas_rect.right() - pill_w - 12.0).max(canvas_rect.left() + 12.0);
-        let mut py = (tip.y - 34.0).max(canvas_rect.top() + 16.0);
-        if py + pill_h > canvas_rect.bottom() - 64.0 {
-            py = tip.y - pill_h - 12.0;
+        let mut px = (tip.x + 22.0).min(canvas_rect.right() - pill_w - theme::SPACE_GROUP).max(canvas_rect.left() + theme::SPACE_GROUP);
+        let mut py = (tip.y - 34.0).max(canvas_rect.top() + theme::SPACE_BLOCK);
+        if py + pill_h > canvas_rect.bottom() - (theme::SPACE_REGION + theme::SPACE_BLOCK) {
+            py = tip.y - pill_h - theme::SPACE_GROUP;
         }
-        if px < canvas_rect.left() + 12.0 {
-            px = canvas_rect.left() + 12.0;
+        if px < canvas_rect.left() + theme::SPACE_GROUP {
+            px = canvas_rect.left() + theme::SPACE_GROUP;
         }
         let pill_rect = Rect::from_min_size(Pos2::new(px, py), Vec2::new(pill_w, pill_h));
         widgets::elevation_shadow(&p, pill_rect, 8);
@@ -3231,16 +3231,28 @@ fn paint_micro_seq_hud(ui: &egui::Ui, app: &App, canvas_rect: Rect, _right_rect:
         let cw = widgets::text_width(&p, &hud.caption, &font_cap);
         let bar_w = (kw + cw + 46.0).min(canvas_rect.width() - 24.0);
         let bar_h = 38.0;
-        let bar_rect = Rect::from_center_size(Pos2::new(canvas_rect.center().x, canvas_rect.top() + 48.0), Vec2::new(bar_w, bar_h));
+        let bar_rect = Rect::from_center_size(Pos2::new(canvas_rect.center().x, canvas_rect.top() + theme::SPACE_REGION), Vec2::new(bar_w, bar_h));
         widgets::elevation_shadow(&p, bar_rect, 10);
         p.rect_filled(bar_rect, 10.0, egui::Color32::from_rgba_unmultiplied(17, 18, 22, 238));
         p.rect_stroke(bar_rect, 10.0, egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36)), egui::StrokeKind::Outside);
-        let key_rect = Rect::from_min_size(Pos2::new(bar_rect.left() + 10.0, bar_rect.top() + 7.0), Vec2::new(kw, 24.0));
+        let key_rect = Rect::from_min_size(
+            Pos2::new(bar_rect.left() + theme::INSET_CONTROL + theme::INSET_SEGMENT, bar_rect.top() + theme::SPACE_INLINE - theme::BORDER_WIDTH),
+            Vec2::new(kw, 24.0),
+        );
         p.rect_filled(key_rect, 6.0, accent);
         p.text(key_rect.center(), Align2::CENTER_CENTER, &hud.keycap, font_key, egui::Color32::WHITE);
-        p.text(Pos2::new(key_rect.right() + 12.0, bar_rect.center().y), Align2::LEFT_CENTER, &hud.caption, font_cap, egui::Color32::from_rgb(0xF4, 0xF4, 0xF6));
+        p.text(
+            Pos2::new(key_rect.right() + theme::SPACE_GROUP, bar_rect.center().y),
+            Align2::LEFT_CENTER,
+            &hud.caption,
+            font_cap,
+            egui::Color32::from_rgb(0xF4, 0xF4, 0xF6),
+        );
         let prog = if total <= 1 { 1.0 } else { (cur as f32 + 1.0) / (total as f32) };
-        let prog_rect = Rect::from_min_size(Pos2::new(bar_rect.left() + 8.0, bar_rect.bottom() - 3.0), Vec2::new((bar_w - 16.0) * prog, 2.0));
+        let prog_rect = Rect::from_min_size(
+            Pos2::new(bar_rect.left() + theme::SPACE_INLINE, bar_rect.bottom() - (theme::SPACE_ROW - theme::BORDER_WIDTH)),
+            Vec2::new((bar_w - 16.0) * prog, 2.0),
+        );
         p.rect_filled(prog_rect, 1.0, accent);
     }
 }
