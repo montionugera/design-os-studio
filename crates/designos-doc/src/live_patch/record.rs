@@ -99,6 +99,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::SetLibraryState { .. } => "Editing library state",
         Command::SetGuides { .. } => "Editing guides",
         Command::SetPrototypeDevice { .. } => "Editing the prototype device",
+        Command::SetAutoFix { .. } => "Editing auto-fix settings",
         Command::SetVariables { .. } => "Editing variables",
         _ => "This edit",
     }

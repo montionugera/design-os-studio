@@ -960,6 +960,7 @@ fn layout_guide_section_edits_the_grids_of_a_frame() {
     }
 }
 
+mod auto_fix;
 mod board;
 mod board_home;
 mod check_designs;

@@ -351,6 +351,8 @@ pub enum TerminalAction {
     /// `selection.spec.json` and pipes its path + node summary +
     /// unresolved Canvas Pin-Comments directly into the active PTY stdin.
     ExportSelectionToTerminal,
+    /// Opens the Check designs panel and scrolls to the `Auto-fix` section.
+    ReviewAutoFix,
 }
 
 /// Orca 3-tier live agent execution status (`Working` / `WaitingForInput` / `Done` / `Idle`).
@@ -679,6 +681,10 @@ pub struct TerminalState {
     pub search_query: String,
     /// Whether `Cmd+F` terminal search is case-sensitive (`Aa`).
     pub search_case_sensitive: bool,
+    /// User-level auto-fix settings written into `context.json` (`"auto_fix_user"`).
+    pub auto_fix_user: designos_doc::AutoFixSettings,
+    /// Compact 1-line auto-fix notice `(count, report_only)` displayed in the Agents panel.
+    pub auto_fix_notice: Option<(usize, bool)>,
 }
 
 impl Default for TerminalState {
@@ -752,6 +758,23 @@ impl TerminalState {
             search_open: false,
             search_query: String::new(),
             search_case_sensitive: false,
+            auto_fix_user: designos_doc::AutoFixSettings::default(),
+            auto_fix_notice: None,
+        }
+    }
+
+    /// Updates the user-level auto-fix settings and marks `context.json` dirty when changed.
+    pub fn set_auto_fix_user(&mut self, settings: designos_doc::AutoFixSettings) {
+        if self.auto_fix_user != settings {
+            self.auto_fix_user = settings;
+            self.last_synced_key = None;
+        }
+    }
+
+    /// Records the latest auto-fix system line `(count, report_only)` for the Agents panel.
+    pub fn set_auto_fix_notice(&mut self, count: usize, report_only: bool) {
+        if count > 0 {
+            self.auto_fix_notice = Some((count, report_only));
         }
     }
 
@@ -817,6 +840,7 @@ impl TerminalState {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             selection.hash(&mut h);
+            self.auto_fix_user.hash(&mut h);
             h.finish()
         };
         let key = (doc.mutation_epoch(), page.0, selection_key);
@@ -829,6 +853,10 @@ impl TerminalState {
                 "current_page_id": page.0,
                 "current_page_name": self.current_page_name,
                 "selected_node_ids": selected_ids,
+                "auto_fix_user": {
+                    "mode": self.auto_fix_user.mode,
+                    "rules": self.auto_fix_user.rules,
+                },
             });
             if let Ok(ctx_bytes) = serde_json::to_vec_pretty(&ctx_val) {
                 let _ = atomic_write_session_file(&self.context_json_path, &ctx_bytes);
@@ -2467,6 +2495,39 @@ pub fn export_selection_and_comments_to_pty(
 /// Renders the 1:1 Figma Desktop `126.9.13` `Agents` Left Side Panel (`New chat / Shared` header,
 /// dismissible AI credits banner, CLI Runtime Selector Bar (`Claude` | `Codex` | `Antigravity` | `Shell`),
 /// pure Chat UI wrapper over the live PTY shell (`DIR-21`), `What's next?` empty state, bottom
+fn render_auto_fix_notice_strip(
+    state: &TerminalState,
+    ui: &mut Ui,
+    p: &egui::Painter,
+    left: f32,
+    width: f32,
+    top: f32,
+    actions: &mut Vec<TerminalAction>,
+) -> f32 {
+    let Some((count, report_only)) = state.auto_fix_notice else {
+        return top;
+    };
+    const ROW_H: f32 = theme::CONTROL_DENSE;
+    const ONE: f32 = theme::BORDER_WIDTH;
+    const PAD_X: f32 = theme::SPACE_SECTION;
+    let row_r = Rect::from_min_size(Pos2::new(left, top), Vec2::new(width, ROW_H));
+    let resp = ui.interact(row_r, Id::new("agents-auto-fix-review"), Sense::click());
+    let bg = if resp.hovered() { TERM_BG_HOVER } else { TERM_BG_ELEVATED };
+    p.rect_filled(row_r, 0.0, bg);
+    widgets::hline(p, row_r.left(), row_r.right(), row_r.bottom() - ONE, TERM_BORDER);
+    let label = if report_only {
+        format!("{count} {} available · Review", if count == 1 { "fix" } else { "fixes" })
+    } else {
+        format!("Auto-fixed {count} {} · Review", if count == 1 { "issue" } else { "issues" })
+    };
+    p.text(Pos2::new(row_r.left() + PAD_X, row_r.center().y), Align2::LEFT_CENTER, label, theme::font_caption_medium(), STATUS_INFO_TEXT);
+    widgets::record(ui, "agents-auto-fix-review", row_r);
+    if resp.clicked() {
+        actions.push(TerminalAction::ReviewAutoFix);
+    }
+    row_r.bottom()
+}
+
 /// `"Ask for changes"` blue-bordered composer box, and toggleable in-panel live VT100 PTY viewport).
 pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: Option<&Path>) -> Vec<TerminalAction> {
     state.ensure_default_tab(file_path);
@@ -2609,8 +2670,10 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
         p.circle_filled(Pos2::new(ctx_r.left() + 10.0, ctx_r.center().y), 2.5, STATUS_INFO_TEXT);
         p.text(Pos2::new(ctx_r.left() + 17.0, ctx_r.center().y), Align2::LEFT_CENTER, ctx_elided, theme::font_caption(), STATUS_INFO_TEXT);
 
+        let vp_top = render_auto_fix_notice_strip(state, ui, &p, rect.left(), rect.width(), ctx_r.bottom(), &mut actions);
+
         // Live VT100 PTY Terminal Viewport (full height)
-        let vp_r = Rect::from_min_max(Pos2::new(rect.left(), ctx_r.bottom()), rect.max);
+        let vp_r = Rect::from_min_max(Pos2::new(rect.left(), vp_top), rect.max);
 
         render_vt100_viewport(state, ui, vp_r, "agents-left-pty");
         if let Some(fix) = state.pending_start_fix.take() {
@@ -2770,7 +2833,7 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
     if pty_toggle_resp.clicked() {
         state.side_panel_pty_open = !state.side_panel_pty_open;
     }
-    top_y = rt_bar_r.bottom();
+    top_y = render_auto_fix_notice_strip(state, ui, &p, rect.left(), rect.width(), rt_bar_r.bottom(), &mut actions);
 
     // ---- D. Bottom Docked `"Ask for changes"` Composer Box (`96px` height, `12px` margin)
     let comp_margin = 12.0;

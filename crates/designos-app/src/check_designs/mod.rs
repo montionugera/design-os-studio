@@ -20,8 +20,10 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+pub use designos_doc::live_patch::FixRow;
+pub use fix::can_revert_fix_row;
 pub use fixture::FIXTURE;
-pub use state::CheckDesignsState;
+pub use state::{AutoFixReport, CheckDesignsState, MAX_AUTO_FIX_ROWS};
 
 use designos_doc::{Color, Document, LibraryRef, LibrarySnapshot, NodeId, NodeKind};
 use std::sync::Arc;

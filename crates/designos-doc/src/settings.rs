@@ -62,6 +62,51 @@ pub struct PrototypeDevice {
     pub background: Option<crate::Color>,
 }
 
+/// Safe-tier auto-fix rule identifiers in display order.
+pub const SAFE_AUTO_FIX_RULES: [&str; 2] = ["sizing-conflict", "hardcoded-value"];
+
+/// Whether post-apply auto-fix runs, only reports, or stays off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoFixMode {
+    #[default]
+    On,
+    ReportOnly,
+    Off,
+}
+
+impl AutoFixMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AutoFixMode::On => "on",
+            AutoFixMode::ReportOnly => "report_only",
+            AutoFixMode::Off => "off",
+        }
+    }
+}
+
+/// Per-file (`Document::auto_fix`) or per-user (`~/.designos/settings.json` `"auto_fix"`)
+/// auto-fix settings. Missing rules default to `true`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AutoFixSettings {
+    #[serde(default)]
+    pub mode: AutoFixMode,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub rules: std::collections::BTreeMap<String, bool>,
+}
+
+impl AutoFixSettings {
+    /// True when `rule` is enabled (missing rules default to `true`).
+    pub fn rule_enabled(&self, rule: &str) -> bool {
+        self.rules.get(rule).copied().unwrap_or(true)
+    }
+
+    /// Sets `rule` to `enabled`.
+    pub fn set_rule(&mut self, rule: impl Into<String>, enabled: bool) {
+        self.rules.insert(rule.into(), enabled);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::*;
@@ -94,5 +139,21 @@ mod tests {
         let back = Document::from_json(&d.to_json().unwrap()).unwrap();
         assert_eq!(back.get(id).unwrap().export_settings, d.get(id).unwrap().export_settings);
         assert!(!serde_json::to_string(back.get(page).unwrap()).unwrap().contains("export_settings"));
+    }
+
+    #[test]
+    fn auto_fix_settings_roundtrip_and_undo() {
+        let mut d = Document::new("t");
+        assert!(!d.to_json().unwrap().contains("auto_fix"));
+        let mut h = History::default();
+        let mut s = AutoFixSettings { mode: AutoFixMode::ReportOnly, rules: Default::default() };
+        s.set_rule("sizing-conflict", false);
+        h.exec(&mut d, Command::SetAutoFix { settings: Some(s.clone()) }).unwrap();
+        let json = d.to_json().unwrap();
+        assert!(json.contains("\"report_only\""));
+        let back = Document::from_json(&json).unwrap();
+        assert_eq!(back.auto_fix, Some(s));
+        h.undo(&mut d).unwrap();
+        assert_eq!(d.auto_fix, None);
     }
 }

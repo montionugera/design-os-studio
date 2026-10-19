@@ -166,6 +166,9 @@ pub struct Document {
     /// Device used when presenting the prototype.
     #[serde(default)]
     pub prototype_device: PrototypeDevice,
+    /// Per-file auto-fix override; `None` falls back to user settings then built-in defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_fix: Option<AutoFixSettings>,
     /// Comment threads on the canvas.
     #[serde(default)]
     pub comments: Vec<CommentThread>,

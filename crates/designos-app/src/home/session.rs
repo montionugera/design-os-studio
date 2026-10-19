@@ -414,6 +414,7 @@ pub(crate) fn doc_hash(doc: &Document) -> u64 {
         &doc.variable_collections,
         &doc.guides,
         &doc.prototype_device,
+        &doc.auto_fix,
         &doc.comments,
         &doc.library,
         &doc.library_page,
@@ -431,6 +432,9 @@ impl App {
     pub fn attach_library(&mut self, root: PathBuf) {
         // Shared libraries use the same root as the projects library.
         self.libs.set_root(root.clone());
+        let (user_auto_fix, unreadable) = crate::comments::settings::load_auto_fix_checked(&root);
+        self.check_designs.user_auto_fix = user_auto_fix;
+        self.check_designs.settings_unreadable = unreadable;
         match Library::open(&root) {
             Ok(lib) => {
                 match lib.seed_first_run(crate::demo::demo_document) {

@@ -22,6 +22,18 @@ use serde_json::{Map, Value};
 /// Format version written in every [`LivePatch`].
 pub const LIVE_PATCH_VERSION: u32 = 1;
 
+/// One row of an auto-fix diff report attached to a [`LivePatch`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FixRow {
+    #[serde(alias = "node_id")]
+    pub node: NodeId,
+    pub node_name: String,
+    pub property: String,
+    pub before: Value,
+    pub after: Value,
+    pub rule: String,
+}
+
 /// The edits of one agent tool call: one line of the session's `doc-patch.jsonl`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LivePatch {
@@ -31,16 +43,33 @@ pub struct LivePatch {
     /// base: after the agent reloads a newer canvas it sees the editor's own ids.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<u64>,
+    #[serde(default)]
     pub ops: Vec<LiveOp>,
+    /// Optional human-readable label for this patch (e.g. `"Auto-fix"` or `"Auto-fix (report only)"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Structured diff rows when this patch was produced by the post-apply auto-fix pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_fix_report: Option<Vec<FixRow>>,
 }
 
 impl LivePatch {
     pub fn new(ops: Vec<LiveOp>) -> Self {
-        Self { v: LIVE_PATCH_VERSION, base: None, ops }
+        Self { v: LIVE_PATCH_VERSION, base: None, ops, label: None, auto_fix_report: None }
     }
 
     pub fn with_base(mut self, base: Option<u64>) -> Self {
         self.base = base;
+        self
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    pub fn with_auto_fix_report(mut self, rows: Vec<FixRow>) -> Self {
+        self.auto_fix_report = Some(rows);
         self
     }
 }

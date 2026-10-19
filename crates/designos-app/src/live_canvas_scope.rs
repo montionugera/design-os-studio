@@ -47,6 +47,7 @@ pub fn scoped_canvas(doc: &Document, page: NodeId, selection: &[NodeId], name: &
     // Threads are small; with them the agent can reply to the user's threads and picks ids
     // that do not collide with theirs.
     scoped.comments = doc.comments.clone();
+    scoped.auto_fix = doc.auto_fix.clone();
     scoped
 }
 

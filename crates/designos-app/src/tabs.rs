@@ -70,6 +70,8 @@ pub struct ProjectTab {
     pub doc: Document,
     pub hist: History,
     pub terminal: crate::terminal::TerminalState,
+    pub last_auto_fix: Option<crate::check_designs::AutoFixReport>,
+    pub auto_fix_history: std::collections::VecDeque<crate::check_designs::AutoFixReport>,
     pub page: NodeId,
     pub selection: Vec<NodeId>,
     pub view: View,
@@ -97,6 +99,8 @@ impl ProjectTab {
             doc: Document::default(),
             hist: History::default(),
             terminal: crate::terminal::TerminalState::for_tab(id),
+            last_auto_fix: app.check_designs.last_auto_fix.clone(),
+            auto_fix_history: app.check_designs.history.clone(),
             page: app.page,
             selection: app.selection.clone(),
             view: app.view,
@@ -222,6 +226,8 @@ impl TabsState {
         tab.file_path = app.file_path.clone();
         tab.lib_file = app.lib_file.clone();
         tab.dev_mode = app.ui.dev_mode;
+        tab.last_auto_fix = app.check_designs.last_auto_fix.clone();
+        tab.auto_fix_history = app.check_designs.history.clone();
         tab.dirty = app.hist.can_undo() || tab.hist.can_undo() || app.autosave.pending();
     }
 
@@ -297,14 +303,25 @@ impl TabsState {
         app.exit_version_view();
         app.flush_autosave();
 
-        let (mut doc, tab_page, tab_selection, tab_view, tab_file_path, tab_lib_file, tab_dev_mode, tab_kind) = {
+        let (mut doc, tab_page, tab_selection, tab_view, tab_file_path, tab_lib_file, tab_dev_mode, tab_kind, tab_last_af, tab_af_hist) = {
             let tab = &mut self.entries[idx];
             let doc = if tab.doc.nodes.is_empty() && idx == self.active_idx && !app.doc.nodes.is_empty() {
                 std::mem::take(&mut app.doc)
             } else {
                 std::mem::take(&mut tab.doc)
             };
-            (doc, tab.page, tab.selection.clone(), tab.view, tab.file_path.clone(), tab.lib_file.clone(), tab.dev_mode, tab.kind)
+            (
+                doc,
+                tab.page,
+                tab.selection.clone(),
+                tab.view,
+                tab.file_path.clone(),
+                tab.lib_file.clone(),
+                tab.dev_mode,
+                tab.kind,
+                tab.last_auto_fix.clone(),
+                tab.auto_fix_history.clone(),
+            )
         };
         crate::io::ensure_page(&mut doc);
         let page = if doc.pages.contains(&tab_page) { tab_page } else { doc.pages[0] };
@@ -315,6 +332,9 @@ impl TabsState {
         app.file_path = tab_file_path;
         app.lib_file = tab_lib_file;
         app.ui.dev_mode = tab_dev_mode;
+        app.check_designs.last_auto_fix = tab_last_af;
+        app.check_designs.history = tab_af_hist;
+        app.check_designs.invalidate();
         app.renaming_file = false;
         app.hover = None;
         app.hover_layer = None;
@@ -482,6 +502,8 @@ impl TabsState {
             doc,
             hist: History::default(),
             terminal,
+            last_auto_fix: None,
+            auto_fix_history: std::collections::VecDeque::new(),
             page,
             selection: Vec::new(),
             view: View::default(),
@@ -757,6 +779,8 @@ impl TabsState {
             dev_mode: copy_dev_mode,
             pinned: false,
             dirty: false,
+            last_auto_fix: None,
+            auto_fix_history: std::collections::VecDeque::new(),
         };
         let insert_idx = (idx + 1).min(self.entries.len());
         self.entries.insert(insert_idx, new_tab);
