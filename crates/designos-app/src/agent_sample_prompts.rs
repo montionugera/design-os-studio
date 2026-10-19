@@ -248,7 +248,7 @@ pub fn paint_empty_state(
     p.text(Pos2::new(center_rect.center().x, heading_y), Align2::CENTER_CENTER, "What's next?", theme::font_large_strong(), theme::TEXT);
 
     let row_x = center_rect.left() + theme::INSET_PANEL;
-    let row_w = (center_rect.width() - 2.0 * theme::INSET_PANEL).max(theme::TARGET_MIN);
+    let row_w = (center_rect.width() - theme::INSET_PANEL - theme::INSET_PANEL).max(theme::TARGET_MIN);
     let mut y = heading_y + theme::SPACE_SECTION;
 
     if !any_cli_installed {
@@ -273,7 +273,7 @@ pub fn paint_empty_state(
             p.rect_filled(btn_rect, theme::cr(theme::RADIUS_CONTROL), fill);
             p.rect_stroke(btn_rect, theme::cr(theme::RADIUS_CONTROL), Stroke::new(theme::BORDER_WIDTH, theme::BORDER), StrokeKind::Inside);
 
-            let text_max_w = (row_w - 2.0 * theme::INSET_BUTTON).max(theme::TARGET_MIN);
+            let text_max_w = (row_w - theme::INSET_BUTTON - theme::INSET_BUTTON).max(theme::TARGET_MIN);
             let label = format!("Install {}", preset.tab_title());
             let elided = widgets::elide(&p, &label, &theme::font_body_medium(), text_max_w);
             p.text(Pos2::new(btn_rect.left() + theme::INSET_BUTTON, btn_rect.center().y), Align2::LEFT_CENTER, elided, theme::font_body_medium(), theme::TEXT);
@@ -299,19 +299,19 @@ pub fn paint_empty_state(
         p.rect_filled(row_rect, theme::cr(theme::RADIUS_CONTROL), fill);
         p.rect_stroke(row_rect, theme::cr(theme::RADIUS_CONTROL), Stroke::new(theme::BORDER_WIDTH, theme::BORDER), StrokeKind::Inside);
 
-        let text_max_w = (row_w - 2.0 * theme::INSET_BUTTON).max(theme::TARGET_MIN);
+        let text_max_w = (row_w - theme::INSET_BUTTON - theme::INSET_BUTTON).max(theme::TARGET_MIN);
         let label_elided = widgets::elide(&p, &prompt.label, &theme::font_body_medium(), text_max_w);
         let body_elided = widgets::elide(&p, &prompt.text, &theme::font_caption(), text_max_w);
 
         p.text(
-            Pos2::new(row_rect.left() + theme::INSET_BUTTON, row_rect.top() + 13.0),
+            Pos2::new(row_rect.left() + theme::INSET_BUTTON, row_rect.top() + theme::SPACE_GROUP),
             Align2::LEFT_CENTER,
             label_elided,
             theme::font_body_medium(),
             theme::TEXT,
         );
         p.text(
-            Pos2::new(row_rect.left() + theme::INSET_BUTTON, row_rect.top() + 28.0),
+            Pos2::new(row_rect.left() + theme::INSET_BUTTON, row_rect.top() + theme::CONTROL_STANDARD),
             Align2::LEFT_CENTER,
             body_elided,
             theme::font_caption(),

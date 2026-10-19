@@ -1130,6 +1130,7 @@ impl TerminalState {
 
         let is_agent_runtime = !matches!(runtime, AgentCliPreset::Shell | AgentCliPreset::DesignOsHelp);
         const _RETAINED_ICON_VARIANTS: [crate::icons::Icon; 3] = [crate::icons::Icon::Microphone, crate::icons::Icon::Wand, crate::icons::Icon::StarFour];
+        #[cfg(not(test))]
         let bin_available = runtime_binary_available(runtime.binary_name());
         #[cfg(test)]
         let bin_available = if self.stub_cli.is_some() {
@@ -1137,7 +1138,7 @@ impl TerminalState {
         } else if let Some(ref p) = self.path_override {
             runtime_binary_available_in(runtime.binary_name(), Some(p.as_os_str()), false)
         } else {
-            bin_available
+            true
         };
 
         let skip_dead_agent = self.active_tab_mut().map(|tab| !tab.is_shell_process() && !tab.is_alive()).unwrap_or(false);
