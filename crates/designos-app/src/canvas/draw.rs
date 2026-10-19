@@ -809,9 +809,9 @@ pub fn overlays(app: &App, ui: &Ui, rect: ERect) {
         let col = if selected || hovered || is_comp_like { sel_color(app, id) } else { lab_col };
         let dx = if is_comp_like { 18.0 } else { 0.0 };
         if is_comp {
-            crate::icons::paint(&p, crate::icons::Icon::Component, Pos2::new(r.left() + 7.0, r.center().y), 14.0, col);
+            crate::icons::paint(&p, crate::icons::Icon::Component, Pos2::new(r.left() + theme::SPACE_INLINE - theme::BORDER_WIDTH, r.center().y), 14.0, col);
         } else if is_inst {
-            paint_instance_diamond(&p, Pos2::new(r.left() + 7.0, r.center().y), 5.0, col);
+            paint_instance_diamond(&p, Pos2::new(r.left() + theme::SPACE_INLINE - theme::BORDER_WIDTH, r.center().y), 5.0, col);
         }
         let clean_name = n.name.trim_start_matches("❖ ").trim_start_matches("◇ ");
         let name = crate::widgets::elide(&p, clean_name, &theme::font_body(), (r.width() - dx + 8.0).max(8.0));
