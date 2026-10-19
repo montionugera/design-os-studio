@@ -17,7 +17,7 @@ fn default_one_num_or_var() -> NumberOrVar {
 #[serde(deny_unknown_fields)]
 pub struct LayoutSpec {
     /// `"row"` / `"horizontal"` or `"column"` / `"vertical"`.
-    #[serde(default, alias = "dir")]
+    #[serde(default)]
     pub direction: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wrap: bool,
