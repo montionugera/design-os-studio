@@ -11,6 +11,7 @@
 //! vector PDF 1.4 pages, one page per frame. Pages preserve frame dimensions,
 //! vector paths, gradients, clipping masks, and selectable text runs.
 
+pub mod agent_context;
 mod android_xml;
 mod bounds;
 mod codegen;
@@ -28,6 +29,7 @@ mod text;
 mod uikit;
 mod util;
 
+pub use agent_context::{escape_xml_attr, fmt_f32_2, metadata_xml, structural_lint_counts, xml_tag_name, MetadataOptions, MetadataXml};
 pub use android_xml::android_xml_for;
 pub use bounds::render_bounds;
 pub use codegen::css_var_display as css_variable_reference;

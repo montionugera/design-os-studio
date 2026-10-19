@@ -646,13 +646,23 @@ impl ServerHandler for DesignOSServer {
         Ok(ListToolsResult { tools: tools(), ..Default::default() })
     }
     async fn call_tool(&self, request: CallToolRequestParams, _: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
+        let tool_name = request.name.to_string();
         let result = self
             .session
             .lock()
             .map_err(|_| "Session unavailable; restart the MCP server".to_string())
             .and_then(|mut session| session.call(&request.name, Value::Object(request.arguments.unwrap_or_default())));
         Ok(match result {
-            Ok(value) => CallToolResult::structured(value),
+            Ok(value) => {
+                if matches!(tool_name.as_str(), "designos_get_metadata" | "get_metadata") {
+                    if let Some(xml) = value.get("xml").and_then(Value::as_str).map(str::to_owned) {
+                        let mut res = CallToolResult::structured(value);
+                        res.content = vec![ContentBlock::text(xml)];
+                        return Ok(res.into());
+                    }
+                }
+                CallToolResult::structured(value)
+            }
             Err(message) => CallToolResult::structured_error(json!({"error":message})),
         }
         .into())
