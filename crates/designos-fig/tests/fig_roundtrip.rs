@@ -1176,12 +1176,12 @@ fn rea_v106_all_seven_gaps_fidelity_and_roundtrip() {
                 "connectorStartStrokeCap": "NONE",
                 "connectorEndStrokeCap": "ARROW_EQUILATERAL",
                 "connectorStart": {
-                    "endpointNodeId": g(1, 41),
+                    "endpointNodeID": g(1, 41),
                     "position": {"x": 100.0, "y": 25.0},
                     "magnet": "RIGHT"
                 },
                 "connectorEnd": {
-                    "endpointNodeId": g(1, 42),
+                    "endpointNodeID": g(1, 42),
                     "position": {"x": 200.0, "y": 25.0},
                     "magnet": "LEFT"
                 },
@@ -1476,8 +1476,8 @@ fn fig_v106_wave5_schema_99pct_coverage_roundtrip() {
                 "fillPaints": [{"type": "SOLID", "color": {"r": 1.0, "g": 0.0, "b": 0.0, "a": 1.0}, "opacity": 1.0, "visible": true}]
             })),
             // 1. BRUSH node with strokeGeometry (no fillGeometry) and brushType
-            node((1, 10), (0, 1), "!", "BRUSH", "CharcoalStroke", json!({
-                "brushType": "CHARCOAL",
+            node((1, 10), (0, 1), "!", "BRUSH", "ScatterBrush", json!({
+                "brushType": "SCATTER",
                 "strokeWeight": 4.0,
                 "strokePaints": [{"type": "SOLID", "color": {"r": 0.1, "g": 0.1, "b": 0.1, "a": 1.0}, "opacity": 1.0, "visible": true}],
                 "strokeGeometry": [{"windingRule": "NONZERO", "commandsBlob": 0}]
@@ -1554,8 +1554,8 @@ fn fig_v106_wave5_schema_99pct_coverage_roundtrip() {
     assert!(doc.styles.is_empty());
 
     // 1. BRUSH node
-    let brush = find(&doc, "CharcoalStroke");
-    assert_eq!(brush.fig_metadata.get("brushType").map(String::as_str), Some("CHARCOAL"));
+    let brush = find(&doc, "ScatterBrush");
+    assert_eq!(brush.fig_metadata.get("brushType").map(String::as_str), Some("SCATTER"));
     match &brush.kind {
         NodeKind::Vector { paths, .. } => assert_eq!(paths.len(), 1, "BRUSH should populate paths from strokeGeometry fallback"),
         other => panic!("expected Vector for BRUSH, got {other:?}"),
@@ -1608,8 +1608,8 @@ fn fig_v106_wave5_schema_99pct_coverage_roundtrip() {
     let bytes = export_fig(&doc).expect("export_fig Wave5Doc");
     let rt = import_fig(&bytes).expect("re-import Wave5Doc");
 
-    let rt_brush = find(&rt, "CharcoalStroke");
-    assert_eq!(rt_brush.fig_metadata.get("brushType").map(String::as_str), Some("CHARCOAL"));
+    let rt_brush = find(&rt, "ScatterBrush");
+    assert_eq!(rt_brush.fig_metadata.get("brushType").map(String::as_str), Some("SCATTER"));
 
     let rt_db = find(&rt, "DbNode");
     assert_eq!(rt_db.fig_metadata.get("shapeWithTextType").map(String::as_str), Some("ENG_DATABASE"));
@@ -1794,7 +1794,7 @@ fn typed_kiwi_passthrough_draw_motion_table_slide_and_large_file_roundtrip() {
                     "strokeOffset": 2.5,
                     "strokeBrushGuid": g(10, 20),
                     "variableWidthPoints": [
-                        {"asymmetricStroke": true, "position": 0.25, "leadingWidth": 3.5, "trailingWidth": 4.25}
+                        {"position": 0.25, "ascent": 3.5, "descent": 4.25, "segmentId": 2}
                     ],
                     "dynamicStrokeSettings": {"frequency": 8.0, "wiggle": 1.5, "smoothen": 0.75},
                     "scatterStrokeSettings": {
@@ -1802,18 +1802,16 @@ fn typed_kiwi_passthrough_draw_motion_table_slide_and_large_file_roundtrip() {
                         "wiggle": 2.0,
                         "angularJitter": 15.0,
                         "sizeJitter": 0.5,
-                        "rotation": "DIRECTION"
+                        "rotation": 15.0
                     },
                     "stretchStrokeSettings": {"orientation": "FORWARD"},
                     "scatterBrushTransforms": [
                         {"m00": 1.0, "m01": 0.0, "m02": 5.0, "m10": 0.0, "m11": 1.0, "m12": 2.0}
                     ],
-                    "pathTrim": {"start": 0.1, "end": 0.9, "offset": 0.05},
+                    "pathTrim": {"value": {"x": 0.1, "y": 0.9}},
                     "strokeData": {
-                        "dynamicStrokeSeed": 77,
-                        "variableWidthPoints": [
-                            {"asymmetricStroke": false, "position": 0.5, "leadingWidth": 2.0, "trailingWidth": 2.0}
-                        ]
+                        "strokes": [{"strokeId": 1, "strokeWeight": 2.0}],
+                        "version": 77
                     }
                 }),
             ),
@@ -1829,8 +1827,9 @@ fn typed_kiwi_passthrough_draw_motion_table_slide_and_large_file_roundtrip() {
                         {
                             "type": "REPEAT",
                             "count": 4,
-                            "countType": "NUMBER",
-                            "unit": "PIXELS",
+                            "repeatType": "RADIAL",
+                            "axis": "X",
+                            "unitType": "PIXELS",
                             "offset": {"x": 16.0, "y": 8.0}
                         }
                     ]
@@ -1844,7 +1843,7 @@ fn typed_kiwi_passthrough_draw_motion_table_slide_and_large_file_roundtrip() {
                 "TEXT_PATH",
                 "CurvedBannerPath",
                 json!({
-                    "textPathStart": 12.5
+                    "textPathStart": {"tValue": 12.5, "forward": true}
                 }),
             ),
             // 2. Motion: FRAME with timelineDefinitions & timelineAssignments + KEYFRAME_TRACK + KEYFRAME + ANIMATION_PRESET_INSTANCE
@@ -1855,16 +1854,12 @@ fn typed_kiwi_passthrough_draw_motion_table_slide_and_large_file_roundtrip() {
                 "FRAME",
                 "MotionStage",
                 json!({
-                    "timelineDefinitions": [
-                        {"id": g(3, 10), "name": "HeroEnter"}
-                    ],
-                    "timelineAssignments": [
-                        {"timelineId": g(3, 10), "targetNodeId": g(1, 20)}
-                    ],
-                    "animationPresets": [
-                        {"presetGuid": g(3, 99), "delay": 0.25, "duration": 0.5}
-                    ],
-                    "textElementDelayBehaviour": "BY_WORD"
+                    "timelineDefinitions": {"entries": [{"id": g(3, 10), "data": {"durationUs": 1500000, "defaultTimeline": true}}]},
+                    "timelineAssignments": {
+                        "entries": [{"key": {"assignedTimelineId": g(3, 10), "containingTimelineId": g(1, 20)}, "value": {"offsetUs": 0, "disabled": false}}]
+                    },
+                    "animationPresets": {"presets": [{"animationPresetId": {"guid": g(3, 99)}, "timelineDefId": g(3, 10), "sortPosition": "!"}]},
+                    "textElementDelayBehaviour": {"enabled": true, "grouping": "WORD", "delayMs": 50.0}
                 }),
             ),
             node(
@@ -1874,13 +1869,13 @@ fn typed_kiwi_passthrough_draw_motion_table_slide_and_large_file_roundtrip() {
                 "KEYFRAME_TRACK",
                 "OpacityTrack",
                 json!({
-                    "keyframeOperation": "OPACITY",
-                    "trackLoopMode": "PING_PONG",
-                    "timelineDuration": 1.5,
-                    "timelineOffset": 0.25,
+                    "keyframeOperation": "SET",
+                    "trackLoopMode": "LOOP",
+                    "timelineDuration": 1500,
+                    "timelineOffset": 250,
                     "timelineDisabled": false,
                     "styleIdsForAnimation": [
-                        {"guid": g(4, 1)}
+                        {"id": g(4, 1), "timelineDefId": g(3, 10), "sortPosition": "!"}
                     ]
                 }),
             ),
@@ -1891,18 +1886,15 @@ fn typed_kiwi_passthrough_draw_motion_table_slide_and_large_file_roundtrip() {
                 "KEYFRAME",
                 "MidKeyframe",
                 json!({
-                    "timelinePosition": 0.5,
-                    "keyframeValue": {"floatValue": 0.75},
+                    "timelinePosition": 500,
+                    "keyframeValue": {"value": {"floatValue": 0.75}, "valueType": "FLOAT"},
                     "interpolationType": "BEZIER",
-                    "bezierHandles": {
-                        "inTangent": {"x": -0.25, "y": 0.0},
-                        "outTangent": {"x": 0.25, "y": 1.0}
-                    },
+                    "bezierHandles": {"p1x": -0.25, "p1y": 0.0, "p2x": 0.25, "p2y": 1.0},
                     "easingData": {
-                        "easingType": "CUSTOM_CUBIC_BEZIER",
-                        "easingFunctionCubicBezier": {"x1": 0.5, "y1": 0.0, "x2": 0.25, "y2": 1.0}
+                        "easingType": "CUSTOM_CUBIC",
+                        "easingValue": {"bezierEasing": {"p1x": 0.5, "p1y": 0.0, "p2x": 0.25, "p2y": 1.0}}
                     },
-                    "easingType": "OUT_BACK",
+                    "easingType": "OUT_BACK_CUBIC",
                     "interpolationColorSpace": "OKLCH"
                 }),
             ),
@@ -1913,7 +1905,7 @@ fn typed_kiwi_passthrough_draw_motion_table_slide_and_large_file_roundtrip() {
                 "ANIMATION_PRESET_INSTANCE",
                 "PresetBounce",
                 json!({
-                    "timelineDuration": 0.75
+                    "timelineDuration": 750
                 }),
             ),
             // 3. Table: TABLE and TABLE_CELL
@@ -1924,19 +1916,10 @@ fn typed_kiwi_passthrough_draw_motion_table_slide_and_large_file_roundtrip() {
                 "TABLE",
                 "PricingTable",
                 json!({
-                    "tableRowPositions": [
-                        {"id": g(5, 1), "position": "!"},
-                        {"id": g(5, 2), "position": "\""}
-                    ],
-                    "tableColumnPositions": [
-                        {"id": g(5, 3), "position": "!"}
-                    ],
-                    "tableRowHeights": [
-                        {"id": g(5, 1), "size": 44.0}
-                    ],
-                    "tableColumnWidths": [
-                        {"id": g(5, 3), "size": 180.0}
-                    ],
+                    "tableRowPositions": {"entries": [{"id": g(5, 1), "position": "!"}, {"id": g(5, 2), "position": "\""}]},
+                    "tableColumnPositions": {"entries": [{"id": g(5, 3), "position": "!"}]},
+                    "tableRowHeights": {"entries": [{"id": g(5, 1), "size": 44.0}]},
+                    "tableColumnWidths": {"entries": [{"id": g(5, 3), "size": 180.0}]},
                     "tableMergedCells": {
                         "entries": [
                             {"rowId": g(5, 1), "colId": g(5, 3), "rowSpan": 2, "colSpan": 1}
@@ -1968,16 +1951,13 @@ fn typed_kiwi_passthrough_draw_motion_table_slide_and_large_file_roundtrip() {
                 json!({
                     "slideSpeakerNotes": "Highlight typed Kiwi passthrough X1",
                     "isSkippedSlide": false,
-                    "slideNumber": "03",
+                    "slideNumber": "SLIDE",
                     "slideNumberSeparator": "/",
                     "objectAnimations": [
                         {
-                            "target": g(1, 43),
-                            "transitionType": "SMART_ANIMATE",
-                            "transitionDuration": 0.5,
-                            "easingType": "IN_OUT_CUBIC",
-                            "timing": {"type": "ON_CLICK", "delay": 0.0},
-                            "phase": "IN"
+                            "id": g(6, 1),
+                            "event": {"interactionType": "ON_CLICK"},
+                            "actions": [{"transitionNodeID": g(1, 43), "transitionType": "SMART_ANIMATE", "transitionDuration": 0.5, "easingType": "INOUT_CUBIC"}]
                         }
                     ]
                 }),
@@ -2042,11 +2022,12 @@ fn typed_kiwi_passthrough_draw_motion_table_slide_and_large_file_roundtrip() {
 
         let tpath = find(&rt, "CurvedBannerPath");
         assert_eq!(tpath.kind, NodeKind::Unknown { type_name: "TEXT_PATH".into() });
-        assert_eq!(tpath.fig_metadata.get("textPathStart").map(String::as_str), Some("12.5"));
+        let start: Value = serde_json::from_str(tpath.fig_metadata.get("textPathStart").expect("textPathStart")).expect("textPathStart is JSON");
+        assert_eq!((start["tValue"].as_f64(), start["forward"].as_bool()), (Some(12.5), Some(true)));
 
         let kf = find(&rt, "MidKeyframe");
         assert_eq!(kf.kind, NodeKind::Unknown { type_name: "KEYFRAME".into() });
-        assert_eq!(kf.fig_metadata.get("timelinePosition").map(String::as_str), Some("0.5"));
+        assert_eq!(kf.fig_metadata.get("timelinePosition").map(String::as_str), Some("500"));
         assert_eq!(kf.fig_metadata.get("interpolationType").map(String::as_str), Some("BEZIER"));
         assert_eq!(kf.fig_metadata.get("interpolationColorSpace").map(String::as_str), Some("OKLCH"));
         assert!(kf.fig_metadata.contains_key("bezierHandles"));
@@ -2069,7 +2050,7 @@ fn typed_kiwi_passthrough_draw_motion_table_slide_and_large_file_roundtrip() {
         assert_eq!(slide.kind, NodeKind::Unknown { type_name: "SLIDE".into() });
         assert_eq!(slide.fig_metadata.get("slideSpeakerNotes").map(String::as_str), Some("Highlight typed Kiwi passthrough X1"));
         assert_eq!(slide.fig_metadata.get("isSkippedSlide").map(String::as_str), Some("false"));
-        assert_eq!(slide.fig_metadata.get("slideNumber").map(String::as_str), Some("03"));
+        assert_eq!(slide.fig_metadata.get("slideNumber").map(String::as_str), Some("SLIDE"));
         assert!(slide.fig_metadata.contains_key("objectAnimations"));
     };
 
@@ -2118,10 +2099,9 @@ fn typed_kiwi_passthrough_keeps_slide_out_transition_and_symbol_link_display_tex
             json!({
                 "objectAnimations": [
                     {
-                        "target": g(1, 2),
-                        "transitionType": "SLIDE_OUT_TO_LEFT",
-                        "transitionDuration": 0.4,
-                        "phase": "OUT"
+                        "id": g(6, 1),
+                        "event": {"interactionType": "ON_CLICK"},
+                        "actions": [{"transitionNodeID": g(1, 2), "transitionType": "SLIDE_OUT_TO_LEFT", "transitionDuration": 0.4}]
                     }
                 ]
             }),
@@ -2149,11 +2129,11 @@ fn typed_kiwi_passthrough_keeps_slide_out_transition_and_symbol_link_display_tex
         serde_json::from_str(raw).unwrap_or_else(|e| panic!("{name} fig_metadata[{key}] is not JSON: {e}"))
     };
 
-    assert_eq!(metadata_json(&doc, "ExitSlide", "objectAnimations")[0]["transitionType"], "SLIDE_OUT_TO_LEFT", "fixture sanity");
+    assert_eq!(metadata_json(&doc, "ExitSlide", "objectAnimations")[0]["actions"][0]["transitionType"], "SLIDE_OUT_TO_LEFT", "fixture sanity");
     assert_eq!(metadata_json(&doc, "LinkedComponent", "symbolLinks")[0]["displayText"], "Read", "fixture sanity");
 
     assert_eq!(
-        metadata_json(&rt, "ExitSlide", "objectAnimations")[0]["transitionType"],
+        metadata_json(&rt, "ExitSlide", "objectAnimations")[0]["actions"][0]["transitionType"],
         "SLIDE_OUT_TO_LEFT",
         "objectAnimations transitionType after round-trip"
     );
@@ -2212,6 +2192,151 @@ fn slot_fields_stay_typed_and_a_cleared_flag_is_not_resurrected_by_passthrough_m
     assert!(!find(&rt, "SlotHost").component.is_slot, "cleared isSlot came back");
     assert!(!find(&rt, "SlotCard").component.is_slot_content, "cleared isSlotContent came back");
     assert!(find(&rt, "SlotCard").component.slot_content_id.is_none(), "cleared slot content id came back");
+}
+
+#[test]
+fn instance_multi_paragraph_and_mixed_style_text_override_resolves_with_null_override_key_and_linked_styles() {
+    let g = |s: u64, l: u64| -> Value { json!({"sessionID": s, "localID": l}) };
+    let null_g = g(u32::MAX as u64, u32::MAX as u64);
+    let node = |id: (u64, u64), parent: (u64, u64), pos: &str, ty: &str, name: &str, extra: Value| -> Value {
+        let mut v = json!({
+            "guid": g(id.0, id.1),
+            "parentIndex": {"guid": g(parent.0, parent.1), "position": pos},
+            "type": ty,
+            "name": name,
+            "phase": "CREATED",
+            "visible": true,
+            "opacity": 1.0,
+            "size": {"x": 520.0, "y": 120.0},
+            "transform": {"m00": 1.0, "m01": 0.0, "m02": 0.0, "m10": 0.0, "m11": 1.0, "m12": 0.0}
+        });
+        for (k, x) in extra.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        v
+    };
+
+    let para1 = "We've included a few simple templates to help you get started.\n\n";
+    let para2_prefix = "Check out the ";
+    let para2_link = "Guide to variables in Figma";
+    let para2_suffix = " to learn more.";
+    let overridden_text = format!("{para1}{para2_prefix}{para2_link}{para2_suffix}");
+
+    // Build characterStyleIDs: para1 = 0, para2_prefix = 13 (semibold), para2_link = 12 (semibold + underline + purple), para2_suffix = 13 (semibold).
+    let mut char_ids: Vec<u64> = vec![0; para1.encode_utf16().count()];
+    char_ids.extend(std::iter::repeat_n(13, para2_prefix.encode_utf16().count()));
+    char_ids.extend(std::iter::repeat_n(12, para2_link.encode_utf16().count()));
+    char_ids.extend(std::iter::repeat_n(13, para2_suffix.encode_utf16().count()));
+
+    let mut raw_nodes = vec![
+        node((0, 0), (0, 0), "", "DOCUMENT", "NoteDoc", json!({})),
+        node((0, 1), (0, 0), "!", "CANVAS", "Internal Only Canvas", json!({"internalOnly": true})),
+        node((0, 2), (0, 0), "\"", "CANVAS", "Examples", json!({})),
+        // Shared text style 18:2016 ("Text lg/Semibold": Inter Semi Bold 600, 18px)
+        node(
+            (18, 2016),
+            (0, 1),
+            "!",
+            "TEXT",
+            "Text lg/Semibold",
+            json!({
+                "styleType": "TEXT",
+                "fontName": {"family": "Inter", "style": "Semi Bold", "postscript": "Inter-SemiBold"},
+                "fontSize": 18.0,
+                "lineHeight": {"units": "PIXELS", "value": 28.0}
+            }),
+        ),
+        // Component "Design note" (2680:401975) with child "Supporting text" (2680:401977)
+        // carrying the null GUID sentinel overrideKey {4294967295, 4294967295}.
+        node((2680, 401975), (0, 1), "\"", "SYMBOL", "Design note", json!({})),
+        node(
+            (2680, 401977),
+            (2680, 401975),
+            "!",
+            "TEXT",
+            "Supporting text",
+            json!({
+                "overrideKey": null_g,
+                "fontName": {"family": "Inter", "style": "Regular", "postscript": "Inter-Regular"},
+                "fontSize": 18.0,
+                "textData": {
+                    "characters": "Lorem ipsum dolor sit amet, consectetur adipiscing elit."
+                }
+            }),
+        ),
+        // Instance "Design note" (11185:8546) on the Examples page overriding 2680:401977
+        // with two paragraphs and mixed character styles referencing shared style 18:2016.
+        node(
+            (11185, 8546),
+            (0, 2),
+            "!",
+            "INSTANCE",
+            "Design note instance",
+            json!({
+                "symbolData": {
+                    "symbolID": g(2680, 401975),
+                    "symbolOverrides": [
+                        {
+                            "guidPath": {"guids": [g(2680, 401977)]},
+                            "textData": {
+                                "characters": overridden_text,
+                                "characterStyleIDs": char_ids,
+                                "styleOverrideTable": [
+                                    {
+                                        "styleID": 12,
+                                        "styleIdForText": {"guid": g(18, 2016)},
+                                        "textDecoration": "UNDERLINE",
+                                        "fillPaints": [
+                                            {
+                                                "type": "SOLID",
+                                                "visible": true,
+                                                "opacity": 1.0,
+                                                "blendMode": "NORMAL",
+                                                "color": {"r": 0.41, "g": 0.25, "b": 0.78, "a": 1.0}
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        "styleID": 13,
+                                        "styleIdForText": {"guid": g(18, 2016)},
+                                        "styleIdForFill": {"guid": null_g},
+                                        "fillPaints": [
+                                            {
+                                                "type": "SOLID",
+                                                "visible": true,
+                                                "opacity": 1.0,
+                                                "blendMode": "NORMAL",
+                                                "color": {"r": 0.09, "g": 0.11, "b": 0.15, "a": 1.0}
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            }),
+        ),
+    ];
+
+    // Pad past the 10_000-node fast_clone threshold so expand_instance takes the fast_clone path.
+    for i in 0..10_010u64 {
+        raw_nodes.push(node((5000, i + 1), (0, 2), "z", "RECTANGLE", "Pad", json!({})));
+    }
+
+    let doc = import_fig_node_changes(&Value::Array(raw_nodes), "NoteDoc").expect("import");
+    let inst = find(&doc, "Design note instance");
+    let child_id = *inst.children.first().expect("instance expanded");
+    let child = doc.get(child_id).expect("supporting text child");
+    assert!(child.component.overrides.contains(&OverrideField::Characters), "Characters override recorded");
+    let NodeKind::Text(tp) = &child.kind else { panic!("expected Text child") };
+    assert!(!tp.content.starts_with("Lorem ipsum"), "multi-paragraph override was lost and fell back to component Lorem ipsum: {:?}", tp.content);
+    assert_eq!(tp.content, overridden_text);
+    assert_eq!(tp.runs.len(), 3, "expected 3 styled runs in second paragraph");
+    assert_eq!(tp.runs[0].style.font_weight, 600, "run 0 inherits semibold (600) from linked styleIdForText 18:2016");
+    assert_eq!(tp.runs[1].style.font_weight, 600, "run 1 inherits semibold (600) from linked styleIdForText 18:2016");
+    assert_eq!(tp.runs[1].style.decoration, TextDecoration::Underline, "run 1 keeps inline UNDERLINE override");
+    assert_eq!(tp.runs[2].style.font_weight, 600, "run 2 inherits semibold (600) from linked styleIdForText 18:2016");
 }
 
 #[test]
@@ -2315,6 +2440,107 @@ fn counter_fill_child_keeps_its_cross_size_in_a_hugging_frame_through_a_fig_roun
     rt.relayout_subtree(rt_row);
     assert_eq!(find(&rt, "Row").size.y, 40.0, "the round trip must not change the cross size");
     assert_eq!(find(&rt, "FillChild").size.y, 40.0);
+}
+
+#[test]
+fn resized_instance_applies_stretch_and_scale_constraints_to_children_without_derived_data() {
+    let g = |s: u64, l: u64| -> Value { json!({"sessionID": s, "localID": l}) };
+    let node = |id: (u64, u64), parent: (u64, u64), pos: &str, ty: &str, name: &str, extra: Value| -> Value {
+        let mut v = json!({
+            "guid": g(id.0, id.1),
+            "parentIndex": {"guid": g(parent.0, parent.1), "position": pos},
+            "type": ty,
+            "name": name,
+            "phase": "CREATED",
+            "visible": true,
+            "opacity": 1.0,
+            "size": {"x": 160.0, "y": 160.0},
+            "transform": {"m00": 1.0, "m01": 0.0, "m02": 0.0, "m10": 0.0, "m11": 1.0, "m12": 0.0}
+        });
+        for (k, x) in extra.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        v
+    };
+    let changes = json!([
+        node((0, 0), (0, 0), "!", "DOCUMENT", "ResizedPieInstance", json!({})),
+        node((0, 1), (0, 0), "!", "CANVAS", "Page 1", json!({})),
+        node((1, 2), (0, 1), "!", "SYMBOL", "_Pie chart", json!({"size": {"x": 160.0, "y": 160.0}})),
+        node(
+            (1, 3),
+            (1, 2),
+            "!",
+            "ELLIPSE",
+            "Background",
+            json!({
+                "size": {"x": 160.0, "y": 160.0},
+                "horizontalConstraint": "STRETCH",
+                "verticalConstraint": "STRETCH",
+            }),
+        ),
+        node(
+            (1, 4),
+            (1, 2),
+            "\"",
+            "ELLIPSE",
+            "Series 2",
+            json!({
+                "size": {"x": 160.0, "y": 160.0},
+                "transform": {
+                    "m00": 0.5, "m01": 0.8660254, "m02": -29.282032,
+                    "m10": -0.8660254, "m11": 0.5, "m12": 109.282036
+                },
+                "horizontalConstraint": "STRETCH",
+                "verticalConstraint": "STRETCH",
+                "overrideKey": {"sessionID": 4294967295u64, "localID": 4294967295u64},
+            }),
+        ),
+        node(
+            (1, 5),
+            (1, 2),
+            "#",
+            "RECTANGLE",
+            "ScaledBadge",
+            json!({
+                "size": {"x": 40.0, "y": 40.0},
+                "transform": {
+                    "m00": 1.0, "m01": 0.0, "m02": 20.0,
+                    "m10": 0.0, "m11": 1.0, "m12": 40.0
+                },
+                "horizontalConstraint": "SCALE",
+                "verticalConstraint": "SCALE",
+            }),
+        ),
+        node(
+            (1, 10),
+            (0, 1),
+            "\"",
+            "INSTANCE",
+            "_Pie chart",
+            json!({
+                "size": {"x": 280.0, "y": 280.0},
+                "symbolData": {
+                    "symbolID": {"sessionID": 1, "localID": 2},
+                    "symbolOverrides": []
+                }
+            }),
+        ),
+    ]);
+    let doc = import_fig_node_changes(&changes, "ResizedPieInstance").expect("import ResizedPieInstance");
+    let inst = doc.nodes.values().find(|n| matches!(n.kind, NodeKind::Instance { .. })).expect("instance exists");
+    assert_eq!(inst.size, Vec2::new(280.0, 280.0));
+    let bg = inst.children.iter().filter_map(|id| doc.get(*id)).find(|n| n.name == "Background").expect("Background child");
+    assert_eq!(bg.size, Vec2::new(280.0, 280.0), "160x160 component with Stretch/Stretch child instanced at 280x280 must import child at 280x280");
+    assert_eq!((bg.transform.tx, bg.transform.ty), (0.0, 0.0));
+
+    let series2 = inst.children.iter().filter_map(|id| doc.get(*id)).find(|n| n.name == "Series 2").expect("Series 2 child");
+    assert_eq!(series2.size, Vec2::new(280.0, 280.0));
+    assert!((series2.transform.tx - (-51.243556)).abs() < 1e-3, "got tx={}", series2.transform.tx);
+    assert!((series2.transform.ty - 191.24356).abs() < 1e-3, "got ty={}", series2.transform.ty);
+
+    let badge = inst.children.iter().filter_map(|id| doc.get(*id)).find(|n| n.name == "ScaledBadge").expect("ScaledBadge child");
+    assert_eq!(badge.size, Vec2::new(70.0, 70.0));
+    assert_eq!((badge.transform.tx, badge.transform.ty), (35.0, 70.0));
 }
 
 #[test]
@@ -2435,6 +2661,150 @@ fn grid_auto_tracks_and_v106_track_maps_roundtrip() {
 
     let rt_al2 = find(&rt, "AutoRowsSizedGrid").kind.frame_props().unwrap().auto_layout.clone().unwrap();
     assert_eq!(rt_al2.grid_auto_tracks, GridAutoTracks::Track(GridTrack::Fixed(64.0)));
+}
+
+#[test]
+fn nested_instance_swap_updates_shell_fills_strokes_effects_and_reapplies_props() {
+    let g = |s: u64, l: u64| -> Value { json!({"sessionID": s, "localID": l}) };
+    let nc = |id: (u64, u64), parent: (u64, u64), pos: &str, ty: &str, name: &str, extra: Value| -> Value {
+        let mut v = json!({
+            "guid": g(id.0, id.1),
+            "parentIndex": {"guid": g(parent.0, parent.1), "position": pos},
+            "type": ty,
+            "name": name,
+            "phase": "CREATED",
+            "visible": true,
+            "opacity": 1.0,
+            "size": {"x": 150.0, "y": 36.0},
+            "transform": {"m00": 1.0, "m01": 0.0, "m02": 0.0, "m10": 0.0, "m11": 1.0, "m12": 0.0}
+        });
+        for (k, x) in extra.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        v
+    };
+    let purple_fill = json!([{"type": "SOLID", "visible": true, "opacity": 1.0, "color": {"r": 0.498, "g": 0.337, "b": 0.851, "a": 1.0}}]);
+    let purple_stroke = json!([{"type": "SOLID", "visible": true, "opacity": 1.0, "color": {"r": 1.0, "g": 1.0, "b": 1.0, "a": 0.12}}]);
+    let shadow_effect = json!([{"type": "DROP_SHADOW", "visible": true, "radius": 2.0, "spread": 0.0, "offset": {"x": 0.0, "y": 1.0}, "color": {"r": 0.0, "g": 0.0, "b": 0.0, "a": 0.05}}]);
+    let prop_defs = json!([{"id": g(100, 1), "name": "Icon leading", "type": "BOOL", "initialValue": {"boolValue": true}}]);
+    let icon_refs = json!([{"componentPropNodeField": "VISIBLE", "defID": g(100, 1)}]);
+
+    let changes = json!([
+        nc((0, 0), (0, 0), "!", "DOCUMENT", "ButtonSwapDoc", json!({})),
+        nc((0, 1), (0, 0), "!", "CANVAS", "Page 1", json!({})),
+        nc(
+            (1, 2),
+            (0, 1),
+            "!",
+            "SYMBOL",
+            "Hierarchy=Primary",
+            json!({
+                "size": {"x": 150.0, "y": 36.0},
+                "fillPaints": purple_fill,
+                "strokePaints": purple_stroke,
+                "strokeWeight": 2.0,
+                "effects": shadow_effect,
+                "cornerRadius": 8.0,
+                "stackMode": "HORIZONTAL",
+                "stackSpacing": 6.0,
+                "stackHorizontalPadding": 12.0,
+                "stackVerticalPadding": 8.0,
+                "componentPropDefs": prop_defs,
+            }),
+        ),
+        nc((1, 3), (1, 2), "!", "RECTANGLE", "Icon", json!({"size": {"x": 20.0, "y": 20.0}, "componentPropRefs": icon_refs})),
+        nc((1, 4), (1, 2), "\"", "TEXT", "Text", json!({"textData": {"characters": "Button"}, "size": {"x": 60.0, "y": 20.0}})),
+        nc(
+            (1, 5),
+            (0, 1),
+            "\"",
+            "SYMBOL",
+            "Hierarchy=Link color",
+            json!({
+                "size": {"x": 126.0, "y": 20.0},
+                "fillPaints": [],
+                "strokePaints": [],
+                "strokeWeight": 0.0,
+                "effects": [],
+                "cornerRadius": 0.0,
+                "stackMode": "HORIZONTAL",
+                "stackSpacing": 6.0,
+                "stackHorizontalPadding": 0.0,
+                "stackVerticalPadding": 0.0,
+                "componentPropDefs": prop_defs,
+            }),
+        ),
+        nc((1, 6), (1, 5), "!", "RECTANGLE", "Icon", json!({"size": {"x": 20.0, "y": 20.0}, "componentPropRefs": icon_refs})),
+        nc((1, 7), (1, 5), "\"", "TEXT", "Text", json!({"textData": {"characters": "Button"}, "size": {"x": 60.0, "y": 20.0}})),
+        nc((1, 10), (0, 1), "#", "SYMBOL", "Section footer", json!({"size": {"x": 343.0, "y": 40.0}}),),
+        nc(
+            (1, 11),
+            (1, 10),
+            "!",
+            "INSTANCE",
+            "ActionButton",
+            json!({
+                "size": {"x": 150.0, "y": 36.0},
+                "fillPaints": purple_fill,
+                "strokePaints": purple_stroke,
+                "strokeWeight": 2.0,
+                "effects": shadow_effect,
+                "cornerRadius": 8.0,
+                "stackMode": "HORIZONTAL",
+                "stackSpacing": 6.0,
+                "stackHorizontalPadding": 12.0,
+                "stackVerticalPadding": 8.0,
+                "symbolData": {
+                    "symbolID": g(1, 2),
+                    "symbolOverrides": []
+                },
+                "componentPropAssignments": [
+                    {"defID": g(100, 1), "value": {"boolValue": false}}
+                ],
+            }),
+        ),
+        nc(
+            (1, 20),
+            (0, 1),
+            "$",
+            "INSTANCE",
+            "FooterUse",
+            json!({
+                "size": {"x": 343.0, "y": 40.0},
+                "symbolData": {
+                    "symbolID": g(1, 10),
+                    "symbolOverrides": [
+                        {
+                            "guidPath": {"guids": [g(1, 11)]},
+                            "overriddenSymbolID": g(1, 5),
+                        },
+                        {
+                            "guidPath": {"guids": [g(1, 11), g(1, 7)]},
+                            "textData": {"characters": "View integration"},
+                        }
+                    ]
+                }
+            }),
+        ),
+    ]);
+
+    let doc = import_fig_node_changes(&changes, "ButtonSwapDoc").expect("import ButtonSwapDoc");
+    let link_comp = find(&doc, "Hierarchy=Link color").id;
+    let footer_use = find(&doc, "FooterUse");
+    let swapped_btn = footer_use.children.iter().filter_map(|id| doc.get(*id)).find(|n| n.name == "ActionButton").expect("ActionButton inside FooterUse");
+    assert_eq!(instance_component(swapped_btn), Some(link_comp));
+    assert!(swapped_btn.fills.is_empty(), "swapped Link color button must not keep Primary purple fill: {:?}", swapped_btn.fills);
+    assert!(swapped_btn.stroke.paints.is_empty(), "swapped Link color button must not keep Primary stroke");
+    assert!(swapped_btn.effects.is_empty(), "swapped Link color button must not keep Primary shadow");
+    assert_eq!(swapped_btn.corner_radii, [0.0; 4]);
+    assert_eq!(swapped_btn.size, Vec2::new(126.0, 20.0));
+    let al = swapped_btn.kind.frame_props().unwrap().auto_layout.as_ref().unwrap();
+    assert_eq!(al.padding, [0.0, 0.0, 0.0, 0.0]);
+    let icon = swapped_btn.children.iter().filter_map(|id| doc.get(*id)).find(|n| n.name == "Icon").expect("Icon inside ActionButton");
+    assert!(!icon.visible, "Icon leading = false assignment on ActionButton must be re-applied after swap");
+    let text = swapped_btn.children.iter().filter_map(|id| doc.get(*id)).find(|n| n.name == "Text").expect("Text inside ActionButton");
+    let NodeKind::Text(tp) = &text.kind else { panic!("expected text") };
+    assert_eq!(tp.content, "View integration");
 }
 
 #[test]
@@ -3098,10 +3468,11 @@ fn passthrough_color_struct_array_and_quoted_string_roundtrip() {
             "transform": {"m00": 1.0, "m01": 0.0, "m02": 0.0, "m10": 0.0, "m11": 1.0, "m12": 0.0},
             "slideSpeakerNotes": "\"quoted\"",
             "keyframeValue": {
-                "colorValue": {"r": 1.0, "g": 0.0, "b": 0.0}
+                "value": {"colorValue": {"r": 1.0, "g": 0.0, "b": 0.0}},
+                "valueType": "COLOR"
             },
             "variableWidthPoints": [
-                {"asymmetricStroke": false, "position": 0.25, "leadingWidth": 2.0, "trailingWidth": 4.0},
+                {"position": 0.25, "ascent": 2.0, "descent": 4.0},
                 {"position": "nope"}
             ]
         }
@@ -3118,8 +3489,8 @@ fn passthrough_color_struct_array_and_quoted_string_roundtrip() {
     // 2. A passthrough Color struct without `a` defaults `a` to 1.0 (opaque), not 0.0.
     let kf_raw = slide.fig_metadata.get("keyframeValue").expect("keyframeValue in fig_metadata");
     let kf_json: Value = serde_json::from_str(kf_raw).expect("parse keyframeValue JSON");
-    assert_eq!(kf_json["colorValue"]["r"].as_f64(), Some(1.0));
-    assert_eq!(kf_json["colorValue"]["a"].as_f64(), Some(1.0), "Color.a must default to 1.0 when omitted: {kf_json}");
+    assert_eq!(kf_json["value"]["colorValue"]["r"].as_f64(), Some(1.0));
+    assert_eq!(kf_json["value"]["colorValue"]["a"].as_f64(), Some(1.0), "Color.a must default to 1.0 when omitted: {kf_json}");
 
     // 3. One malformed element in an array must be skipped without dropping the valid elements.
     let vwp_raw = slide.fig_metadata.get("variableWidthPoints").expect("variableWidthPoints kept in fig_metadata");
@@ -3127,8 +3498,8 @@ fn passthrough_color_struct_array_and_quoted_string_roundtrip() {
     let arr = vwp_json.as_array().expect("variableWidthPoints array");
     assert_eq!(arr.len(), 1, "valid element must survive when a sibling element is malformed: {arr:?}");
     assert_eq!(arr[0]["position"].as_f64(), Some(0.25));
-    assert_eq!(arr[0]["leadingWidth"].as_f64(), Some(2.0));
-    assert_eq!(arr[0]["trailingWidth"].as_f64(), Some(4.0));
+    assert_eq!(arr[0]["ascent"].as_f64(), Some(2.0));
+    assert_eq!(arr[0]["descent"].as_f64(), Some(4.0));
 }
 
 #[test]

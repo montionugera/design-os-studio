@@ -4,7 +4,7 @@
 use crate::app::App;
 use crate::edit::Tx;
 use crate::layout;
-use designos_doc::{Affine, Command, Document, Node, NodeId, NodeKind, Vec2};
+use designos_doc::{Affine, Command, Document, Node, NodeId, NodeKind, PropKind, PropValue, Vec2};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -126,13 +126,18 @@ fn place_figma(app: &mut App, html: &str) -> Result<Vec<NodeId>, String> {
 
     let (mut lists, map) = instantiate_mapped(&mut app.doc, &clip);
     let mut new_roots = Vec::new();
+    let mut dropped_refs = 0usize;
     for nodes in &mut lists {
         for n in nodes.iter_mut() {
-            detach_foreign_refs(n, &map);
+            dropped_refs += detach_foreign_refs(n, &map);
         }
         if let Some(root) = nodes.first() {
             new_roots.push(root.id);
         }
+    }
+    let slot_roots: Vec<&Node> = lists.iter().filter_map(|l| l.first()).collect();
+    if let Some(err) = crate::ops::slot_edit_error(&app.doc, &[], Some((parent, &slot_roots))) {
+        return Err(err.to_string());
     }
     let mut tx = Tx::new();
     // Image bytes go through the same undo step as the layers that reference them.
@@ -149,6 +154,7 @@ fn place_figma(app: &mut App, html: &str) -> Result<Vec<NodeId>, String> {
             return Err(format!("Cannot paste from Figma: {e}"));
         }
     }
+    App::mark_slot_content_override(&mut app.doc, &mut tx.ed, parent);
     // Figma already laid the payload out, so its layers keep their sizes; only the ancestors (an auto-layout
     // or group parent) re-flow around them.
     for r in &new_roots {
@@ -169,20 +175,88 @@ fn place_figma(app: &mut App, html: &str) -> Result<Vec<NodeId>, String> {
     app.run_tx(tx);
     app.selection = new_roots.clone();
     app.fonts.load_for(&app.doc);
+    if dropped_refs > 0 {
+        app.show_toast(format!("Pasted from Figma ({dropped_refs} unknown component or slot reference(s) dropped)"), false);
+    }
     Ok(new_roots)
 }
 
 /// Rewrites references that pointed into the payload's document: component links follow `map` to the
 /// pasted copies, anything else (styles, variable bindings, prototype links) is dropped.
-fn detach_foreign_refs(n: &mut Node, map: &HashMap<NodeId, NodeId>) {
+/// Returns the number of unknown component, slot, or instance-swap target ids that were dropped.
+fn detach_foreign_refs(n: &mut Node, map: &HashMap<NodeId, NodeId>) -> usize {
+    let mut dropped = 0usize;
     if let NodeKind::Instance { component, .. } = &mut n.kind {
-        *component = component.and_then(|c| map.get(&c).copied());
+        if let Some(c) = *component {
+            if let Some(&mapped) = map.get(&c) {
+                *component = Some(mapped);
+            } else {
+                *component = None;
+                dropped += usize::from(c.0 != 0);
+            }
+        }
     }
     n.component.source = n.component.source.and_then(|s| map.get(&s).copied());
+    for prop in &mut n.component.props {
+        if let PropKind::InstanceSwap { preferred } = &mut prop.kind {
+            preferred.retain_mut(|id| {
+                if let Some(&mapped) = map.get(id) {
+                    *id = mapped;
+                    true
+                } else {
+                    dropped += usize::from(id.0 != 0);
+                    false
+                }
+            });
+        }
+        remap_foreign_prop_value(&mut prop.default, map, &mut dropped);
+    }
+    for val in n.component.values.values_mut() {
+        remap_foreign_prop_value(val, map, &mut dropped);
+    }
+    for cfg in n.component.slot_configs.values_mut() {
+        cfg.preferred.retain_mut(|id| {
+            if let Some(&mapped) = map.get(id) {
+                *id = mapped;
+                true
+            } else {
+                dropped += usize::from(id.0 != 0);
+                false
+            }
+        });
+    }
     n.style_refs.clear();
     n.variables = Default::default();
     n.prototype.reactions.clear();
     n.prototype.fixed_children = n.prototype.fixed_children.iter().filter_map(|c| map.get(c).copied()).collect();
+    dropped
+}
+
+fn remap_foreign_prop_value(val: &mut PropValue, map: &HashMap<NodeId, NodeId>, dropped: &mut usize) {
+    match val {
+        PropValue::Instance(id) => {
+            if id.0 != 0 {
+                if let Some(&mapped) = map.get(id) {
+                    *id = mapped;
+                } else {
+                    *id = NodeId(0);
+                    *dropped += 1;
+                }
+            }
+        }
+        PropValue::Slot(ids) => {
+            ids.retain_mut(|id| {
+                if let Some(&mapped) = map.get(id) {
+                    *id = mapped;
+                    true
+                } else {
+                    *dropped += usize::from(id.0 != 0);
+                    false
+                }
+            });
+        }
+        PropValue::Bool(_) | PropValue::Text(_) | PropValue::Variant(_) => {}
+    }
 }
 
 /// Places a dropped `.svg` file's markup centered on screen position `at`
@@ -205,6 +279,9 @@ pub fn drop_svg(app: &mut App, svg: &str, name: &str, at: Option<egui::Pos2>, nt
 /// step, and selects it.
 pub fn place_svg(app: &mut App, svg: &str, name: &str, center: Vec2, parent: NodeId) -> Result<NodeId, String> {
     let mut out = designos_svg::svg_to_nodes(svg, name, &mut || app.doc.alloc_id()).map_err(|e| format!("Cannot import SVG: {e}"))?;
+    if let Some(err) = crate::ops::slot_edit_error(&app.doc, &[], Some((parent, &[&out.nodes[0]]))) {
+        return Err(err.to_string());
+    }
     let inv = app.doc.world_transform(parent).invert().ok_or("Cannot place into a collapsed layer")?;
     let c = inv.apply(center);
     let size = out.nodes[0].size;
@@ -214,6 +291,7 @@ pub fn place_svg(app: &mut App, svg: &str, name: &str, center: Vec2, parent: Nod
     let index = app.doc.get(parent).map(|p| p.children.len()).unwrap_or(0);
     let mut tx = Tx::new();
     tx.cmd(&mut app.doc, Command::Insert { parent, index, nodes: out.nodes }).map_err(|e| e.to_string())?;
+    App::mark_slot_content_override(&mut app.doc, &mut tx.ed, parent);
     layout::relayout_around(&mut app.doc, &mut tx.ed, parent);
     app.run_tx(tx);
     app.selection = vec![root];
@@ -273,6 +351,8 @@ fn instantiate_mapped(doc: &mut Document, clip: &Clip) -> (Vec<Vec<Node>>, HashM
             let mut n = (*src).clone();
             n.id = map[&id];
             n.source_id = None;
+            // a slot content guid names one node; copies must not share it
+            n.component.slot_content_id = None;
             // connectors copied together with their nodes join the copies; a connector copied alone
             // keeps its nodes while they exist, and is left loose (at its last point) otherwise
             if let NodeKind::Connector(c) = &mut n.kind {
@@ -508,5 +588,114 @@ pub(crate) mod tests {
         assert!(legacy_json.contains("null"));
         let repaired = from_json(&legacy_json).expect("from_json repairs legacy null floats");
         assert_eq!((repaired.nodes[0].size.x, repaired.nodes[0].opacity), (0.0, 1.0));
+    }
+
+    #[test]
+    fn figma_paste_remaps_slot_and_swap_ids_and_drops_and_reports_unknown_ids() {
+        use designos_doc::{ComponentPropDef, FrameProps, PropKind, PropValue, SlotPropConfig};
+
+        let mut app = app_with_one_rect();
+        for _ in 0..15 {
+            let id = app.doc.alloc_id();
+            app.doc.insert(app.page, Node::rectangle(id, Rect::new(0.0, 0.0, 5.0, 5.0))).unwrap();
+        }
+        let pre_paste_ids: std::collections::HashSet<NodeId> = app.doc.nodes.keys().copied().collect();
+
+        // Build a Figma clipboard payload document where `ForeignIcon` lives on the internal library page
+        // (so `import_figma_clipboard` resolves its GUID to a valid `frag` NodeId, which is not in the
+        // pasted page roots and would alias an existing `app.doc` node if not dropped).
+        let mut frag_doc = Document::new("frag");
+        let fpage = frag_doc.add_page("Page");
+        let lib_page = frag_doc.alloc_id();
+        frag_doc.nodes.insert(lib_page, Node::new(lib_page, NodeKind::Page { background: designos_doc::Color::WHITE }));
+        frag_doc.library_page = Some(lib_page);
+
+        let foreign_icon_id = frag_doc.alloc_id();
+        let mut foreign_icon = Node::new(foreign_icon_id, NodeKind::Component(FrameProps::default()));
+        foreign_icon.name = "ForeignIcon".into();
+        frag_doc.insert(lib_page, foreign_icon).unwrap();
+
+        let local_icon_id = frag_doc.alloc_id();
+        let mut local_icon = Node::new(local_icon_id, NodeKind::Component(FrameProps::default()));
+        local_icon.name = "LocalIcon".into();
+        frag_doc.insert(fpage, local_icon).unwrap();
+
+        let panel_id = frag_doc.alloc_id();
+        let mut panel = Node::new(panel_id, NodeKind::Component(FrameProps::default()));
+        panel.name = "Panel".into();
+        panel.component.props = vec![
+            ComponentPropDef {
+                name: "SwapLocal#1:1".into(),
+                kind: PropKind::InstanceSwap { preferred: vec![local_icon_id, foreign_icon_id] },
+                default: PropValue::Instance(local_icon_id),
+            },
+            ComponentPropDef {
+                name: "SwapForeign#1:2".into(),
+                kind: PropKind::InstanceSwap { preferred: vec![foreign_icon_id] },
+                default: PropValue::Instance(foreign_icon_id),
+            },
+            ComponentPropDef { name: "Body#1:3".into(), kind: PropKind::Slot, default: PropValue::Slot(vec![]) },
+        ];
+        panel.component.slot_configs.insert("Body#1:3".into(), SlotPropConfig { preferred: vec![local_icon_id, foreign_icon_id], ..Default::default() });
+        frag_doc.insert(fpage, panel).unwrap();
+
+        let inst_id = frag_doc.alloc_id();
+        let mut panel_inst = Node::new(inst_id, NodeKind::Instance { component: Some(panel_id), component_key: None, frame: FrameProps::default() });
+        panel_inst.name = "PanelInst".into();
+        frag_doc.insert(fpage, panel_inst).unwrap();
+
+        let inst_slot_child_id = frag_doc.alloc_id();
+        let mut inst_slot_child = Node::frame(inst_slot_child_id, Rect::new(0.0, 0.0, 20.0, 20.0));
+        inst_slot_child.name = "InstSlotChild".into();
+        frag_doc.insert(inst_id, inst_slot_child).unwrap();
+
+        {
+            let inst_mut = frag_doc.get_mut(inst_id).unwrap();
+            inst_mut.component.values.insert("SwapLocal#1:1".into(), PropValue::Instance(local_icon_id));
+            inst_mut.component.values.insert("SwapForeign#1:2".into(), PropValue::Instance(foreign_icon_id));
+            inst_mut.component.values.insert("Body#1:3".into(), PropValue::Slot(vec![inst_slot_child_id, foreign_icon_id]));
+        }
+
+        let fig_bytes = designos_fig::export_fig(&frag_doc).unwrap();
+        assert!(paste_figma(&mut app, &figma_html(&fig_bytes)));
+
+        let local_icon = by_name(&app, "LocalIcon");
+        let panel = by_name(&app, "Panel");
+        let panel_inst = by_name(&app, "PanelInst");
+        let inst_slot_child = by_name(&app, "InstSlotChild");
+
+        assert!(!pre_paste_ids.contains(&local_icon.id));
+        assert!(!pre_paste_ids.contains(&inst_slot_child.id));
+
+        // 1. SlotPropConfig::preferred on Panel points only at pasted LocalIcon, dropping ForeignIcon
+        let slot_cfg = panel.component.slot_configs.get("Body").expect("Body slot config exists");
+        assert_eq!(slot_cfg.preferred, vec![local_icon.id], "slot_configs[*].preferred must remap pasted ids and drop unknown ids");
+
+        // 2. InstanceSwap::preferred and PropValue::Instance defaults on Panel
+        let swap_local_def = panel.component.props.iter().find(|p| p.name == "SwapLocal").unwrap();
+        assert_eq!(swap_local_def.kind, PropKind::InstanceSwap { preferred: vec![local_icon.id] });
+        assert_eq!(swap_local_def.default, PropValue::Instance(local_icon.id));
+
+        let swap_foreign_def = panel.component.props.iter().find(|p| p.name == "SwapForeign").unwrap();
+        assert_eq!(swap_foreign_def.kind, PropKind::InstanceSwap { preferred: vec![] });
+        assert_eq!(swap_foreign_def.default, PropValue::Instance(NodeId(0)), "unknown InstanceSwap default must not alias pre-existing node");
+
+        // 3. Instance prop values on PanelInst
+        assert_eq!(panel_inst.component.values.get("SwapLocal"), Some(&PropValue::Instance(local_icon.id)));
+        assert_eq!(
+            panel_inst.component.values.get("SwapForeign"),
+            Some(&PropValue::Instance(NodeId(0))),
+            "unknown Instance prop value must not alias pre-existing node"
+        );
+        assert_eq!(
+            panel_inst.component.values.get("Body"),
+            Some(&PropValue::Slot(vec![inst_slot_child.id])),
+            "instance PropValue::Slot must remap pasted ids and drop unknown ids"
+        );
+
+        // 4. Dropped unknown ids are reported via a non-error toast
+        let toast = app.toast.as_ref().expect("dropped unknown ids are reported");
+        assert!(!toast.error, "dropped foreign ref notice is informational, not a fatal error: {}", toast.text);
+        assert!(toast.text.contains("dropped"), "toast reports dropped references: {}", toast.text);
     }
 }

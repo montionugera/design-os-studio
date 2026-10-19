@@ -226,7 +226,8 @@ pub struct SlotPropConfig {
     /// `stretchChildOnInsert`: inserted content stretches to the slot's width.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stretch_child_on_insert: Option<bool>,
-    /// `displayByDefault`: the slot shows its content before anything is inserted.
+    /// `displayByDefault`: Figma's `displayEmptyByDefault` in `SlotSettings`. When set, empty instances of
+    /// the slot keep the slot highlight visible ("Show empty by default").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_by_default: Option<bool>,
     /// `minChildren`.
@@ -241,6 +242,9 @@ pub struct SlotPropConfig {
     /// Components offered for this slot (`preferredValues`), as local node ids.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub preferred: Vec<NodeId>,
+    /// Unmapped keys from `slotPropConfig` preserved across REST import and native JSON save/load.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -267,10 +271,15 @@ pub struct ComponentLink {
     /// The node is content placed in a slot (`isSlotContent`, tag=495).
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_slot_content: bool,
-    /// Guid (`session:local`) a node carries as `slot-content-id`. Kept opaque: it names
-    /// slot content that need not be a node of this document.
+    /// Guid (`session:local`) a node carries as its own `slot-content-id` (`jsonSerialized`).
+    /// Kept opaque: it names slot content that need not be a node of this document. It is not a
+    /// per-property value and is never derived from or turned into `slot_content_ids`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot_content_id: Option<String>,
+    /// Per-property slot content guid (`session:local`), keyed by slot property name. Read from
+    /// the `SLOT_CONTENT_ID` value of a property definition or assignment, and only from there.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub slot_content_ids: BTreeMap<String, String>,
     /// Binds a node property to a component property, e.g.
     /// `Visible -> "Show icon"`, `Characters -> "Label"`, `MainComponent -> "Icon"`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -315,6 +324,7 @@ impl ComponentLink {
             && !self.is_slot
             && !self.is_slot_content
             && self.slot_content_id.is_none()
+            && self.slot_content_ids.is_empty()
             && self.bindings.is_empty()
             && self.description.is_empty()
             && !self.expose_nested_instances

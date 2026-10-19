@@ -54,11 +54,12 @@ fn message_job(f: &Finding, color: Color32) -> egui::text::LayoutJob {
 }
 
 fn list_height(report: &Report) -> f32 {
+    let notes_h = (report.unreadable_libraries.len() as f32) * 28.0 + if report.truncated { NOTE_H } else { 0.0 };
     if report.findings.is_empty() {
-        return EMPTY_H + if report.truncated { NOTE_H } else { 0.0 };
+        return EMPTY_H + notes_h;
     }
     let groups = Rule::ALL.iter().filter(|r| report.of(**r).next().is_some()).count() as f32;
-    groups * GROUP_H + report.findings.len() as f32 * ROW_H + if report.truncated { NOTE_H } else { 0.0 }
+    groups * GROUP_H + report.findings.len() as f32 * ROW_H + notes_h
 }
 
 pub fn show(app: &mut App, ctx: &Context) {
@@ -81,9 +82,9 @@ pub fn show(app: &mut App, ctx: &Context) {
         let (rect, _) = ui.allocate_exact_size(size, Sense::click());
         widgets::record(ui, "check-designs-panel", rect);
         let p = ui.painter().clone();
-        widgets::elevation_400(&p, rect, theme::RADIUS_LARGE);
-        p.rect_filled(rect, theme::cr(theme::RADIUS_LARGE), theme::BG_MENU);
-        p.rect_stroke(rect, theme::cr(theme::RADIUS_LARGE), Stroke::new(1.0, theme::BORDER_MENU), StrokeKind::Inside);
+        widgets::elevation_400(&p, rect, theme::RADIUS_FRAME);
+        p.rect_filled(rect, theme::cr(theme::RADIUS_FRAME), theme::BG_MENU);
+        p.rect_stroke(rect, theme::cr(theme::RADIUS_FRAME), Stroke::new(1.0, theme::BORDER_MENU), StrokeKind::Inside);
 
         // Header: title and close.
         p.text(Pos2::new(rect.left() + PAD, rect.top() + HEADER_H / 2.0), Align2::LEFT_CENTER, "Check designs", theme::font_large_strong(), theme::TEXT);
@@ -116,7 +117,7 @@ pub fn show(app: &mut App, ctx: &Context) {
             (true, false) => (theme::BG_BRAND, Color32::WHITE),
             (false, _) => (theme::BG_TERTIARY, theme::TEXT_DISABLED),
         };
-        p.rect_filled(fix_all, theme::cr(theme::RADIUS_MEDIUM), bg);
+        p.rect_filled(fix_all, theme::cr(theme::RADIUS_CONTROL), bg);
         p.text(fix_all.center(), Align2::CENTER_CENTER, "Fix all", theme::font_body_medium(), fg);
         if fixable > 0 && resp.on_hover_text(format!("Apply {fixable} fixes as one undo step")).clicked() {
             act = Some(Act::FixAll);
@@ -129,6 +130,9 @@ pub fn show(app: &mut App, ctx: &Context) {
             egui::ScrollArea::vertical().id_salt("check-designs-list").max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
                 ui.set_width(PANEL_W);
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
+                for lib_name in &report.unreadable_libraries {
+                    unreadable_library_note(ui, lib_name);
+                }
                 if report.findings.is_empty() {
                     empty_state(ui, report.scanned);
                 }
@@ -183,12 +187,12 @@ fn group_header(ui: &mut Ui, rule: Rule, count: usize) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(PANEL_W, GROUP_H), Sense::hover());
     let p = ui.painter();
     let title = rule.title();
-    let font = theme::font_body_semibold();
+    let font = theme::font_body_strong();
     p.text(Pos2::new(rect.left() + PAD, rect.center().y), Align2::LEFT_CENTER, title, font.clone(), theme::TEXT_SECONDARY);
     let tw = widgets::text_width(p, title, &font);
     let badge = Rect::from_center_size(Pos2::new(rect.left() + PAD + tw + 8.0 + 10.0, rect.center().y), Vec2::new(20.0, 16.0));
-    p.rect_filled(badge, theme::cr(theme::RADIUS_LARGE), theme::BG_TERTIARY);
-    p.text(badge.center(), Align2::CENTER_CENTER, count.to_string(), theme::font_small_medium(), theme::TEXT);
+    p.rect_filled(badge, theme::cr(theme::RADIUS_FRAME), theme::BG_TERTIARY);
+    p.text(badge.center(), Align2::CENTER_CENTER, count.to_string(), theme::font_caption_medium(), theme::TEXT);
 }
 
 fn row(ui: &mut Ui, idx: usize, f: &Finding) -> Option<Act> {
@@ -206,8 +210,16 @@ fn row(ui: &mut Ui, idx: usize, f: &Finding) -> Option<Act> {
     icons::paint(&p, icon, Pos2::new(rect.left() + PAD + 8.0, rect.top() + 16.0), 14.0, tint);
     let text_x = rect.left() + PAD + ICON_COL;
     let has_fix = f.fix.is_some();
-    let name = widgets::elide(&p, &f.node_name, &theme::font_body_medium(), message_width(has_fix));
-    p.text(Pos2::new(text_x, rect.top() + 16.0), Align2::LEFT_CENTER, name, theme::font_body_medium(), theme::TEXT);
+    let from_lib = f.is_from_library();
+    let badge_w = if from_lib { 48.0 } else { 0.0 };
+    let name = widgets::elide(&p, &f.node_name, &theme::font_body_medium(), (message_width(has_fix) - badge_w).max(40.0));
+    p.text(Pos2::new(text_x, rect.top() + 16.0), Align2::LEFT_CENTER, &name, theme::font_body_medium(), theme::TEXT);
+    if from_lib {
+        let nw = widgets::text_width(&p, &name, &theme::font_body_medium());
+        let badge = Rect::from_min_size(Pos2::new(text_x + nw + 6.0, rect.top() + 8.0), Vec2::new(42.0, 16.0));
+        p.rect_filled(badge, theme::cr(theme::RADIUS_MARK), theme::BG_TERTIARY);
+        p.text(badge.center(), Align2::CENTER_CENTER, "Library", theme::font_caption(), theme::TEXT_SECONDARY);
+    }
     let galley = p.layout_job(message_job(f, theme::TEXT_SECONDARY));
     p.galley(Pos2::new(text_x, rect.top() + 26.0), galley, theme::TEXT_SECONDARY);
     widgets::hline(&p, rect.left() + PAD, rect.right() - PAD, rect.bottom() - 1.0, theme::BORDER_SUBTLE);
@@ -217,7 +229,7 @@ fn row(ui: &mut Ui, idx: usize, f: &Finding) -> Option<Act> {
         let btn = Rect::from_min_size(Pos2::new(rect.right() - PAD - FIX_W, rect.top() + 8.0), Vec2::new(FIX_W, BTN_H));
         widgets::record(ui, &format!("check-designs-fix-{idx}"), btn);
         let resp = ui.interact(btn, Id::new(("check-designs-fix", idx)), Sense::click());
-        p.rect_filled(btn, theme::cr(theme::RADIUS_MEDIUM), if resp.hovered() { theme::BG_PRESSED } else { theme::BG_TERTIARY });
+        p.rect_filled(btn, theme::cr(theme::RADIUS_CONTROL), if resp.hovered() { theme::BG_PRESSED } else { theme::BG_TERTIARY });
         p.text(btn.center(), Align2::CENTER_CENTER, "Fix", theme::font_body_medium(), theme::TEXT);
         if resp.on_hover_text(f.fix_label.clone()).clicked() {
             act = Some(Act::Fix(idx));
@@ -226,11 +238,21 @@ fn row(ui: &mut Ui, idx: usize, f: &Finding) -> Option<Act> {
     act
 }
 
+fn unreadable_library_note(ui: &mut Ui, name: &str) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(PANEL_W, 28.0), Sense::hover());
+    widgets::record(ui, "check-designs-unreadable-library", rect);
+    let p = ui.painter();
+    let note = format!("Library \"{name}\" couldn't be read; its suggestions are missing");
+    let txt = widgets::elide(p, &note, &theme::font_caption(), PANEL_W - 2.0 * PAD);
+    p.text(Pos2::new(rect.left() + PAD, rect.center().y), Align2::LEFT_CENTER, txt, theme::font_caption(), theme::TEXT_SECONDARY);
+    widgets::hline(p, rect.left() + PAD, rect.right() - PAD, rect.bottom() - 1.0, theme::BORDER_SUBTLE);
+}
+
 fn empty_state(ui: &mut Ui, scanned: usize) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(PANEL_W, EMPTY_H), Sense::hover());
     let p = ui.painter();
     icons::paint(p, Icon::Check, Pos2::new(rect.center().x, rect.top() + 28.0), 20.0, STATUS_OK_TEXT);
-    p.text(Pos2::new(rect.center().x, rect.top() + 52.0), Align2::CENTER_CENTER, "No issues found", theme::font_body_semibold(), theme::TEXT);
+    p.text(Pos2::new(rect.center().x, rect.top() + 52.0), Align2::CENTER_CENTER, "No issues found", theme::font_body_strong(), theme::TEXT);
     let note = format!("Hard-coded values, contrast and detached instances were checked on {scanned} layers.");
     let galley = p.layout(note, theme::font_body(), theme::TEXT_SECONDARY, PANEL_W - 2.0 * PAD - 24.0);
     p.galley(Pos2::new(rect.center().x - galley.size().x / 2.0, rect.top() + 66.0), galley, theme::TEXT_SECONDARY);
@@ -240,9 +262,9 @@ fn truncation_note(ui: &mut Ui) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(PANEL_W, NOTE_H), Sense::hover());
     let p = ui.painter();
     let inner = rect.shrink2(Vec2::new(PAD, 6.0));
-    p.rect_filled(inner, theme::cr(theme::RADIUS_MEDIUM), STATUS_WARN_BG);
-    p.rect_stroke(inner, theme::cr(theme::RADIUS_MEDIUM), Stroke::new(1.0, STATUS_WARN_BORDER), StrokeKind::Inside);
+    p.rect_filled(inner, theme::cr(theme::RADIUS_CONTROL), STATUS_WARN_BG);
+    p.rect_stroke(inner, theme::cr(theme::RADIUS_CONTROL), Stroke::new(1.0, STATUS_WARN_BORDER), StrokeKind::Inside);
     let note = format!("Stopped after {MAX_SCANNED_LAYERS} layers. Select fewer layers to check the rest.");
-    let galley = p.layout(note, theme::font_body(), STATUS_WARN_TEXT, inner.width() - 16.0);
-    p.galley(Pos2::new(inner.left() + 8.0, inner.center().y - galley.size().y / 2.0), galley, STATUS_WARN_TEXT);
+    let galley = p.layout(note, theme::font_body(), STATUS_WARN_TEXT, inner.width() - theme::SPACE_BLOCK);
+    p.galley(Pos2::new(inner.left() + theme::SPACE_INLINE, inner.center().y - galley.size().y / 2.0), galley, STATUS_WARN_TEXT);
 }

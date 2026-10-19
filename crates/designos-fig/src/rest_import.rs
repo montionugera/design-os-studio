@@ -561,10 +561,12 @@ pub(crate) fn import_rest_value_owned<'a>(
         connectors: Vec::new(),
         deferred_pending: None,
     };
-    if let Some(comps) = v.get("components").and_then(Value::as_object) {
-        for (id, c) in comps {
-            if let Some(k) = fstr(c, "key") {
-                cx.component_keys.insert(id.clone(), k.to_string());
+    for section in ["components", "componentSets"] {
+        if let Some(comps) = v.get(section).and_then(Value::as_object) {
+            for (id, c) in comps {
+                if let Some(k) = fstr(c, "key") {
+                    cx.component_keys.insert(id.clone(), k.to_string());
+                }
             }
         }
     }
@@ -672,10 +674,12 @@ pub(crate) fn import_rest_value_with_blobs<'a>(
         connectors: Vec::new(),
         deferred_pending: None,
     };
-    if let Some(comps) = v.get("components").and_then(Value::as_object) {
-        for (id, c) in comps {
-            if let Some(k) = fstr(c, "key") {
-                cx.component_keys.insert(id.clone(), k.to_string());
+    for section in ["components", "componentSets"] {
+        if let Some(comps) = v.get(section).and_then(Value::as_object) {
+            for (id, c) in comps {
+                if let Some(k) = fstr(c, "key") {
+                    cx.component_keys.insert(id.clone(), k.to_string());
+                }
             }
         }
     }
@@ -771,11 +775,17 @@ impl<'a> Ctx<'a> {
             self.ids.insert(src.clone(), id);
         }
         crate::proto::apply_scroll(&mut node, &v);
-        if let Some(k) = fstr(&v, "_overrideKey") {
+        if let Some(k) = fstr(&v, "_overrideKey").filter(|k| *k != "4294967295:4294967295") {
             self.override_keys.insert(id, std::sync::Arc::from(k));
         }
-        if let (Some(k), true) = (fstr(&v, "componentKey"), matches!(node.kind, NodeKind::Component(_) | NodeKind::ComponentSet(_))) {
-            self.library_keys.insert(id, (k.to_string(), fstr(&v, "sourceLibraryKey").map(String::from)));
+        if matches!(node.kind, NodeKind::Component(_) | NodeKind::ComponentSet(_)) {
+            // The file's `components` / `componentSets` maps carry the publish key of a component
+            // that has no `componentKey` field of its own; keep it the same way.
+            let map_key = node.source_id.as_deref().and_then(|s| self.component_keys.get(s)).map(String::as_str);
+            if let Some(k) = fstr(&v, "componentKey").or(map_key) {
+                node.fig_metadata.entry("componentKey".into()).or_insert_with(|| k.to_string());
+                self.library_keys.insert(id, (k.to_string(), fstr(&v, "sourceLibraryKey").map(String::from)));
+            }
         }
         let is_instance = matches!(node.kind, NodeKind::Instance { .. });
         let origin = abs_origin(&v).unwrap_or(pinfo.origin);
@@ -869,11 +879,17 @@ impl<'a> Ctx<'a> {
             self.ids.insert(src.clone(), id);
         }
         crate::proto::apply_scroll(&mut node, v);
-        if let Some(k) = fstr(v, "_overrideKey") {
+        if let Some(k) = fstr(v, "_overrideKey").filter(|k| *k != "4294967295:4294967295") {
             self.override_keys.insert(id, std::sync::Arc::from(k));
         }
-        if let (Some(k), true) = (fstr(v, "componentKey"), matches!(node.kind, NodeKind::Component(_) | NodeKind::ComponentSet(_))) {
-            self.library_keys.insert(id, (k.to_string(), fstr(v, "sourceLibraryKey").map(String::from)));
+        if matches!(node.kind, NodeKind::Component(_) | NodeKind::ComponentSet(_)) {
+            // The file's `components` / `componentSets` maps carry the publish key of a component
+            // that has no `componentKey` field of its own; keep it the same way.
+            let map_key = node.source_id.as_deref().and_then(|s| self.component_keys.get(s)).map(String::as_str);
+            if let Some(k) = fstr(v, "componentKey").or(map_key) {
+                node.fig_metadata.entry("componentKey".into()).or_insert_with(|| k.to_string());
+                self.library_keys.insert(id, (k.to_string(), fstr(v, "sourceLibraryKey").map(String::from)));
+            }
         }
         let is_instance = matches!(node.kind, NodeKind::Instance { .. });
         let origin = abs_origin(v).unwrap_or(pinfo.origin);
@@ -1214,6 +1230,30 @@ impl<'a> Ctx<'a> {
                 let name = prop_name(key);
                 let dv = d.get("defaultValue");
                 let text = || dv.and_then(Value::as_str).unwrap_or("").to_string();
+                let extract_prefs = |d: &Value| -> Vec<String> {
+                    let mut out = Vec::new();
+                    if let Some(pv) = d.get("preferredValues") {
+                        if pv.is_object() {
+                            for entry in farr(pv, "instanceSwapValues") {
+                                if let Some(k) = fstr(entry, "key") {
+                                    out.push(k.to_string());
+                                }
+                            }
+                            for s in farr(pv, "stringValues") {
+                                if let Some(k) = s.as_str() {
+                                    out.push(k.to_string());
+                                }
+                            }
+                        } else {
+                            for p in farr(d, "preferredValues") {
+                                if let Some(ps) = p.as_str().or_else(|| fstr(p, "key")) {
+                                    out.push(ps.to_string());
+                                }
+                            }
+                        }
+                    }
+                    out
+                };
                 let (kind, default) = match fstr(d, "type") {
                     Some("BOOLEAN") => (PropKind::Boolean, PropValue::Bool(dv.and_then(Value::as_bool).unwrap_or(true))),
                     Some("TEXT") => (PropKind::Text, PropValue::Text(text())),
@@ -1223,16 +1263,24 @@ impl<'a> Ctx<'a> {
                     ),
                     Some("INSTANCE_SWAP") => {
                         self.pending_swaps.push((id, name.clone(), text(), true));
-                        for p in farr(d, "preferredValues") {
-                            if let Some(ps) = p.as_str().or_else(|| fstr(p, "key")) {
-                                self.pending_swaps.push((id, name.clone(), format!("PREF:{ps}"), true));
-                            }
+                        for ps in extract_prefs(d) {
+                            self.pending_swaps.push((id, name.clone(), format!("PREF:{ps}"), true));
                         }
                         (PropKind::InstanceSwap { preferred: Vec::new() }, PropValue::Instance(NodeId(0)))
                     }
                     Some("SLOT") => {
                         if let Some(cfg) = d.get("slotPropConfig").and_then(Value::as_object) {
                             let opt_u32 = |k: &str| cfg.get(k).and_then(Value::as_u64).map(|x| x.min(u64::from(u32::MAX)) as u32);
+                            let extra = cfg
+                                .iter()
+                                .filter(|(k, _)| {
+                                    !matches!(
+                                        k.as_str(),
+                                        "stretchChildOnInsert" | "displayByDefault" | "minChildren" | "maxChildren" | "allowPreferredValuesOnly"
+                                    )
+                                })
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect();
                             n.component.slot_configs.insert(
                                 name.clone(),
                                 SlotPropConfig {
@@ -1242,13 +1290,15 @@ impl<'a> Ctx<'a> {
                                     max_children: opt_u32("maxChildren"),
                                     allow_preferred_values_only: cfg.get("allowPreferredValuesOnly").and_then(Value::as_bool),
                                     preferred: Vec::new(),
+                                    extra,
                                 },
                             );
                         }
-                        for p in farr(d, "preferredValues") {
-                            if let Some(ps) = p.as_str().or_else(|| fstr(p, "key")) {
-                                self.pending_swaps.push((id, name.clone(), format!("SLOTPREF:{ps}"), true));
-                            }
+                        for ps in extract_prefs(d) {
+                            self.pending_swaps.push((id, name.clone(), format!("SLOTPREF:{ps}"), true));
+                        }
+                        if let Some(scid) = fstr(d, "slotContentId").filter(|s| !s.is_empty()) {
+                            n.component.slot_content_ids.insert(name.clone(), scid.to_string());
                         }
                         (PropKind::Slot, PropValue::Slot(Vec::new()))
                     }
@@ -1271,9 +1321,16 @@ impl<'a> Ctx<'a> {
                         PropValue::Instance(NodeId(0))
                     }
                     Some("SLOT") => {
-                        let s = text();
-                        self.pending_swaps.push((id, name.clone(), format!("SLOT:{s}"), false));
-                        PropValue::Slot(Vec::new())
+                        if let Some(scid) = fstr(d, "slotContentId").filter(|s| !s.is_empty()) {
+                            n.component.slot_content_ids.insert(name.clone(), scid.to_string());
+                        }
+                        if val.is_some() {
+                            let s = text();
+                            self.pending_swaps.push((id, name.clone(), format!("SLOT:{s}"), false));
+                            PropValue::Slot(Vec::new())
+                        } else {
+                            continue;
+                        }
                     }
                     _ => continue,
                 };
@@ -1557,10 +1614,18 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    fn resolve_pref_target(&self, pref_key: &str) -> Option<NodeId> {
+        self.ids
+            .get(pref_key)
+            .copied()
+            .or_else(|| self.library_keys.iter().find_map(|(&nid, (k, _))| (k == pref_key).then_some(nid)))
+            .or_else(|| self.component_keys.iter().find_map(|(sid, k)| (k == pref_key).then(|| self.ids.get(sid).copied()).flatten()))
+    }
+
     fn resolve_swaps(&mut self) {
         for (node, name, rest_id, is_def) in std::mem::take(&mut self.pending_swaps) {
             if let Some(pref_key) = rest_id.strip_prefix("PREF:") {
-                let Some(&target) = self.ids.get(pref_key) else { continue };
+                let Some(target) = self.resolve_pref_target(pref_key) else { continue };
                 let Some(n) = self.doc.get_mut(node) else { continue };
                 if let Some(d) = n.component.props.iter_mut().find(|d| d.name == name) {
                     if let PropKind::InstanceSwap { preferred } = &mut d.kind {
@@ -1572,7 +1637,7 @@ impl<'a> Ctx<'a> {
                 continue;
             }
             if let Some(pref_key) = rest_id.strip_prefix("SLOTPREF:") {
-                let Some(&target) = self.ids.get(pref_key) else { continue };
+                let Some(target) = self.resolve_pref_target(pref_key) else { continue };
                 let Some(n) = self.doc.get_mut(node) else { continue };
                 // A slot may list preferred components without ever writing a `slotPropConfig`.
                 let cfg = n.component.slot_configs.entry(name).or_default();
@@ -1589,7 +1654,10 @@ impl<'a> Ctx<'a> {
                         .split(',')
                         .filter_map(|part| {
                             let part = part.trim();
-                            self.ids.get(part).copied().or_else(|| part.parse::<u64>().ok().map(NodeId))
+                            if part.parse::<u64>().is_ok() {
+                                return None;
+                            }
+                            self.ids.get(part).copied()
                         })
                         .collect()
                 };
@@ -1835,24 +1903,46 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// Points the nested instance `d` at `target` and rebuilds its children.
+    /// Points the nested instance `d` at `target`, updates its component shell
+    /// properties to `target`'s defaults, rebuilds its children, and re-applies
+    /// `d`'s own component property values.
     fn swap_nested(&mut self, d: NodeId, target: NodeId, targets: &BTreeMap<NodeId, NodeId>, done: &mut BTreeSet<NodeId>) {
         let current = match self.doc.get(d).map(|n| &n.kind) {
             Some(NodeKind::Instance { component, .. }) => *component,
             _ => return,
         };
-        if current == Some(target) || !matches!(self.doc.get(target).map(|n| &n.kind), Some(NodeKind::Component(_))) {
+        if current == Some(target) {
             return;
         }
+        let Some(target_node) = self.doc.get(target).cloned() else {
+            return;
+        };
+        let NodeKind::Component(target_fp) = &target_node.kind else {
+            return;
+        };
         self.expand_nested(target, targets, done);
         for k in self.doc.get(d).map(|n| n.children.clone()).unwrap_or_default() {
             let _ = self.doc.remove(k);
         }
-        if let Some(NodeKind::Instance { component, component_key, .. }) = self.doc.get_mut(d).map(|n| &mut n.kind) {
-            *component = Some(target);
-            *component_key = None;
+        if let Some(dn) = self.doc.get_mut(d) {
+            dn.kind = NodeKind::Instance { frame: target_fp.clone(), component: Some(target), component_key: None };
+            dn.size = target_node.size;
+            dn.fills = target_node.fills;
+            dn.stroke = target_node.stroke;
+            dn.effects = target_node.effects;
+            dn.opacity = target_node.opacity;
+            dn.blend = target_node.blend;
+            dn.is_mask = target_node.is_mask;
+            dn.corner_radii = target_node.corner_radii;
+            dn.corner_smoothing = target_node.corner_smoothing;
+            dn.fill_geometry = target_node.fill_geometry;
+            dn.stroke_geometry = target_node.stroke_geometry;
+            dn.style_refs = target_node.style_refs;
+            dn.variables.bindings = target_node.variables.bindings;
+            dn.component.variant_props = target_node.component.variant_props;
         }
         self.expand_instance(d, target);
+        self.apply_props(d, targets, done);
     }
 
     /// `.fig` library components of internal-only canvases become external
@@ -1864,10 +1954,15 @@ impl<'a> Ctx<'a> {
             return;
         }
         let keys = std::mem::take(&mut self.library_keys);
+        let mut lib_comp_keys: HashMap<NodeId, String> = HashMap::new();
         for (node, (key, lib)) in &keys {
             let Some(n) = self.doc.get(*node) else { continue };
+            if !self.doc.is_ancestor(lp, *node) {
+                continue;
+            }
+            lib_comp_keys.insert(*node, key.clone());
             let in_set = n.parent.and_then(|p| self.doc.get(p)).is_some_and(|p| matches!(p.kind, NodeKind::ComponentSet(_)));
-            if in_set || !self.doc.is_ancestor(lp, *node) {
+            if in_set {
                 continue;
             }
             let kind = if matches!(n.kind, NodeKind::ComponentSet(_)) { LibraryAssetKind::ComponentSet } else { LibraryAssetKind::Component };
@@ -1877,7 +1972,7 @@ impl<'a> Ctx<'a> {
         for n in self.doc.nodes.values_mut() {
             if let NodeKind::Instance { component: Some(comp), component_key, .. } = &mut n.kind {
                 if component_key.is_none() {
-                    if let Some((key, _)) = keys.get(comp) {
+                    if let Some(key) = lib_comp_keys.get(comp) {
                         *component_key = Some(key.clone());
                     }
                 }
@@ -1994,6 +2089,73 @@ impl<'a> Ctx<'a> {
             }
             if container {
                 stack.extend(orig_children.into_iter().rev().map(|c| (c, id)));
+            }
+        }
+        if !self.scales.contains_key(&inst) {
+            let old = self.doc.get(comp).map(|n| n.size).unwrap_or_default();
+            let new = self.doc.get(inst).map(|n| n.size).unwrap_or_default();
+            if (new.x - old.x).abs() > 1e-4 || (new.y - old.y).abs() > 1e-4 {
+                self.apply_instance_constraints(inst, old, new, 16);
+            }
+        }
+    }
+
+    /// Applies horizontal and vertical [`Constraint`]s to the children of a
+    /// resized instance container (`old` -> `new`) before instance overrides
+    /// and `derivedSymbolData` run.
+    fn apply_instance_constraints(&mut self, parent: NodeId, old: Vec2, new: Vec2, depth: usize) {
+        if depth == 0 || old.x <= 0.0 || old.y <= 0.0 {
+            return;
+        }
+        let (has_al, children) = match self.doc.get(parent) {
+            Some(p) => (p.kind.frame_props().and_then(|f| f.auto_layout.as_ref()).is_some(), p.children.clone()),
+            None => return,
+        };
+        let dw = new.x - old.x;
+        let dh = new.y - old.y;
+        let rx = new.x / old.x;
+        let ry = new.y / old.y;
+        for c in children {
+            let Some(k) = self.doc.get(c) else { continue };
+            if has_al && !k.layout_child.absolute {
+                continue;
+            }
+            let old_child = k.size;
+            let t = k.transform;
+            let old_center = t.apply(Vec2::new(old_child.x * 0.5, old_child.y * 0.5));
+            let old_left = old_center.x - old_child.x * 0.5;
+            let old_top = old_center.y - old_child.y * 0.5;
+            let (new_left, new_w) = match k.constraints.horizontal {
+                Constraint::Min => (old_left, old_child.x),
+                Constraint::Max => (old_left + dw, old_child.x),
+                Constraint::Center => (old_left + dw * 0.5, old_child.x),
+                Constraint::Stretch => (old_left, (old_child.x + dw).max(1.0)),
+                Constraint::Scale => (old_left * rx, (old_child.x * rx).max(1.0)),
+            };
+            let (new_top, new_h) = match k.constraints.vertical {
+                Constraint::Min => (old_top, old_child.y),
+                Constraint::Max => (old_top + dh, old_child.y),
+                Constraint::Center => (old_top + dh * 0.5, old_child.y),
+                Constraint::Stretch => (old_top, (old_child.y + dh).max(1.0)),
+                Constraint::Scale => (old_top * ry, (old_child.y * ry).max(1.0)),
+            };
+            let new_size = Vec2::new(new_w, new_h);
+            let new_center = Vec2::new(new_left + new_w * 0.5, new_top + new_h * 0.5);
+            let new_tx = new_center.x - (t.a * new_w * 0.5 + t.c * new_h * 0.5);
+            let new_ty = new_center.y - (t.b * new_w * 0.5 + t.d * new_h * 0.5);
+            let size_changed = (new_size.x - old_child.x).abs() > 1e-4 || (new_size.y - old_child.y).abs() > 1e-4;
+            let is_container = k.kind.is_container();
+            if let Some(km) = self.doc.get_mut(c) {
+                km.transform.tx = new_tx;
+                km.transform.ty = new_ty;
+                km.size = new_size;
+                if size_changed && !matches!(km.kind, NodeKind::Vector { .. } | NodeKind::BooleanOp(_)) {
+                    km.fill_geometry = None;
+                    km.stroke_geometry = None;
+                }
+            }
+            if size_changed && is_container {
+                self.apply_instance_constraints(c, old_child, new_size, depth - 1);
             }
         }
     }
@@ -2127,16 +2289,31 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    fn source_tail_of(&self, mut id: NodeId) -> Option<&str> {
+        for _ in 0..8 {
+            let n = self.doc.get(id)?;
+            if let Some(s) = n.source_id.as_deref() {
+                let tail = s.rsplit(';').next().unwrap_or(s);
+                if !tail.is_empty() {
+                    return Some(tail);
+                }
+            }
+            let src = n.component.source?;
+            if src == id {
+                return None;
+            }
+            id = src;
+        }
+        None
+    }
+
     fn node_matches(&self, c: NodeId, g: &str) -> bool {
         if let Some(k) = self.override_key_of(c) {
             if &**k == g {
                 return true;
             }
         }
-        self.doc.get(c).is_some_and(|n| {
-            let s = n.source_id.as_deref().unwrap_or("");
-            s.rsplit(';').next().unwrap_or(s) == g
-        })
+        self.source_tail_of(c) == Some(g)
     }
 
     fn build_subtree_lookup(&self, root: NodeId) -> HashMap<String, NodeId> {
@@ -2149,12 +2326,9 @@ impl<'a> Ctx<'a> {
                     map.insert(k.to_string(), c);
                 }
             }
-            if let Some(cn) = self.doc.get(c) {
-                if let Some(s) = cn.source_id.as_deref() {
-                    let tail = s.rsplit(';').next().unwrap_or(s);
-                    if !tail.is_empty() && ok.map(|x| &**x) != Some(tail) && !map.contains_key(tail) {
-                        map.insert(tail.to_string(), c);
-                    }
+            if let Some(tail) = self.source_tail_of(c) {
+                if ok.map(|x| &**x) != Some(tail) && !map.contains_key(tail) {
+                    map.insert(tail.to_string(), c);
                 }
             }
         }
@@ -2172,9 +2346,8 @@ impl<'a> Ctx<'a> {
                     map.insert(k.to_string(), n);
                 }
             }
-            if let Some(s) = nn.source_id.as_deref() {
-                let tail = s.rsplit(';').next().unwrap_or(s);
-                if !tail.is_empty() && ok.map(|x| &**x) != Some(tail) && !map.contains_key(tail) {
+            if let Some(tail) = self.source_tail_of(n) {
+                if ok.map(|x| &**x) != Some(tail) && !map.contains_key(tail) {
                     map.insert(tail.to_string(), n);
                 }
             }
