@@ -1152,6 +1152,9 @@ impl Shell {
         }
         // Agent edits that arrived during a drag or text edit land once it has ended.
         crate::live_patch_apply::apply_pending_live_patches(&mut self.app);
+        if !self.app.doc.prune_in_progress().is_empty() {
+            self.app.changed();
+        }
         if full_vars {
             // The local-variables full view replaces the left panel, canvas and right panel.
             rail::show(&mut self.app, ui, rail_rect);
@@ -1332,6 +1335,11 @@ pub fn execute_terminal_actions(app: &mut App, actions: Vec<crate::terminal::Ter
                 match crate::terminal::export_selection_and_comments_to_pty(&mut app.terminal, &app.doc, app.page, &app.selection, app.file_path.as_deref()) {
                     Ok(p) => app.show_toast(format!("Sent selection & comments -> {}", p.display()), false),
                     Err(e) => app.show_toast(e, true),
+                }
+            }
+            crate::terminal::TerminalAction::ClearInProgress { run_id, agent } => {
+                if !app.doc.clear_in_progress_for_run_or_agent(run_id.as_deref(), agent.as_deref()).is_empty() {
+                    app.changed();
                 }
             }
         }

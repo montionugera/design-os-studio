@@ -417,6 +417,7 @@ pub(crate) fn doc_hash(doc: &Document) -> u64 {
         &doc.comments,
         &doc.library,
         &doc.library_page,
+        &doc.in_progress,
     )
         .serialize(HashSerializer(&mut h));
     doc.images.len().hash(&mut h);

@@ -1029,8 +1029,32 @@ fn apply_descendant_override(doc: &mut Document, tid: NodeId, ov_obj: &Map<Strin
     }
 }
 
+/// Report returned by [`export_pen_json_with_report`] listing transient state omitted from the `.pen` scene format (E15-7 §6).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PenExportReport {
+    /// Active `in_progress` root IDs left out of the `.pen` scene format export.
+    pub omitted_in_progress_ids: Vec<NodeId>,
+    /// Number of active `in_progress` roots left out of the `.pen` scene format export.
+    pub omitted_in_progress_count: usize,
+}
+
+impl PenExportReport {
+    /// Human-readable summary note when transient `in_progress` flags were omitted from `.pen` export.
+    pub fn summary_note(&self) -> Option<String> {
+        (self.omitted_in_progress_count > 0)
+            .then(|| format!("Omitted {} in_progress flag(s) from scene format export ({:?})", self.omitted_in_progress_count, self.omitted_in_progress_ids))
+    }
+}
+
 /// Serializes a [`Document`] into a Pencil.dev `.pen` JSON string.
 pub fn export_pen_json(doc: &Document) -> Result<String, String> {
+    export_pen_json_with_report(doc).map(|(json, _)| json)
+}
+
+/// Like [`export_pen_json`], also returning a [`PenExportReport`] listing any active `in_progress`
+/// roots omitted because `.pen` does not carry agent work-in-progress state (`placeholder` has a
+/// separate component meaning and is never written from `in_progress`, E15-7 §6).
+pub fn export_pen_json_with_report(doc: &Document) -> Result<(String, PenExportReport), String> {
     let mut root = Map::new();
     root.insert("version".into(), json!("1.0"));
     root.insert("name".into(), json!(doc.name));
@@ -1115,7 +1139,10 @@ pub fn export_pen_json(doc: &Document) -> Result<String, String> {
         root.insert("pages".into(), Value::Array(pages_json));
     }
 
-    serde_json::to_string_pretty(&Value::Object(root)).map_err(|e| e.to_string())
+    let omitted_in_progress_ids: Vec<NodeId> = doc.in_progress.keys().copied().filter(|&id| doc.get_in_progress(id).is_some()).collect();
+    let report = PenExportReport { omitted_in_progress_count: omitted_in_progress_ids.len(), omitted_in_progress_ids };
+    let json = serde_json::to_string_pretty(&Value::Object(root)).map_err(|e| e.to_string())?;
+    Ok((json, report))
 }
 
 fn export_var_value(v: &VariableValue) -> Value {
@@ -1585,5 +1612,80 @@ mod tests {
         assert!(warning.expect("budget exhaustion is surfaced as a warning").contains("3000 instance(s)"));
         assert_eq!(doc.nodes.len(), 1 + 1 + 20_000 + 3_000, "nothing was cloned");
         assert!(elapsed < std::time::Duration::from_millis(1_500), "importing took {elapsed:?}");
+    }
+
+    #[test]
+    fn scene_format_does_not_carry_flag() {
+        designos_doc::set_mock_now_ms(Some(1_000_000));
+        let mut doc = Document::new("Scene Format Test");
+        let page = doc.add_page("Page 1");
+        let fid = doc.alloc_id();
+        let frame = doc.insert(page, Node::frame(fid, Rect::new(0.0, 0.0, 320.0, 240.0))).unwrap();
+        doc.set_in_progress(
+            frame,
+            Some(designos_doc::InProgress {
+                run_id: Some("run_scene".into()),
+                agent: Some("Claude Code".into()),
+                since_ms: designos_doc::now_ms(),
+                stale_after_s: Some(300),
+                status: Some("Building hero...".into()),
+            }),
+        );
+
+        let (exported, report) = export_pen_json_with_report(&doc).expect("export .pen with report should succeed");
+        assert!(!exported.contains("placeholder"), "in_progress must never write placeholder into scene format: {exported}");
+        assert!(!exported.contains("in_progress"), "in_progress must never be written into scene format: {exported}");
+        assert_eq!(report.omitted_in_progress_count, 1);
+        assert_eq!(report.omitted_in_progress_ids, vec![frame]);
+        assert!(report.summary_note().unwrap().contains("1 in_progress flag"));
+
+        let reimported = import_pen_json(&exported).expect("re-import .pen should succeed");
+        assert!(reimported.in_progress.is_empty(), "re-imported scene format must have no in_progress entries");
+
+        // Importing a scene format node with placeholder: true must NOT infer in_progress.
+        let placeholder_json =
+            r##"{"version":"1.0","children":[{"id":"p1","type":"frame","name":"Placeholder Frame","width":200,"height":120,"placeholder":true}]}"##;
+        let imported_placeholder = import_pen_json(placeholder_json).expect("import placeholder .pen should succeed");
+        assert!(imported_placeholder.in_progress.is_empty(), "placeholder: true must not create an in_progress entry");
+        designos_doc::set_mock_now_ms(None);
+    }
+
+    #[test]
+    fn fig_round_trip_keeps_flag() {
+        designos_doc::set_mock_now_ms(Some(1_500_000));
+        let mut doc = Document::new("Fig Roundtrip Test");
+        let page = doc.add_page("Page 1");
+        let fid = doc.alloc_id();
+        let mut frame_node = Node::frame(fid, Rect::new(20.0, 40.0, 400.0, 300.0));
+        frame_node.name = "Hero Screen".into();
+        let frame = doc.insert(page, frame_node).unwrap();
+        let expected = designos_doc::InProgress {
+            run_id: Some("run_fig_rt".into()),
+            agent: Some("Claude Code".into()),
+            since_ms: 1_500_000,
+            stale_after_s: Some(600),
+            status: Some("Polishing typography".into()),
+        };
+        doc.set_in_progress(frame, Some(expected.clone()));
+
+        // Binary .fig round-trip
+        let bytes = crate::export_fig(&doc).expect("export_fig should succeed");
+        let roundtripped = crate::import_fig(&bytes).expect("import_fig should succeed");
+        assert_eq!(roundtripped.in_progress.len(), 1, "expected 1 restored in_progress entry after .fig round-trip");
+        let (&restored_id, restored_ip) = roundtripped.in_progress.iter().next().unwrap();
+        assert_eq!(restored_ip, &expected);
+        assert_eq!(roundtripped.get(restored_id).unwrap().name, "Hero Screen");
+        assert!(
+            !roundtripped.get(restored_id).unwrap().plugin_data.contains_key("designos:in_progress"),
+            "reserved pluginData key must be consumed into Document.in_progress"
+        );
+
+        // REST JSON round-trip
+        let rest_json = serde_json::to_string(&crate::export_rest_json(&doc)).expect("export_rest_json should succeed");
+        let rest_roundtripped = crate::import_rest_json(&rest_json).expect("import_rest_json should succeed");
+        assert_eq!(rest_roundtripped.in_progress.len(), 1);
+        let (_, rest_ip) = rest_roundtripped.in_progress.iter().next().unwrap();
+        assert_eq!(rest_ip, &expected);
+        designos_doc::set_mock_now_ms(None);
     }
 }

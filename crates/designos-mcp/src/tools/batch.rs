@@ -40,14 +40,23 @@ pub fn tool_descriptor() -> Value {
         "op".into(),
         json!({
             "type": "string",
-            "enum": ["apply_spec", "insert", "update", "move", "delete", "set_variables", "set_style"]
+            "enum": ["apply_spec", "insert", "update", "move", "delete", "set_variables", "set_style", "set_in_progress"]
         }),
     );
     op_properties.insert("as".into(), json!({ "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" }));
     op_properties.insert("parent".into(), node_or_ref.clone());
     op_properties.insert("parent_id".into(), node_or_ref.clone());
     op_properties.insert("node".into(), node_or_ref.clone());
-    op_properties.insert("node_id".into(), node_or_ref);
+    op_properties.insert("node_id".into(), node_or_ref.clone());
+    op_properties.insert("nodes".into(), json!({ "type": "array", "items": node_or_ref.clone(), "minItems": 1, "maxItems": 200 }));
+    op_properties.insert("node_ids".into(), json!({ "type": "array", "items": node_or_ref, "minItems": 1, "maxItems": 200 }));
+    op_properties.insert("value".into(), json!({ "type": "boolean" }));
+    op_properties.insert("in_progress".into(), json!({ "type": "boolean" }));
+    op_properties.insert("agent".into(), json!({ "type": "string", "maxLength": 256 }));
+    op_properties.insert("status".into(), json!({ "type": "string", "maxLength": 512 }));
+    op_properties.insert("run_id".into(), json!({ "type": "string", "maxLength": 256 }));
+    op_properties.insert("stale_after_s".into(), json!({ "type": "integer", "minimum": 60, "maximum": 86400 }));
+    op_properties.insert("force".into(), json!({ "type": "boolean", "default": false }));
     op_properties.insert("index".into(), json!({ "type": "integer", "minimum": 0 }));
     op_properties.insert("spec".into(), json!({ "type": "object" }));
     op_properties.insert("kind".into(), json!({ "type": "string", "enum": ["frame", "rectangle", "ellipse", "text"] }));
@@ -73,7 +82,7 @@ pub fn tool_descriptor() -> Value {
     });
     json!({
         "name": "designos_apply_batch",
-        "description": "Execute 1..=200 write operations (apply_spec, insert, update, move, delete, set_variables, set_style) as a single atomic transaction and one undo group. Later ops may reference nodes created by earlier ops via '@<as>' or '@<as>/<name path>'. With dry_run=true, computes and returns created IDs, name_to_id map, touched_roots, and touched_bounds without mutating the document or publishing a live patch. Note: in a live Studio session, if the editor remaps a colliding ID on replay, the reply holds the session IDs until the next canvas reload.",
+        "description": "Execute 1..=200 write operations (apply_spec, insert, update, move, delete, set_variables, set_style, set_in_progress) as a single atomic transaction and one undo group. Later ops may reference nodes created by earlier ops via '@<as>' or '@<as>/<name path>'. With dry_run=true, computes and returns created IDs, name_to_id map, touched_roots, and touched_bounds without mutating the document or publishing a live patch. Note: in a live Studio session, if the editor remaps a colliding ID on replay, the reply holds the session IDs until the next canvas reload.",
         "inputSchema": {
             "type": "object",
             "required": ["ops"],
@@ -293,6 +302,33 @@ struct SetStyleOp {
     apply: Vec<ApplyStyleLinkInput>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetInProgressOp {
+    #[allow(dead_code)]
+    op: String,
+    #[serde(rename = "as")]
+    alias: Option<String>,
+    #[serde(default, alias = "node_ids")]
+    nodes: Option<Vec<NodeRef>>,
+    #[serde(default, alias = "node_id")]
+    node: Option<NodeRef>,
+    #[serde(default)]
+    value: Option<bool>,
+    #[serde(default)]
+    in_progress: Option<bool>,
+    #[serde(default, alias = "agent_name")]
+    agent: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    stale_after_s: Option<u32>,
+    #[serde(default)]
+    force: bool,
+}
+
 #[derive(Clone, Debug)]
 enum ParsedOp {
     ApplySpec(Box<ApplySpecOp>),
@@ -302,6 +338,7 @@ enum ParsedOp {
     Delete(DeleteOp),
     SetVariables(SetVariablesOp),
     SetStyle(SetStyleOp),
+    SetInProgress(SetInProgressOp),
 }
 
 impl ParsedOp {
@@ -314,6 +351,7 @@ impl ParsedOp {
             Self::Delete(_) => "delete",
             Self::SetVariables(_) => "set_variables",
             Self::SetStyle(_) => "set_style",
+            Self::SetInProgress(_) => "set_in_progress",
         }
     }
 
@@ -326,6 +364,7 @@ impl ParsedOp {
             Self::Delete(o) => o.alias.as_deref(),
             Self::SetVariables(o) => o.alias.as_deref(),
             Self::SetStyle(o) => o.alias.as_deref(),
+            Self::SetInProgress(o) => o.alias.as_deref(),
         }
     }
 }
@@ -506,6 +545,54 @@ fn parse_and_validate_ops(raw_ops: Vec<Value>) -> Result<Vec<ParsedOp>, String> 
                     validate_ref_pre_run(&link.node, &declared_as, idx, "set_style", &format!("apply/{link_idx}/node"))?;
                 }
                 ParsedOp::SetStyle(a)
+            }
+            "set_in_progress" => {
+                let a: SetInProgressOp =
+                    serde_json::from_value(val).map_err(|e| op_failed_error(idx, "set_in_progress", "INVALID_ARGUMENTS", &op_path, e.to_string()))?;
+                if a.value.is_none() && a.in_progress.is_none() {
+                    return Err(op_failed_error(idx, "set_in_progress", "MISSING_FIELD", &format!("{op_path}/value"), "missing boolean field 'value'"));
+                }
+                if let Some(stale) = a.stale_after_s {
+                    if !(60..=86_400).contains(&stale) {
+                        return Err(op_failed_error(
+                            idx,
+                            "set_in_progress",
+                            "VALUE_OUT_OF_RANGE",
+                            &format!("{op_path}/stale_after_s"),
+                            "stale_after_s must be between 60 and 86400",
+                        ));
+                    }
+                }
+                let mut total_targets = 0usize;
+                if let Some(list) = &a.nodes {
+                    for (n_idx, r) in list.iter().enumerate() {
+                        validate_ref_pre_run(r, &declared_as, idx, "set_in_progress", &format!("nodes/{n_idx}"))?;
+                        total_targets += 1;
+                    }
+                }
+                if let Some(single) = &a.node {
+                    validate_ref_pre_run(single, &declared_as, idx, "set_in_progress", "node")?;
+                    total_targets += 1;
+                }
+                if total_targets == 0 {
+                    return Err(op_failed_error(
+                        idx,
+                        "set_in_progress",
+                        "INVALID_ARGUMENTS",
+                        &format!("{op_path}/nodes"),
+                        "set_in_progress requires at least one target in 'nodes' or 'node'",
+                    ));
+                }
+                if total_targets > 200 {
+                    return Err(op_failed_error(
+                        idx,
+                        "set_in_progress",
+                        "VALUE_OUT_OF_RANGE",
+                        &format!("{op_path}/nodes"),
+                        "set_in_progress targets at most 200 nodes per op",
+                    ));
+                }
+                ParsedOp::SetInProgress(a)
             }
             other => {
                 return Err(batch_error("INVALID_ARGUMENTS", Some(idx), Some(other), &format!("/ops/{idx}/op"), format!("unsupported batch op '{other}'")));
@@ -1149,6 +1236,11 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
                         first.parent = Some(parent);
                     }
                     recorded_live_ops.push(LiveOp::Insert { parent, at: SiblingHint::at(&prev_children, target_idx), nodes: live_nodes });
+                    for &sid in &subtree_ids {
+                        if let Some(ip) = trial.in_progress.get(&sid) {
+                            recorded_live_ops.push(LiveOp::SetInProgress { node: sid, state: Some(ip.clone()) });
+                        }
+                    }
                 }
 
                 created_root_ids.push(root_id.0);
@@ -1365,6 +1457,127 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
                 let before_bounds = node_page_bounds(&trial, root_node);
                 touched_records.push(TouchedRootRecord { op: op_idx, node_id: root_node, before_bounds });
             }
+            ParsedOp::SetInProgress(a) => {
+                let flag = a.value.or(a.in_progress).unwrap_or(false);
+                let mut target_ids: Vec<NodeId> = Vec::new();
+                if let Some(list) = &a.nodes {
+                    for (n_idx, r) in list.iter().enumerate() {
+                        let id = resolve_node_ref(&trial, &alias_roots, r, op_idx, op_name, &format!("nodes/{n_idx}"))?;
+                        if !target_ids.contains(&id) {
+                            target_ids.push(id);
+                        }
+                    }
+                }
+                if let Some(single) = &a.node {
+                    let id = resolve_node_ref(&trial, &alias_roots, single, op_idx, op_name, "node")?;
+                    if !target_ids.contains(&id) {
+                        target_ids.push(id);
+                    }
+                }
+                let effective_run_id = a
+                    .run_id
+                    .as_ref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| std::env::var("DESIGNOS_AGENT_RUN_ID").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+                let effective_agent = a
+                    .agent
+                    .as_ref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| std::env::var("DESIGNOS_AGENT_RUNTIME").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+                    .or_else(|| std::env::var("DESIGNOS_AGENT_NAME").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+                let effective_status = a.status.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
+                for &id in &target_ids {
+                    check_lease_guard(&trial, engine.owned_frames.as_deref(), id, op_idx, op_name)?;
+                    if flag {
+                        if let Err(root_opt) = trial.is_in_progress_root(id) {
+                            let valid_options: Vec<u64> = root_opt.into_iter().map(|r| r.0).collect();
+                            let msg = match root_opt {
+                                Some(r) => format!("node {} is not a root frame; target root frame {} instead", id.0, r.0),
+                                None => format!("node {} is not a root frame", id.0),
+                            };
+                            return Err(serde_json::to_string(&json!({
+                                "code": "IN_PROGRESS_TARGET_NOT_ROOT",
+                                "failed_op": op_idx,
+                                "op": op_name,
+                                "path": op_path,
+                                "node_id": id.0,
+                                "root_frame_id": root_opt.map(|r| r.0),
+                                "valid_options": valid_options,
+                                "message": msg,
+                                "safe_to_retry": true,
+                                "cause": {
+                                    "code": "IN_PROGRESS_TARGET_NOT_ROOT",
+                                    "path": op_path,
+                                    "node_id": id.0,
+                                    "root_frame_id": root_opt.map(|r| r.0),
+                                    "valid_options": valid_options,
+                                    "message": msg,
+                                    "safe_to_retry": true
+                                }
+                            }))
+                            .unwrap());
+                        }
+                        if !a.force {
+                            if let Some(existing) = trial.get_in_progress(id) {
+                                if let Some(ex_run) = &existing.run_id {
+                                    if effective_run_id.as_deref() != Some(ex_run.as_str()) {
+                                        let msg = format!("node {} is already flagged in_progress by run '{ex_run}'", id.0);
+                                        return Err(serde_json::to_string(&json!({
+                                            "code": "NODE_IN_PROGRESS_BY_OTHER_RUN",
+                                            "failed_op": op_idx,
+                                            "op": op_name,
+                                            "path": op_path,
+                                            "node_id": id.0,
+                                            "existing_run_id": ex_run,
+                                            "existing_agent": existing.agent,
+                                            "message": msg,
+                                            "next_step": "Pass force:true only when the other run is known dead.",
+                                            "safe_to_retry": true,
+                                            "cause": {
+                                                "code": "NODE_IN_PROGRESS_BY_OTHER_RUN",
+                                                "path": op_path,
+                                                "node_id": id.0,
+                                                "existing_run_id": ex_run,
+                                                "existing_agent": existing.agent,
+                                                "message": msg,
+                                                "next_step": "Pass force:true only when the other run is known dead.",
+                                                "safe_to_retry": true
+                                            }
+                                        }))
+                                        .unwrap());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let now = designos_doc::now_ms();
+                for &id in &target_ids {
+                    let state = flag.then(|| designos_doc::InProgress {
+                        run_id: effective_run_id.clone(),
+                        agent: effective_agent.clone(),
+                        since_ms: now,
+                        stale_after_s: a.stale_after_s,
+                        status: effective_status.clone(),
+                    });
+                    let prev = trial.set_in_progress(id, state.clone());
+                    if prev != state {
+                        changed.updated += 1;
+                        if recording_live {
+                            recorded_live_ops.push(LiveOp::SetInProgress { node: id, state });
+                        }
+                    }
+                    let before_bounds = node_page_bounds(&trial, id);
+                    touched_records.push(TouchedRootRecord { op: op_idx, node_id: id, before_bounds });
+                }
+                if let (Some(alias), Some(&first_id)) = (&a.alias, target_ids.first()) {
+                    alias_roots.insert(alias.clone(), first_id);
+                }
+            }
         }
     }
 
@@ -1404,20 +1617,29 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
 
     // Step 4: Dry run returns the trial result without committing or publishing (§3.2.4).
     // Step 5 & Edge case 5: Empty effective change skips commit, undo entry, and patch line (§8.5).
-    if !batch_args.dry_run && !collected_cmds.is_empty() && changed.any() {
-        engine.history.exec(&mut engine.doc, Command::Batch(collected_cmds)).map_err(|e| batch_error("INTERNAL_ERROR", None, None, "", e.to_string()))?;
-        for target in &relayout_targets {
-            relayout_for_node(&mut engine.doc, *target);
+    let in_progress_changed = trial.in_progress != engine.doc.in_progress;
+    if !batch_args.dry_run {
+        let cmds_committed = !collected_cmds.is_empty() && changed.any();
+        if cmds_committed {
+            engine.history.exec(&mut engine.doc, Command::Batch(collected_cmds)).map_err(|e| batch_error("INTERNAL_ERROR", None, None, "", e.to_string()))?;
+            for target in &relayout_targets {
+                relayout_for_node(&mut engine.doc, *target);
+            }
+            engine.settle_layout();
+            engine.live_patch_label = Some(undo_label.clone());
         }
-        engine.settle_layout();
-        engine.record(recorded_live_ops);
-        engine.live_patch_label = Some(undo_label.clone());
-
-        debug_assert_eq!(
-            batch_state_hash(&engine.doc, &check_ids),
-            batch_state_hash(&trial, &check_ids),
-            "committed document hash must equal trial document hash"
-        );
+        if in_progress_changed {
+            engine.doc.in_progress = trial.in_progress.clone();
+            engine.doc.prune_in_progress();
+        }
+        if cmds_committed || in_progress_changed {
+            engine.record(recorded_live_ops);
+            debug_assert_eq!(
+                batch_state_hash(&engine.doc, &check_ids),
+                batch_state_hash(&trial, &check_ids),
+                "committed document hash must equal trial document hash"
+            );
+        }
     }
 
     Ok(json!({
@@ -1443,9 +1665,9 @@ pub fn batch_state_hash(doc: &Document, touched_ids: &[NodeId]) -> u64 {
     doc.nodes.len().hash(&mut h);
     doc.pages.hash(&mut h);
     if doc.nodes.len() <= 5_000 {
-        let _ = (&doc.nodes, &doc.styles, &doc.style_meta, &doc.variables, &doc.variable_collections).serialize(StreamHashSerializer(&mut h));
+        let _ = (&doc.nodes, &doc.styles, &doc.style_meta, &doc.variables, &doc.variable_collections, &doc.in_progress).serialize(StreamHashSerializer(&mut h));
     } else {
-        let _ = (&doc.styles, &doc.style_meta, &doc.variables, &doc.variable_collections).serialize(StreamHashSerializer(&mut h));
+        let _ = (&doc.styles, &doc.style_meta, &doc.variables, &doc.variable_collections, &doc.in_progress).serialize(StreamHashSerializer(&mut h));
         for &id in touched_ids {
             id.0.hash(&mut h);
             let _ = doc.get(id).serialize(StreamHashSerializer(&mut h));
@@ -2176,5 +2398,174 @@ mod tests {
             );
             assert!(commit_ms <= budget_ms, "E15-4 commit for {target_nodes} nodes took {commit_ms:.1}ms, exceeding budget {budget_ms:.1}ms");
         }
+    }
+
+    #[test]
+    fn batch_flag_and_clear_on_run_end() {
+        designos_doc::set_mock_now_ms(Some(2_000_000));
+        let mut engine = Engine::default();
+        let page = engine.resolve_default_page().unwrap();
+        let res = engine
+            .call(
+                "designos_apply_batch",
+                json!({
+                    "ops": [
+                        {
+                            "op": "apply_spec",
+                            "parent": page.0,
+                            "as": "hero",
+                            "spec": {
+                                "kind": "frame",
+                                "name": "Hero Frame",
+                                "width": 390.0,
+                                "height": 844.0,
+                                "children": [
+                                    { "kind": "text", "name": "Headline", "text": "Welcome" }
+                                ]
+                            }
+                        },
+                        {
+                            "op": "set_in_progress",
+                            "nodes": ["@hero"],
+                            "value": true,
+                            "run_id": "run_test_1",
+                            "agent": "Claude Code",
+                            "stale_after_s": 300,
+                            "status": "Refining hero typography"
+                        }
+                    ]
+                }),
+            )
+            .expect("batch with set_in_progress must succeed");
+
+        let hero_id = NodeId(res["name_to_id"]["hero"].as_u64().unwrap());
+        let ip = engine.doc.get_in_progress(hero_id).expect("hero frame should be flagged in_progress");
+        assert_eq!(ip.run_id.as_deref(), Some("run_test_1"));
+        assert_eq!(ip.agent.as_deref(), Some("Claude Code"));
+        assert_eq!(ip.stale_after_s, Some(300));
+        assert_eq!(ip.status.as_deref(), Some("Refining hero typography"));
+
+        // Verify all read surfaces expose in_progress
+        let doc_summary = engine.call("designos_get_document", json!({})).unwrap();
+        assert_eq!(doc_summary["in_progress_count"], 1);
+        assert_eq!(doc_summary["in_progress_nodes"][0]["node_id"], hero_id.0);
+
+        let list = engine.call("designos_list_nodes", json!({ "query": "Hero Frame" })).unwrap();
+        assert_eq!(list["nodes"][0]["in_progress"]["agent"], "Claude Code");
+
+        let node_view = engine.call("designos_get_node", json!({ "node_id": hero_id.0 })).unwrap();
+        assert_eq!(node_view["in_progress"]["run_id"], "run_test_1");
+
+        let xpath_view = engine.call("designos_query_xpath", json!({ "selector": "//Frame[@name='Hero Frame']" })).unwrap();
+        assert_eq!(xpath_view["nodes"][0]["in_progress"]["agent"], "Claude Code");
+
+        let exported_spec = engine.call("designos_export_spec", json!({ "node_id": hero_id.0 })).unwrap();
+        assert_eq!(exported_spec["spec"]["in_progress"]["agent"], "Claude Code");
+
+        // Another run cannot overwrite without force:true
+        let conflict = engine
+            .call(
+                "designos_apply_batch",
+                json!({
+                    "ops": [{
+                        "op": "set_in_progress",
+                        "nodes": [hero_id.0],
+                        "value": true,
+                        "run_id": "run_other",
+                        "agent": "Codex"
+                    }]
+                }),
+            )
+            .unwrap_err();
+        let conflict_json: Value = serde_json::from_str(&conflict).unwrap();
+        assert_eq!(conflict_json["code"], "NODE_IN_PROGRESS_BY_OTHER_RUN");
+
+        // Clearing on run end removes the entry
+        let cleared = engine.doc.clear_in_progress_for_run_or_agent(Some("run_test_1"), Some("Claude Code"));
+        assert_eq!(cleared, vec![hero_id]);
+        assert!(engine.doc.get_in_progress(hero_id).is_none());
+        designos_doc::set_mock_now_ms(None);
+    }
+
+    #[test]
+    fn undo_does_not_touch_flag() {
+        designos_doc::set_mock_now_ms(Some(2_100_000));
+        let mut engine = Engine::default();
+        let page = engine.resolve_default_page().unwrap();
+        let created =
+            engine.call("designos_create_node", json!({ "parent_id": page.0, "kind": "frame", "name": "Card", "width": 320.0, "height": 200.0 })).unwrap();
+        let frame_id = created["node"]["id"].as_u64().unwrap();
+
+        engine.call("designos_update_node", json!({ "node_id": frame_id, "name": "Card Edited" })).unwrap();
+        let undo_before = engine.history.undo_depth();
+
+        // Flag via standalone tool: must not push a History step
+        let flag_res = engine.call("designos_set_in_progress", json!({ "node_ids": [frame_id], "value": true, "stale_after_s": 120 })).unwrap();
+        assert_eq!(flag_res["changed"], true);
+        assert_eq!(engine.history.undo_depth(), undo_before, "set_in_progress must not add an undo step");
+
+        // Undo reverts the rename while keeping the in_progress flag intact
+        let undo_res = engine.call("designos_undo", json!({})).unwrap();
+        assert_eq!(undo_res["changed"], true);
+        assert_eq!(engine.doc.get(NodeId(frame_id)).unwrap().name, "Card");
+        assert!(engine.doc.get_in_progress(NodeId(frame_id)).is_some(), "undo must not clear in_progress flag");
+        designos_doc::set_mock_now_ms(None);
+    }
+
+    #[test]
+    fn not_root_refused() {
+        let mut engine = Engine::default();
+        let page = engine.resolve_default_page().unwrap();
+        let res = engine
+            .call(
+                "designos_apply_batch",
+                json!({
+                    "ops": [
+                        {
+                            "op": "insert",
+                            "parent": page.0,
+                            "as": "root_frame",
+                            "kind": "frame",
+                            "name": "Root",
+                            "width": 300.0,
+                            "height": 200.0
+                        },
+                        {
+                            "op": "insert",
+                            "parent": "@root_frame",
+                            "as": "inner_text",
+                            "kind": "text",
+                            "name": "Inner Label",
+                            "text": "Hello"
+                        }
+                    ]
+                }),
+            )
+            .unwrap();
+        let root_id = res["name_to_id"]["root_frame"].as_u64().unwrap();
+        let text_id = res["name_to_id"]["inner_text"].as_u64().unwrap();
+
+        // Standalone tool refuses non-root text and reports root_frame_id
+        let err = engine.call("designos_set_in_progress", json!({ "node_ids": [text_id], "value": true })).unwrap_err();
+        let err_json: Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(err_json["code"], "IN_PROGRESS_TARGET_NOT_ROOT");
+        assert_eq!(err_json["root_frame_id"], root_id);
+
+        // Batch op also refuses non-root text and reports root_frame_id
+        let batch_err = engine
+            .call(
+                "designos_apply_batch",
+                json!({
+                    "ops": [{
+                        "op": "set_in_progress",
+                        "nodes": [text_id],
+                        "value": true
+                    }]
+                }),
+            )
+            .unwrap_err();
+        let batch_err_json: Value = serde_json::from_str(&batch_err).unwrap();
+        assert_eq!(batch_err_json["code"], "IN_PROGRESS_TARGET_NOT_ROOT");
+        assert_eq!(batch_err_json["root_frame_id"], root_id);
     }
 }

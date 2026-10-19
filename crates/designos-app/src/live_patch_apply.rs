@@ -91,7 +91,7 @@ pub fn apply_live_patches(app: &mut App, patches: &[LivePatch]) {
             Err(e) => failures.push(e),
         }
     }
-    if committed_any {
+    if committed_any || total.applied > 0 {
         if !total.inserted_roots.is_empty() {
             app.selection = total.inserted_roots.clone();
         }
@@ -111,18 +111,21 @@ pub fn apply_live_patches(app: &mut App, patches: &[LivePatch]) {
 
 fn apply_one(app: &mut App, patch: &LivePatch) -> Result<(LivePatchReport, bool), String> {
     let saved = app.terminal.live_patch.state.clone();
+    let saved_in_progress = app.doc.in_progress.clone();
     let mut tx = Tx::new();
     let replayed = replay_live_patch(&mut app.doc, patch, &mut app.terminal.live_patch.state, &mut |doc, cmd| tx.cmd(doc, cmd));
     let report = match replayed {
         Ok(r) => r,
         Err(e) => {
             tx.cancel(&mut app.doc);
+            app.doc.in_progress = saved_in_progress;
             return Err(e.to_string());
         }
     };
     let committed = tx.commit(&mut app.doc, &mut app.hist).map_err(|e| {
         // Nothing of this patch landed, so neither do the id remaps it made.
         app.terminal.live_patch.state = saved;
+        app.doc.in_progress = saved_in_progress;
         e.to_string()
     })?;
     if committed {

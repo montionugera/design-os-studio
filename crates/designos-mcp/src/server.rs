@@ -519,6 +519,8 @@ impl Session {
                         | "designos_reply_comment"
                         | "designos_resolve_comment"
                         | "designos_set_dev_status"
+                        | "designos_set_in_progress"
+                        | "set_in_progress"
                         | "designos_undo"
                         | "designos_redo"
                 );
@@ -544,7 +546,9 @@ impl Session {
                         return Err(format!("The open editor could not receive this edit, so it was undone: {e}"));
                     }
                     self.dirty = true;
-                    self.history_dropped = false;
+                    if !matches!(name, "designos_set_in_progress" | "set_in_progress") {
+                        self.history_dropped = false;
+                    }
                 } else if matches!(name, "designos_undo" | "designos_redo") && self.history_dropped {
                     if let Some(obj) = result.as_object_mut() {
                         obj.insert(

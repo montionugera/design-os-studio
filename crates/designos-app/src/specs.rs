@@ -2188,6 +2188,9 @@ impl App {
                 trial.walk(root_id, |n, _| nodes.push(n.clone()));
                 let index = self.doc.get(parent).map(|p| p.children.len()).unwrap_or(0);
                 if self.hist.exec(&mut self.doc, Command::Insert { parent, index, nodes }).is_ok() {
+                    if let Some(ip) = trial.in_progress.get(&root_id).cloned() {
+                        self.doc.set_in_progress(root_id, Some(ip));
+                    }
                     self.doc.relayout_subtree(parent);
                     self.selection = vec![root_id];
                     self.changed();

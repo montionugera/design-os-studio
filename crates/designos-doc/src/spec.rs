@@ -116,11 +116,43 @@ pub struct NodeSpec {
     pub annotation: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub annotations: Vec<String>,
+    /// Optional agent `in_progress` flag (`true`, `false`, or an [`InProgress`] object).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_progress: Option<InProgressSpec>,
     /// Attached canvas comments when exporting a subtree spec.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comments: Vec<ResolvedCommentThread>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<NodeSpec>,
+}
+
+/// Declarative `in_progress` flag on a [`NodeSpec`] (`true`/`false` or a detailed [`InProgress`] object).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum InProgressSpec {
+    Bool(bool),
+    Detailed(InProgress),
+}
+
+impl InProgressSpec {
+    pub fn into_state(self) -> Option<InProgress> {
+        match self {
+            InProgressSpec::Bool(true) => Some(InProgress {
+                run_id: std::env::var("DESIGNOS_AGENT_RUN_ID").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+                agent: std::env::var("DESIGNOS_AGENT_RUNTIME").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+                since_ms: now_ms(),
+                stale_after_s: None,
+                status: None,
+            }),
+            InProgressSpec::Bool(false) => None,
+            InProgressSpec::Detailed(mut ip) => {
+                if ip.since_ms == 0 {
+                    ip.since_ms = now_ms();
+                }
+                Some(ip)
+            }
+        }
+    }
 }
 
 /// A canvas comment thread enriched with its resolved world position and the
@@ -582,6 +614,18 @@ impl Document {
         }
 
         self.insert(parent, node).map_err(|e| e.to_string())?;
+        if let Some(ip_spec) = &spec.in_progress {
+            let state = ip_spec.clone().into_state();
+            if state.is_some() {
+                if let Err(root_opt) = self.is_in_progress_root(id) {
+                    return Err(match root_opt {
+                        Some(r) => format!("IN_PROGRESS_TARGET_NOT_ROOT: node {} is not a root frame (use root frame {})", id.0, r.0),
+                        None => format!("IN_PROGRESS_TARGET_NOT_ROOT: node {} is not a root frame", id.0),
+                    });
+                }
+            }
+            self.set_in_progress(id, state);
+        }
 
         // Convenience: if a frame/preset (like easeui-button-primary or easeui-badge) specifies `text`,
         // automatically insert a child Text node inside it!
@@ -658,6 +702,7 @@ impl Document {
         });
         let dev_status = n.dev.status.map(|s| s.label().to_string());
         let annotations: Vec<String> = n.dev.annotations.iter().map(|a| a.text.clone()).collect();
+        let in_progress = self.get_in_progress(id).cloned().map(InProgressSpec::Detailed);
         let comments: Vec<ResolvedCommentThread> = all_comments
             .iter()
             .filter(|c| c.target_node_id == Some(id.0) || (c.target_node_id.is_none() && c.target_frame_id == Some(id.0)))
@@ -701,6 +746,7 @@ impl Document {
             dev_status,
             annotation: None,
             annotations,
+            in_progress,
             comments,
             children,
         })
