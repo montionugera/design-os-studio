@@ -1,3 +1,5 @@
+mod agent_approval_card;
+pub mod agent_permissions;
 pub mod agent_sessions;
 mod agent_start_failure;
 mod app;

@@ -42,6 +42,17 @@ pub fn save_flag(root: &Path, key: &str, value: bool) -> Result<(), String> {
     designos_library::write_atomic(&root.join(FILE), text.as_bytes()).map_err(|e| format!("Cannot save settings: {e}"))
 }
 
+pub fn load_str(root: &Path, key: &str) -> Option<String> {
+    read(root).get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+pub fn save_str(root: &Path, key: &str, value: &str) -> Result<(), String> {
+    let mut map = read(root);
+    map.insert(key.into(), value.into());
+    let text = serde_json::to_string_pretty(&serde_json::Value::Object(map)).map_err(|e| e.to_string())?;
+    designos_library::write_atomic(&root.join(FILE), text.as_bytes()).map_err(|e| format!("Cannot save settings: {e}"))
+}
+
 /// Saves the author name (an empty name resets to the OS user name).
 pub fn save_author(root: &Path, name: &str) -> Result<(), String> {
     let mut map = read(root);
