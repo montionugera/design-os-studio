@@ -675,6 +675,7 @@ pub struct TerminalState {
     #[allow(dead_code)]
     pub left_scroll: f32,
     pub last_watched_mtime: Option<std::time::SystemTime>,
+    pub last_fallback_spec_mtime: Option<std::time::SystemTime>,
     /// Whether the legacy credits banner flag is set (kept for test compatibility).
     #[allow(dead_code)]
     pub credits_banner_dismissed: bool,
@@ -713,21 +714,16 @@ pub struct TerminalState {
     pub agy_cwd_scoped: bool,
     /// Additional directories prepended at the front of `PATH` when spawning child PTYs.
     pub path_prepend: Vec<PathBuf>,
-    /// Background single-thread latest-wins snapshot writer (`#690` §6).
-    snapshot_worker: crate::agent_session_files::SnapshotWorker,
 }
 
 impl Default for TerminalState {
     fn default() -> Self {
-        #[cfg(test)]
-        {
-            static NEXT_TEST_TAB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(100_000);
-            Self::for_tab(NEXT_TEST_TAB.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        let mut st = Self::for_tab(1);
+        if cfg!(test) {
+            st.live_spec_path = PathBuf::from("/tmp/designos-live-agent-out-test-isolated.spec.json");
+            st.last_watched_mtime = std::fs::metadata(&st.live_spec_path).and_then(|m| m.modified()).ok();
         }
-        #[cfg(not(test))]
-        {
-            Self::for_tab(1)
-        }
+        st
     }
 }
 
@@ -757,6 +753,7 @@ impl TerminalState {
         let context_json_path = session_dir.join("context.json");
         let selection_spec_path = session_dir.join("selection.spec.json");
         let initial_spec_mtime = std::fs::metadata(&live_spec_path).and_then(|m| m.modified()).ok();
+        let fallback_spec_mtime = std::fs::metadata("/tmp/designos-live-agent-out.spec.json").and_then(|m| m.modified()).ok();
         let live_patch = crate::live_patch_log::LivePatchLog::bind(session_dir.join("doc-patch.jsonl"));
         Self {
             key: crate::agent_sessions::SessionKey::Fallback(session_id.clone()),
@@ -783,6 +780,7 @@ impl TerminalState {
             viewport_focused: true,
             left_scroll: 0.0,
             last_watched_mtime: initial_spec_mtime,
+            last_fallback_spec_mtime: fallback_spec_mtime,
             credits_banner_dismissed: true,
             side_panel_pty_open: true,
             chat_mode: false,
@@ -800,12 +798,10 @@ impl TerminalState {
             lock_owner: None,
             agy_cwd_scoped: false,
             path_prepend: Vec::new(),
-            snapshot_worker: crate::agent_session_files::SnapshotWorker::new(),
         }
     }
 
     fn update_session_dir_paths(&mut self, session_dir: PathBuf) {
-        self.snapshot_worker.cancel_and_wait();
         self.live_spec_path = session_dir.join("live-spec.json");
         self.live_doc_sync_path = session_dir.join("doc-sync.designos");
         self.live_canvas_path = session_dir.join("canvas.designos");
@@ -924,50 +920,15 @@ impl TerminalState {
         }
     }
 
-    /// Harvests completion or failure status from the off-UI-thread [`SnapshotWorker`].
-    /// Clears `self.last_synced_key` and surfaces a write failure in `self.status_msg` if the
-    /// worker failed to write `self.session_dir`, so the next sync retries.
-    pub fn reconcile_snapshot_worker(&mut self) -> Option<String> {
-        let status = self.snapshot_worker.take_status();
-        if let Some((dir, key)) = status.completed {
-            if dir == self.session_dir {
-                self.last_synced_key = Some(key);
-            }
-        }
-        if let Some((dir, key)) = status.failed {
-            if dir == self.session_dir && self.last_synced_key == Some(key) {
-                self.last_synced_key = None;
-            }
-        }
-        if let Some(ref e) = status.error {
-            self.status_msg = Some(e.clone());
-        }
-        status.error
-    }
-
-    /// Waits for any in-flight or queued off-UI-thread snapshot write to finish and reconciles
-    /// `self.last_synced_key` / `self.status_msg`.
-    pub fn flush_live_sync(&mut self) {
-        self.snapshot_worker.flush();
-        let _ = self.reconcile_snapshot_worker();
-    }
-
-    #[cfg(test)]
-    pub fn snapshot_worker_thread_id(&self) -> Option<std::thread::ThreadId> {
-        self.snapshot_worker.last_writer_thread_id()
-    }
-
     /// Synchronizes the open file's document, currently selected page (`page`), and selection into
     /// `self.session_dir` (`context.json`, `canvas.designos`, `mcp-config.json`, `hooks.json`, `SKILL.md`)
-    /// on the off-UI-thread [`SnapshotWorker`] (`#690` §6) so any CLI agent (`claude`, `codex`, `agy`, `grok`)
-    /// in this file's terminal automatically targets THIS file and its currently selected page without
-    /// serializing full-document JSON or writing files on the UI thread.
+    /// so any CLI agent (`claude`, `codex`, `agy`, `grok`) in this file's terminal automatically
+    /// targets THIS file and its currently selected page.
     pub fn sync_live_file_context(&mut self, doc: &Document, page: NodeId, selection: &[NodeId], file_path: Option<&Path>) {
+        let _ = std::fs::create_dir_all(&self.session_dir);
         self.current_page_id = page.0;
         self.current_page_name = doc.get(page).map(|n| n.name.clone()).unwrap_or_else(|| "Page 1".into());
         self.doc_name = if doc.name.trim().is_empty() { "Untitled".into() } else { doc.name.clone() };
-
-        let _ = self.reconcile_snapshot_worker();
 
         // The canvas the agent reads must keep holding every edit the agent made. While one of its
         // edits waits for the user to finish, or the user is mid-edit, or deferred auto-layout
@@ -978,14 +939,11 @@ impl TerminalState {
             return;
         }
 
-        // Selected ids, document/page names, and file path: the scoped canvas ships the selected frames whole.
+        // Selected ids, not just their count: the scoped canvas ships the selected frames whole.
         let selection_key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             selection.hash(&mut h);
-            self.doc_name.hash(&mut h);
-            self.current_page_name.hash(&mut h);
-            file_path.hash(&mut h);
             h.finish()
         };
         let key = (doc.mutation_epoch(), page.0, selection_key);
@@ -999,47 +957,121 @@ impl TerminalState {
                 "current_page_name": self.current_page_name,
                 "selected_node_ids": selected_ids,
             });
-            let context_bytes = serde_json::to_vec_pretty(&ctx_val).unwrap_or_default();
-            let canvas_doc =
-                if doc.nodes.len() <= 25_000 { doc.clone() } else { crate::live_canvas_scope::scoped_canvas(doc, page, selection, &self.doc_name) };
+            if let Ok(ctx_bytes) = serde_json::to_vec_pretty(&ctx_val) {
+                let _ = atomic_write_session_file(&self.context_json_path, &ctx_bytes);
+                if !cfg!(test) {
+                    let _ = atomic_write_session_file(Path::new("/tmp/designos-live-context.json"), &ctx_bytes);
+                }
+            }
+
+            let canvas_json = if doc.nodes.len() <= 25_000 {
+                doc.to_json().ok()
+            } else {
+                crate::live_canvas_scope::scoped_canvas(doc, page, selection, &self.doc_name).to_json().ok()
+            };
+            if let Some(json_str) = canvas_json {
+                let _ = atomic_write_session_file(&self.live_canvas_path, json_str.as_bytes());
+                if !cfg!(test) {
+                    let _ = atomic_write_session_file(Path::new("/tmp/designos-live-canvas.designos"), json_str.as_bytes());
+                }
+            }
+
+            self.provision_session_agent_files(file_path);
             self.last_synced_key = Some(key);
-            self.snapshot_worker.enqueue(crate::agent_session_files::SnapshotJob {
-                session_dir: self.session_dir.clone(),
-                session_id: self.session_id.clone(),
-                key,
-                context_json_path: self.context_json_path.clone(),
-                live_canvas_path: self.live_canvas_path.clone(),
-                live_spec_path: self.live_spec_path.clone(),
-                live_doc_sync_path: self.live_doc_sync_path.clone(),
-                live_doc_patch_path: self.live_patch.path.clone(),
-                context_bytes,
-                canvas_doc,
-                doc_name: self.doc_name.clone(),
-                current_page_id: page.0,
-                current_page_name: self.current_page_name.clone(),
-                file_path: file_path.map(Path::to_path_buf),
-            });
         }
     }
 
     fn provision_session_agent_files(&self, file_path: Option<&Path>) {
-        let job = crate::agent_session_files::SnapshotJob {
-            session_dir: self.session_dir.clone(),
-            session_id: self.session_id.clone(),
-            key: (0, 0, 0),
-            context_json_path: self.context_json_path.clone(),
-            live_canvas_path: self.live_canvas_path.clone(),
-            live_spec_path: self.live_spec_path.clone(),
-            live_doc_sync_path: self.live_doc_sync_path.clone(),
-            live_doc_patch_path: self.live_patch.path.clone(),
-            context_bytes: Vec::new(),
-            canvas_doc: Document::default(),
-            doc_name: self.doc_name.clone(),
-            current_page_id: self.current_page_id,
-            current_page_name: self.current_page_name.clone(),
-            file_path: file_path.map(Path::to_path_buf),
-        };
-        let _ = write_session_agent_files_for_job(&job);
+        let mcp_bin = designos_mcp_binary();
+        let workspace_dir = session_workspace_dir(file_path);
+
+        let mcp_config = serde_json::json!({
+            "mcpServers": {
+                "designos": {
+                    "command": mcp_bin.display().to_string(),
+                    "args": ["--workspace", workspace_dir.display().to_string()],
+                    "env": {
+                        "DESIGNOS_SESSION_DIR": self.session_dir.display().to_string(),
+                        "DESIGNOS_LIVE_CANVAS": self.live_canvas_path.display().to_string(),
+                        "DESIGNOS_LIVE_DOC_SYNC": self.live_doc_sync_path.display().to_string(),
+                        "DESIGNOS_LIVE_DOC_PATCH": self.live_patch.path.display().to_string(),
+                        "DESIGNOS_LIVE_SPEC": self.live_spec_path.display().to_string(),
+                        "DESIGNOS_CONTEXT_JSON": self.context_json_path.display().to_string(),
+                        "DESIGNOS_TARGET_PAGE_ID": self.current_page_id.to_string(),
+                        "DESIGNOS_TARGET_PAGE_NAME": self.current_page_name,
+                        "DESIGNOS_DOC_NAME": self.doc_name,
+                        "DESIGNOS_FILE": file_path.map(|p| p.display().to_string()).unwrap_or_default()
+                    }
+                }
+            }
+        });
+        let mcp_config_path = self.session_dir.join("mcp-config.json");
+        if let Ok(bytes) = serde_json::to_vec_pretty(&mcp_config) {
+            let _ = atomic_write_session_file(&mcp_config_path, &bytes);
+            write_agy_session_plugin(&self.session_dir, &bytes);
+        }
+        write_grok_session_config(&self.session_dir, &mcp_config);
+
+        let page_context = serde_json::json!({
+            "session_id": self.session_id,
+            "doc_name": self.doc_name,
+            "file_path": file_path.map(|p| p.display().to_string()),
+            "current_page_id": self.current_page_id,
+            "current_page_name": self.current_page_name,
+        });
+        // Claude's reply to a prompt hook: the page as `additionalContext`, nothing that could block the prompt.
+        let context_reply_path = self.session_dir.join("page-context-reply.json");
+        let context_reply = serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": format!("DESIGN:OS Studio page context: {page_context}"),
+            }
+        });
+        if let Ok(bytes) = serde_json::to_vec_pretty(&context_reply) {
+            let _ = atomic_write_session_file(&context_reply_path, &bytes);
+        }
+        let status_path = self.session_dir.join("agent-status.json");
+        if let Ok(bytes) = serde_json::to_vec_pretty(&session_hooks_settings(&status_path, Some(&context_reply_path))) {
+            let _ = atomic_write_session_file(&self.session_dir.join("hooks.json"), &bytes);
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(&session_hooks_settings(&status_path, None)) {
+            let _ = atomic_write_session_file(&self.session_dir.join(".grok").join("hooks").join("designos-status.json"), &bytes);
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(&agy_session_hooks(&status_path)) {
+            let _ = atomic_write_session_file(&self.session_dir.join(".agents").join("hooks.json"), &bytes);
+        }
+
+        let skill_md = format!(
+            "---\n\
+             name: designos-studio\n\
+             description: Live per-file canvas & current-page MCP bridge for DESIGN:OS Studio ({doc_name} · {page_name}).\n\
+             ---\n\n\
+             # DESIGN:OS Studio — Per-File & Current-Page Live Agent Bridge\n\n\
+             You are running inside the dedicated terminal for file **`{doc_name}`** (session `{session_id}`).\n\
+             - **Active File**: `{doc_name}` (`$DESIGNOS_LIVE_CANVAS` = `{canvas}`)\n\
+             - **Current Selected Page**: `{page_name}` (`NodeId({page_id})`, `$DESIGNOS_TARGET_PAGE_ID` = `{page_id}`)\n\
+             - **Live Context JSON**: `{ctx}` (`$DESIGNOS_CONTEXT_JSON`)\n\
+             - **Live Spec Drop Path**: `{spec}` (`$DESIGNOS_LIVE_SPEC`)\n\
+             - **Live Doc Sync Path**: `{doc_sync}` (`$DESIGNOS_LIVE_DOC_SYNC`)\n\
+             - **Live Edit Log**: `{doc_patch}` (`$DESIGNOS_LIVE_DOC_PATCH`; written by `designos-mcp`, replayed by Studio in order, with a mark wherever you open another document)\n\n\
+             ## Automatic Current-Page Delivery Rules\n\
+             1. Every `designos-mcp` tool call (`designos_apply_spec`, `designos_create_node`, `designos_update_node`, `designos_query_xpath`, `designos_lint`, `designos_add_comment`) is already bound to **`{doc_name}`** and automatically targets the user's currently selected page **`{page_name}` (`NodeId({page_id})`)** when `parent_id` / `page_id` is omitted.\n\
+             2. Or write a declarative `NodeSpec` JSON tree directly to `$DESIGNOS_LIVE_SPEC` (`{spec}`) — DESIGN:OS Studio hot-applies it onto **`{page_name}`** in `< 50ms`.\n",
+            doc_name = self.doc_name,
+            page_name = self.current_page_name,
+            session_id = self.session_id,
+            page_id = self.current_page_id,
+            canvas = self.live_canvas_path.display(),
+            ctx = self.context_json_path.display(),
+            spec = self.live_spec_path.display(),
+            doc_sync = self.live_doc_sync_path.display(),
+            doc_patch = self.live_patch.path.display(),
+        );
+        let _ = atomic_write_session_file(&self.session_dir.join("SKILL.md"), skill_md.as_bytes());
+        let _ = atomic_write_session_file(&self.session_dir.join(".claude/skills/designos-studio/SKILL.md"), skill_md.as_bytes());
+        let _ = atomic_write_session_file(&self.session_dir.join(".agents/skills/designos-studio/SKILL.md"), skill_md.as_bytes());
+        // Codex, Grok and Antigravity read `AGENTS.md` from their cwd (the session dir).
+        let _ = atomic_write_session_file(&self.session_dir.join("AGENTS.md"), skill_md.as_bytes());
     }
 
     /// Screenshot fixture (`--panel agents-start-failure`): opens an Antigravity tab on a real
@@ -1089,19 +1121,7 @@ impl TerminalState {
         }
     }
 
-    /// Cancels/waits for any in-flight snapshot write and removes `self.session_dir` if it is an
-    /// ephemeral `/tmp/designos-sessions/<session_id>/` directory (never touching library
-    /// `<lib_root>/agent-sessions/<file_id>/` folders).
-    fn cleanup_ephemeral_session_dir(&mut self) {
-        self.snapshot_worker.cancel_and_wait();
-        if crate::agent_session_files::is_ephemeral_session_dir(&self.session_dir) {
-            let _ = std::fs::remove_dir_all(&self.session_dir);
-            self.last_synced_key = None;
-        }
-    }
-
-    /// Terminates all child PTY processes owned by this file's terminal state and cleans up its
-    /// ephemeral session folder (or releases its library lock).
+    /// Terminates all child PTY processes owned by this file's terminal state.
     pub fn shutdown(&mut self) {
         let mut reg_dirty = false;
         let now = crate::agent_sessions::unix_timestamp_secs();
@@ -1119,7 +1139,6 @@ impl TerminalState {
             let _ = crate::agent_sessions::save_registry(&self.session_dir, &self.session_registry);
         }
         self.release_lock();
-        self.cleanup_ephemeral_session_dir();
     }
 
     /// Returns `true` when the embedded terminal viewport is actively capturing raw keyboard input,
@@ -1374,7 +1393,7 @@ impl TerminalState {
     ) -> Result<usize, String> {
         let id = self.next_tab_id.max(1);
         self.next_tab_id = id + 1;
-        let _ = crate::agent_session_files::ensure_session_dir(&self.session_dir);
+        let _ = std::fs::create_dir_all(&self.session_dir);
         self.provision_session_agent_files(file_path);
         let env = self.session_env();
         let cmd_override = command.map(|c| {
@@ -1485,8 +1504,7 @@ impl TerminalState {
         }
     }
 
-    /// Closes tab at `idx`, killing its child process if still running, and cleans up the
-    /// ephemeral session folder when no tabs remain.
+    /// Closes tab at `idx`, killing its child process if still running.
     pub fn close_tab(&mut self, idx: usize) {
         if idx < self.tabs.len() {
             let mut removed = self.tabs.remove(idx);
@@ -1504,9 +1522,6 @@ impl TerminalState {
                 self.active_tab = 0;
             }
         }
-        if self.tabs.is_empty() {
-            self.cleanup_ephemeral_session_dir();
-        }
     }
 
     /// Returns a mutable reference to the currently active `TerminalTab`.
@@ -1522,14 +1537,10 @@ impl TerminalState {
     }
 
     /// Live bridge polling (`<50ms` hot-apply):
-    /// 1. Polls `self.live_spec_path` (`live-spec.json`) -> `TerminalAction::ApplySpecFile(...)`
+    /// 1. Polls `self.live_spec_path` (`live-spec.json`) and `/tmp/designos-live-agent-out.spec.json` -> `TerminalAction::ApplySpecFile(...)`
     /// 2. Polls `doc-patch.jsonl` (agent edits and document switches written by `designos-mcp`) -> `TerminalAction::ApplyLiveLog(...)`
     pub fn poll_live_agent_bridge(&mut self) -> Vec<TerminalAction> {
         let mut actions = Vec::new();
-
-        if let Some(err) = self.reconcile_snapshot_worker() {
-            actions.push(TerminalAction::LiveSyncError(err));
-        }
 
         // Channel 1: Scoped live-spec.json
         let live_spec = self.live_spec_path.clone();
@@ -1543,6 +1554,24 @@ impl TerminalState {
                     self.last_watched_mtime = Some(mtime);
                     self.status_msg = Some(format!("Hot-applied {} (<50ms)", live_spec.display()));
                     actions.push(TerminalAction::ApplySpecFile(live_spec));
+                }
+            }
+        }
+
+        // Channel 1b: Global fallback /tmp/designos-live-agent-out.spec.json (when distinct from self.live_spec_path)
+        let fallback_spec = PathBuf::from("/tmp/designos-live-agent-out.spec.json");
+        if !cfg!(test) && fallback_spec != self.live_spec_path {
+            if let Ok(meta) = std::fs::metadata(&fallback_spec) {
+                if let Ok(mtime) = meta.modified() {
+                    let is_newer = match self.last_fallback_spec_mtime {
+                        Some(prev) => mtime > prev,
+                        None => true,
+                    };
+                    if is_newer {
+                        self.last_fallback_spec_mtime = Some(mtime);
+                        self.status_msg = Some("Hot-applied /tmp/designos-live-agent-out.spec.json (<50ms)".into());
+                        actions.push(TerminalAction::ApplySpecFile(fallback_spec));
+                    }
                 }
             }
         }
@@ -2396,11 +2425,11 @@ fn build_agent_shell_cmd(shell_bin: &str, agent_cli: &str) -> CommandBuilder {
 /// `<session_dir>/.agents/plugins/designos/` (`plugin.json` + `mcp_config.json`, same bytes as
 /// `mcp-config.json`). `agy` 1.4.2 has no per-session MCP flag; launching with `--add-dir <session_dir>`
 /// makes it discover this plugin for that session only, leaving the user's global agy config untouched.
-fn write_agy_session_plugin(session_dir: &Path, mcp_config_bytes: &[u8]) -> std::io::Result<()> {
+fn write_agy_session_plugin(session_dir: &Path, mcp_config_bytes: &[u8]) {
     let plugin_dir = session_dir.join(".agents").join("plugins").join("designos");
     let manifest = br#"{"name":"designos"}"#;
-    atomic_write_session_file(&plugin_dir.join("plugin.json"), manifest)?;
-    atomic_write_session_file(&plugin_dir.join("mcp_config.json"), mcp_config_bytes)
+    let _ = atomic_write_session_file(&plugin_dir.join("plugin.json"), manifest);
+    let _ = atomic_write_session_file(&plugin_dir.join("mcp_config.json"), mcp_config_bytes);
 }
 
 /// Renders `s` as a TOML basic string. JSON string escapes are a valid subset of TOML's.
@@ -2420,8 +2449,8 @@ fn toml_key(k: &str) -> String {
 /// Publishes the session's `mcpServers` as Grok's project config `<session_dir>/.grok/config.toml`.
 /// Grok 1.0.62 has no per-session MCP flag; it merges the project layer of its cwd, so the tab is
 /// started with `--cwd <session_dir>` and the user's `~/.grok/config.toml` is never written.
-fn write_grok_session_config(session_dir: &Path, mcp_config: &serde_json::Value) -> std::io::Result<()> {
-    let Some(servers) = mcp_config.get("mcpServers").and_then(|v| v.as_object()) else { return Ok(()) };
+fn write_grok_session_config(session_dir: &Path, mcp_config: &serde_json::Value) {
+    let Some(servers) = mcp_config.get("mcpServers").and_then(|v| v.as_object()) else { return };
     let mut toml = String::new();
     for (name, server) in servers {
         let key = toml_key(name);
@@ -2444,106 +2473,16 @@ fn write_grok_session_config(session_dir: &Path, mcp_config: &serde_json::Value)
         }
         toml.push('\n');
     }
-    atomic_write_session_file(&session_dir.join(".grok").join("config.toml"), toml.as_bytes())
+    let _ = atomic_write_session_file(&session_dir.join(".grok").join("config.toml"), toml.as_bytes());
 }
 
 fn atomic_write_session_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    crate::agent_session_files::atomic_write_session_file(path, bytes)
-}
-
-/// Writes `mcp-config.json`, `hooks.json`, `SKILL.md`, `AGENTS.md`, and runtime-specific plugin/hook
-/// files for `job` into `job.session_dir` (`#690` §6).
-pub(crate) fn write_session_agent_files_for_job(job: &crate::agent_session_files::SnapshotJob) -> std::io::Result<()> {
-    let mcp_bin = designos_mcp_binary();
-    let workspace_dir = session_workspace_dir(job.file_path.as_deref());
-
-    let mcp_config = serde_json::json!({
-        "mcpServers": {
-            "designos": {
-                "command": mcp_bin.display().to_string(),
-                "args": ["--workspace", workspace_dir.display().to_string()],
-                "env": {
-                    "DESIGNOS_SESSION_DIR": job.session_dir.display().to_string(),
-                    "DESIGNOS_LIVE_CANVAS": job.live_canvas_path.display().to_string(),
-                    "DESIGNOS_LIVE_DOC_SYNC": job.live_doc_sync_path.display().to_string(),
-                    "DESIGNOS_LIVE_DOC_PATCH": job.live_doc_patch_path.display().to_string(),
-                    "DESIGNOS_LIVE_SPEC": job.live_spec_path.display().to_string(),
-                    "DESIGNOS_CONTEXT_JSON": job.context_json_path.display().to_string(),
-                    "DESIGNOS_TARGET_PAGE_ID": job.current_page_id.to_string(),
-                    "DESIGNOS_TARGET_PAGE_NAME": job.current_page_name,
-                    "DESIGNOS_DOC_NAME": job.doc_name,
-                    "DESIGNOS_FILE": job.file_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
-                }
-            }
-        }
-    });
-    let mcp_config_path = job.session_dir.join("mcp-config.json");
-    let bytes = serde_json::to_vec_pretty(&mcp_config).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    atomic_write_session_file(&mcp_config_path, &bytes)?;
-    write_agy_session_plugin(&job.session_dir, &bytes)?;
-    write_grok_session_config(&job.session_dir, &mcp_config)?;
-
-    let page_context = serde_json::json!({
-        "session_id": job.session_id,
-        "doc_name": job.doc_name,
-        "file_path": job.file_path.as_ref().map(|p| p.display().to_string()),
-        "current_page_id": job.current_page_id,
-        "current_page_name": job.current_page_name,
-    });
-    // Claude's reply to a prompt hook: the page as `additionalContext`, nothing that could block the prompt.
-    let context_reply_path = job.session_dir.join("page-context-reply.json");
-    let context_reply = serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": format!("DESIGN:OS Studio page context: {page_context}"),
-        }
-    });
-    let reply_bytes = serde_json::to_vec_pretty(&context_reply).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    atomic_write_session_file(&context_reply_path, &reply_bytes)?;
-
-    let status_path = job.session_dir.join("agent-status.json");
-    let hooks_bytes = serde_json::to_vec_pretty(&session_hooks_settings(&status_path, Some(&context_reply_path)))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    atomic_write_session_file(&job.session_dir.join("hooks.json"), &hooks_bytes)?;
-
-    let grok_hooks_bytes =
-        serde_json::to_vec_pretty(&session_hooks_settings(&status_path, None)).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    atomic_write_session_file(&job.session_dir.join(".grok").join("hooks").join("designos-status.json"), &grok_hooks_bytes)?;
-
-    let agy_hooks_bytes = serde_json::to_vec_pretty(&agy_session_hooks(&status_path)).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    atomic_write_session_file(&job.session_dir.join(".agents").join("hooks.json"), &agy_hooks_bytes)?;
-
-    let skill_md = format!(
-        "---\n\
-         name: designos-studio\n\
-         description: Live per-file canvas & current-page MCP bridge for DESIGN:OS Studio ({doc_name} · {page_name}).\n\
-         ---\n\n\
-         # DESIGN:OS Studio — Per-File & Current-Page Live Agent Bridge\n\n\
-         You are running inside the dedicated terminal for file **`{doc_name}`** (session `{session_id}`).\n\
-         - **Active File**: `{doc_name}` (`$DESIGNOS_LIVE_CANVAS` = `{canvas}`)\n\
-         - **Current Selected Page**: `{page_name}` (`NodeId({page_id})`, `$DESIGNOS_TARGET_PAGE_ID` = `{page_id}`)\n\
-         - **Live Context JSON**: `{ctx}` (`$DESIGNOS_CONTEXT_JSON`)\n\
-         - **Live Spec Drop Path**: `{spec}` (`$DESIGNOS_LIVE_SPEC`)\n\
-         - **Live Doc Sync Path**: `{doc_sync}` (`$DESIGNOS_LIVE_DOC_SYNC`)\n\
-         - **Live Edit Log**: `{doc_patch}` (`$DESIGNOS_LIVE_DOC_PATCH`; written by `designos-mcp`, replayed by Studio in order, with a mark wherever you open another document)\n\n\
-         ## Automatic Current-Page Delivery Rules\n\
-         1. Every `designos-mcp` tool call (`designos_apply_spec`, `designos_create_node`, `designos_update_node`, `designos_query_xpath`, `designos_lint`, `designos_add_comment`) is already bound to **`{doc_name}`** and automatically targets the user's currently selected page **`{page_name}` (`NodeId({page_id})`)** when `parent_id` / `page_id` is omitted.\n\
-         2. Or write a declarative `NodeSpec` JSON tree directly to `$DESIGNOS_LIVE_SPEC` (`{spec}`) — DESIGN:OS Studio hot-applies it onto **`{page_name}`** in `< 50ms`.\n",
-        doc_name = job.doc_name,
-        page_name = job.current_page_name,
-        session_id = job.session_id,
-        page_id = job.current_page_id,
-        canvas = job.live_canvas_path.display(),
-        ctx = job.context_json_path.display(),
-        spec = job.live_spec_path.display(),
-        doc_sync = job.live_doc_sync_path.display(),
-        doc_patch = job.live_doc_patch_path.display(),
-    );
-    atomic_write_session_file(&job.session_dir.join("SKILL.md"), skill_md.as_bytes())?;
-    atomic_write_session_file(&job.session_dir.join(".claude/skills/designos-studio/SKILL.md"), skill_md.as_bytes())?;
-    atomic_write_session_file(&job.session_dir.join(".agents/skills/designos-studio/SKILL.md"), skill_md.as_bytes())?;
-    // Codex, Grok and Antigravity read `AGENTS.md` from their cwd (the session dir).
-    atomic_write_session_file(&job.session_dir.join("AGENTS.md"), skill_md.as_bytes())
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Shell command that records `state` for the Agents panel (`agent-status.json`, read by `poll_agent_status`).
@@ -2655,9 +2594,8 @@ pub fn configure_pty_env_with_session(cmd: &mut CommandBuilder, preset: AgentCli
         cmd.env("DESIGNOS_TARGET_PAGE_NAME", &sess.current_page_name);
         cmd.env("DESIGNOS_DOC_NAME", &sess.doc_name);
     } else {
-        let fallback_dir = std::env::temp_dir().join("designos-sessions").join(tab_session_id(&format!("p{}", std::process::id()), 1));
-        cmd.env("DESIGNOS_LIVE_SPEC", fallback_dir.join("live-spec.json").as_os_str());
-        cmd.env("DESIGNOS_SELECTION_JSON", fallback_dir.join("selection.spec.json").as_os_str());
+        cmd.env("DESIGNOS_LIVE_SPEC", "/tmp/designos-live-agent-out.spec.json");
+        cmd.env("DESIGNOS_SELECTION_JSON", "/tmp/designos-live-selection.spec.json");
     }
 
     if let Ok(exe) = std::env::current_exe() {
@@ -2757,9 +2695,9 @@ fn is_valid_node_spec_json(candidate: &str) -> bool {
 }
 
 /// Serializes the active selection (or first top-level frame on `page`) to
-/// the session's `selection.spec.json` with a `designos_context` object (node name, id, open
-/// pin-comments). Pastes only a fixed file-reference sentence into a live agent tab (never node
-/// name, id, or comment text).
+/// the session's `selection.spec.json` (plus `/tmp/designos-live-selection.spec.json`) with a
+/// `designos_context` object (node name, id, open pin-comments). Pastes only a fixed
+/// file-reference sentence into a live agent tab (never node name, id, or comment text).
 pub fn export_selection_and_comments_to_pty(
     state: &mut TerminalState,
     doc: &Document,
@@ -2798,7 +2736,9 @@ pub fn export_selection_and_comments_to_pty(
         );
     }
     let json = serde_json::to_string_pretty(&json_value).map_err(|e| e.to_string())?;
-    atomic_write_session_file(&state.selection_spec_path, json.as_bytes()).map_err(|e| format!("write {}: {e}", state.selection_spec_path.display()))?;
+    let _ = atomic_write_session_file(&state.selection_spec_path, json.as_bytes());
+    let tmp_path = std::env::temp_dir().join("designos-live-selection.spec.json");
+    std::fs::write(&tmp_path, &json).map_err(|e| format!("write {}: {e}", tmp_path.display()))?;
 
     let cmd_snippet =
         format!("Read the design:os selection at {} (node spec plus open pin-comments under \"designos_context\").", state.selection_spec_path.display());
@@ -3458,12 +3398,12 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
 }
 
 fn render_runtime_dropdown_menu(state: &mut TerminalState, ui: &mut Ui, panel_rect: Rect, top_y: f32, file_path: Option<&Path>) {
-    let min_menu_w = theme::CONTROL_STANDARD * 6.0 + theme::INSET_PANEL;
+    let min_menu_w = theme::CONTROL_STANDARD * 6.0 + theme::SPACE_BLOCK;
     let max_menu_w = theme::CONTROL_STANDARD * 8.0;
     let menu_w = (panel_rect.width() - theme::SPACE_SECTION).clamp(min_menu_w, max_menu_w);
     let entries = [AgentCliPreset::Claude, AgentCliPreset::Codex, AgentCliPreset::Grok, AgentCliPreset::Antigravity, AgentCliPreset::Shell];
     let last_resume = state.resumable_sessions().first().map(|e| (e.title.clone(), e.cli.clone()));
-    let row_h = theme::CONTROL_STANDARD + theme::SPACE_ROW;
+    let row_h = theme::CONTROL_STANDARD + theme::SPACE_INLINE;
     let header_h = theme::CONTROL_DENSE;
     let extra_rows = if last_resume.is_some() { 1.0 } else { 0.0 };
     let menu_h = header_h + (entries.len() as f32 + extra_rows) * row_h + theme::SPACE_INLINE;
@@ -3475,10 +3415,10 @@ fn render_runtime_dropdown_menu(state: &mut TerminalState, ui: &mut Ui, panel_re
     p.rect_stroke(menu_r, CornerRadius::same(8), Stroke::new(1.0, Color32::from_rgb(0x3E, 0x3E, 0x46)), StrokeKind::Inside);
     widgets::record(ui, "agents-runtime-dropdown-menu", menu_r);
 
-    let row_y1 = theme::SPACE_ROW + theme::SPACE_FACT;
+    let row_y1 = theme::SPACE_INLINE + theme::SPACE_ROW;
     let row_y2 = theme::CONTROL_DENSE - 1.0;
-    let hdr_y = theme::INSET_PANEL + 1.0;
-    let elide_pad = theme::INSET_PANEL + theme::SPACE_ROW;
+    let hdr_y = theme::SPACE_GROUP + 1.0;
+    let elide_pad = theme::SPACE_BLOCK + theme::SPACE_ROW;
     let elide_min = theme::CONTROL_DENSE + theme::SPACE_SECTION;
     p.text(
         Pos2::new(menu_r.left() + row_y1, menu_r.top() + hdr_y),
@@ -3487,7 +3427,7 @@ fn render_runtime_dropdown_menu(state: &mut TerminalState, ui: &mut Ui, panel_re
         theme::font_caption_strong(),
         theme::TEXT_SECONDARY,
     );
-    widgets::hline(&p, menu_r.left() + theme::SPACE_ROW, menu_r.right() - theme::SPACE_ROW, menu_r.top() + header_h, TERM_BORDER);
+    widgets::hline(&p, menu_r.left() + theme::SPACE_INLINE, menu_r.right() - theme::SPACE_INLINE, menu_r.top() + header_h, TERM_BORDER);
 
     let mut resume_clicked = false;
     let mut row_offset = 0usize;
@@ -4633,16 +4573,17 @@ Done!
 
     #[test]
     fn poll_live_agent_bridge_detects_updated_spec_file() {
+        let _ = std::fs::remove_file("/tmp/designos-live-agent-out.spec.json");
+        let live_path = std::env::temp_dir().join(format!("designos-live-agent-test-{}.spec.json", std::process::id()));
         let mut st = TerminalState::default();
-        let _ = std::fs::create_dir_all(&st.session_dir);
-        let live_path = st.live_spec_path.clone();
         st.last_watched_mtime = Some(std::time::UNIX_EPOCH);
+        st.live_spec_path = live_path.clone();
         let _ = std::fs::write(&live_path, r#"{"name":"Live Agent Frame","preset":"easeui-card"}"#);
         let actions = st.poll_live_agent_bridge();
         assert_eq!(actions, vec![TerminalAction::ApplySpecFile(live_path.clone())]);
         // Subsequent poll without modification returns empty
         assert!(st.poll_live_agent_bridge().is_empty());
-        st.shutdown();
+        let _ = std::fs::remove_file(&live_path);
     }
 
     #[test]
@@ -4848,8 +4789,8 @@ Done!
         configure_pty_env(&mut cmd, AgentCliPreset::Codex, None);
         assert_eq!(cmd.get_env("DESIGNOS_AGENT_RUNTIME"), Some(std::ffi::OsStr::new("codex")));
 
-        let live_spec = std::path::Path::new("/tmp/designos-sessions/session-x/live-spec.json");
-        let sel_json = std::path::Path::new("/tmp/designos-sessions/session-x/selection.spec.json");
+        let live_spec = std::path::Path::new("/tmp/designos-live-agent-out.spec.json");
+        let sel_json = std::path::Path::new("/tmp/designos-selection.json");
         let grok_cmd = build_real_cli_command(AgentCliPreset::Grok, "Build card", live_spec, sel_json);
         assert!(grok_cmd.contains("DESIGNOS_AGENT_RUNTIME='grok'"));
     }
@@ -4865,8 +4806,8 @@ Done!
         assert!(AgentCliPreset::Antigravity.cli_launch_command().starts_with("agy --dangerously-skip-permissions"));
         assert_eq!(AgentCliPreset::Shell.cli_launch_command(), "");
 
-        let live_spec = std::path::Path::new("/tmp/designos-sessions/session-x/live-spec.json");
-        let sel_json = std::path::Path::new("/tmp/designos-sessions/session-x/selection.spec.json");
+        let live_spec = std::path::Path::new("/tmp/designos-live-agent-out.spec.json");
+        let sel_json = std::path::Path::new("/tmp/designos-selection.json");
         let claude_cmd = build_real_cli_command(AgentCliPreset::Claude, "Create a SaaS hero frame", live_spec, sel_json);
         assert!(claude_cmd.contains("claude --dangerously-skip-permissions -p"));
         assert!(claude_cmd.contains("--mcp-config"));
@@ -4986,9 +4927,7 @@ Done!
         let beta_page = doc2.add_page("Page 1");
 
         st1.sync_live_file_context(&doc1, page2, &[], None);
-        st1.flush_live_sync();
         st2.sync_live_file_context(&doc2, beta_page, &[], None);
-        st2.flush_live_sync();
 
         assert_eq!(st1.current_page_id, page2.0);
         assert_eq!(st1.current_page_name, "Page 2 — Agent Target");
@@ -5503,6 +5442,7 @@ Done!
     #[test]
     fn export_selection_pastes_fixed_sentence_only() {
         let mut st = TerminalState::default();
+        st.bind_session(format!("p{}-export-sel", std::process::id()));
         st.spawn_tab(AgentCliPreset::Shell, None).expect("spawn");
         st.active_tab_mut().unwrap().spawn_preset = AgentCliPreset::Claude;
         let rec = attach_recorder(st.active_tab_mut().unwrap());
@@ -5559,6 +5499,7 @@ Done!
         let _ = std::fs::remove_file(&marker);
 
         let mut st = TerminalState::default();
+        st.bind_session(format!("p{pid}-dead-agent"));
         spawn_stub_exiting_agent_into(&mut st);
         assert!(wait_until_tab_exits(&mut st, 8), "stub agent must exit");
         assert!(!st.active_tab_mut().unwrap().is_alive());
@@ -5746,7 +5687,6 @@ Done!
         let mut doc = Document::new("Agy Plugin File");
         let page = doc.add_page("Page 1");
         st.sync_live_file_context(&doc, page, &[], Some(std::path::Path::new("/tmp/agy-plugin-file.designos")));
-        st.flush_live_sync();
 
         let plugin_dir = st.session_dir.join(".agents").join("plugins").join("designos");
         let manifest: serde_json::Value =
@@ -5783,7 +5723,6 @@ Done!
         let mut doc = Document::new("Grok Project Config File");
         let page = doc.add_page("Page 1");
         st.sync_live_file_context(&doc, page, &[], Some(std::path::Path::new("/tmp/grok \"quoted\" file.designos")));
-        st.flush_live_sync();
 
         let toml = std::fs::read_to_string(st.session_dir.join(".grok").join("config.toml")).expect(".grok/config.toml");
         assert!(toml.contains("[mcp_servers.designos]\n"), "{toml}");
@@ -5830,7 +5769,6 @@ Done!
         let page = doc.add_page("Page 1");
         let file = std::env::temp_dir().join("codex-env-file.designos");
         st.sync_live_file_context(&doc, page, &[], Some(&file));
-        st.flush_live_sync();
         let env = st.session_env();
         let mut cmd = CommandBuilder::new("true");
         configure_pty_env_with_session(&mut cmd, AgentCliPreset::Codex, Some(&file), Some(&env));
@@ -5901,7 +5839,6 @@ Done!
         let mut doc = Document::new("Skill Layout File");
         let page = doc.add_page("Page 1");
         st.sync_live_file_context(&doc, page, &[], None);
-        st.flush_live_sync();
         for rel in [".claude/skills/designos-studio/SKILL.md", ".agents/skills/designos-studio/SKILL.md", "AGENTS.md"] {
             let text = std::fs::read_to_string(st.session_dir.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
             assert!(text.contains("designos-studio") && text.contains("Skill Layout File"), "{rel}: {text}");
@@ -5930,7 +5867,6 @@ Done!
         let page = doc.add_page("Page 1");
         let a = doc.add_page("Page 2");
         st.sync_live_file_context(&doc, page, &[a], None);
-        st.flush_live_sync();
         let _ = std::fs::remove_file(st.session_dir.join("agent-status.json"));
         st
     }
