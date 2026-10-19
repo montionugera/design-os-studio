@@ -679,6 +679,8 @@ pub struct TerminalState {
     pub search_query: String,
     /// Whether `Cmd+F` terminal search is case-sensitive (`Aa`).
     pub search_case_sensitive: bool,
+    /// Built-in and user `SKILL.md` attachments for agent design runs (`RD-4`).
+    pub skills: crate::skills::SkillsAttachmentState,
 }
 
 impl Default for TerminalState {
@@ -752,6 +754,7 @@ impl TerminalState {
             search_open: false,
             search_query: String::new(),
             search_case_sensitive: false,
+            skills: crate::skills::SkillsAttachmentState::default(),
         }
     }
 
@@ -894,15 +897,22 @@ impl TerminalState {
         });
         // Claude's reply to a prompt hook: the page as `additionalContext`, nothing that could block the prompt.
         let context_reply_path = self.session_dir.join("page-context-reply.json");
+        let fenced_skills = self.skills.format_fenced_blocks();
+        let additional_context = if fenced_skills.is_empty() {
+            format!("DESIGN:OS Studio page context: {page_context}")
+        } else {
+            format!("DESIGN:OS Studio page context: {page_context}\n\n{fenced_skills}")
+        };
         let context_reply = serde_json::json!({
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
-                "additionalContext": format!("DESIGN:OS Studio page context: {page_context}"),
+                "additionalContext": additional_context,
             }
         });
         if let Ok(bytes) = serde_json::to_vec_pretty(&context_reply) {
             let _ = atomic_write_session_file(&context_reply_path, &bytes);
         }
+        let _ = self.skills.write_run_record(&self.session_dir, &self.session_id, self.active_runtime);
         let status_path = self.session_dir.join("agent-status.json");
         if let Ok(bytes) = serde_json::to_vec_pretty(&session_hooks_settings(&status_path, Some(&context_reply_path))) {
             let _ = atomic_write_session_file(&self.session_dir.join("hooks.json"), &bytes);
@@ -1031,8 +1041,14 @@ impl TerminalState {
         if trimmed.is_empty() {
             return;
         }
+        if let Some(violation) = self.skills.limit_violation() {
+            self.status_msg = Some(violation);
+            return;
+        }
         self.ensure_default_tab(file_path);
         let runtime = self.active_runtime;
+        self.provision_session_agent_files(file_path);
+        let _ = self.skills.write_run_record(&self.session_dir, &self.session_id, runtime);
         if let Some(tab) = self.active_tab_mut() {
             tab.preset = runtime;
             tab.title = format!("{} #{}", runtime.tab_title(), tab.id);
@@ -1067,7 +1083,8 @@ impl TerminalState {
         let raw_cmd = if is_raw_shell { trimmed.trim_start_matches('$').trim_start_matches('!').trim().to_string() } else { String::new() };
 
         let selection_path = self.selection_spec_path.clone();
-        let real_cli_cmd = build_real_cli_command(runtime, trimmed, &self.live_spec_path, &selection_path);
+        let prompt_with_skills = if runtime == AgentCliPreset::Claude { trimmed.to_string() } else { self.skills.attach_to_prompt(runtime, trimmed) };
+        let real_cli_cmd = build_real_cli_command(runtime, &prompt_with_skills, &self.live_spec_path, &selection_path);
         let display_cmd = if is_raw_shell { raw_cmd.clone() } else { real_cli_cmd.clone() };
 
         let run_real_cli = !is_raw_shell
@@ -2604,10 +2621,16 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
         let ctx_r = Rect::from_min_size(Pos2::new(rect.left(), bar_r.bottom()), Vec2::new(rect.width(), ctx_h));
         p.rect_filled(ctx_r, 0.0, TERM_BG_ELEVATED);
         widgets::hline(&p, ctx_r.left(), ctx_r.right(), ctx_r.bottom() - 1.0, TERM_BORDER);
+        let skills_chip_w = 68.0;
+        let skills_chip_r =
+            Rect::from_min_size(Pos2::new((ctx_r.right() - skills_chip_w - 4.0).max(ctx_r.left() + 80.0), ctx_r.top() + 2.0), Vec2::new(skills_chip_w, 16.0));
         let ctx_badge = format!("{} · {}", state.doc_name, state.current_page_name);
-        let ctx_elided = widgets::elide(&p, &ctx_badge, &theme::font_caption(), (ctx_r.width() - 24.0).max(40.0));
+        let ctx_elided = widgets::elide(&p, &ctx_badge, &theme::font_caption(), (skills_chip_r.left() - ctx_r.left() - 22.0).max(32.0));
         p.circle_filled(Pos2::new(ctx_r.left() + 10.0, ctx_r.center().y), 2.5, STATUS_INFO_TEXT);
         p.text(Pos2::new(ctx_r.left() + 17.0, ctx_r.center().y), Align2::LEFT_CENTER, ctx_elided, theme::font_caption(), STATUS_INFO_TEXT);
+        if state.skills.paint_chip(ui, &p, skills_chip_r, "agents-skills-picker-btn") {
+            state.provision_session_agent_files(file_path);
+        }
 
         // Live VT100 PTY Terminal Viewport (full height)
         let vp_r = Rect::from_min_max(Pos2::new(rect.left(), ctx_r.bottom()), rect.max);
@@ -2621,6 +2644,7 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
         if state.runtime_dropdown_open {
             render_runtime_dropdown_menu(state, ui, rect, bar_r.bottom() + 4.0, file_path);
         }
+        state.skills.show_picker_popover(ui, rect, (ctx_r.bottom() + 250.0).min(rect.bottom() - 8.0));
 
         let repaint_ms = if state.viewport_focused { 50 } else { 500 };
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(repaint_ms));
@@ -3050,6 +3074,12 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
         }
     }
 
+    // Bottom-left `Skills` picker chip button (`RD-4`)
+    let skills_r = Rect::from_center_size(Pos2::new(composer_rect.left() + 138.0, icon_y), Vec2::new(66.0, 20.0));
+    if state.skills.paint_chip(ui, &p, skills_r, "agents-composer-skills") {
+        state.provision_session_agent_files(file_path);
+    }
+
     // Bottom-right Microphone circle button (`26x26` `#2D364D` circle + `#6EA8FE` mic glyph)
     let mic_center = Pos2::new(composer_rect.right() - 50.0, icon_y);
     let mic_r = Rect::from_center_size(mic_center, Vec2::splat(26.0));
@@ -3067,11 +3097,14 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
     }
 
     // Bottom-right Up-Arrow Send circle button (`26x26` `#383838` / `#0D99FF` circle + `↑` arrow)
-    let has_text = !state.input_line.trim().is_empty();
+    let can_start = state.skills.can_start_run();
+    let has_text = !state.input_line.trim().is_empty() && can_start;
     let send_center = Pos2::new(composer_rect.right() - 18.0, icon_y);
     let send_r = Rect::from_center_size(send_center, Vec2::splat(26.0));
     let send_resp = ui.interact(send_r, Id::new("agents-composer-send"), Sense::click());
-    let send_bg = if has_text {
+    let send_bg = if !can_start {
+        STATUS_BAD_BG
+    } else if has_text {
         Color32::from_rgb(0x0D, 0x99, 0xFF)
     } else if send_resp.hovered() {
         Color32::from_rgb(0x45, 0x45, 0x45)
@@ -3081,7 +3114,7 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
     p.circle_filled(send_center, 13.0, send_bg);
     paint_up_arrow_icon(&p, send_center, if has_text { Color32::WHITE } else { icon_gray });
     widgets::record(ui, "agents-composer-send", send_r);
-    if send_resp.clicked() {
+    if send_resp.clicked() && can_start {
         submit_composer = true;
     }
 
@@ -3099,6 +3132,8 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
             }
         }
     }
+
+    state.skills.show_picker_popover(ui, rect, composer_rect.top());
 
     actions
 }
