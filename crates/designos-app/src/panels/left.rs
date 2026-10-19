@@ -16,8 +16,25 @@ pub fn show(app: &mut App, ui: &mut Ui, rect: Rect) {
     let inner = Rect::from_min_max(rect.min, Pos2::new(rect.right() - theme::BORDER_WIDTH, rect.bottom()));
     if matches!(app.ui.rail, Some(crate::app::RailItem::Agents | crate::app::RailItem::Tools)) {
         let fp = app.file_path.clone();
-        let actions = crate::terminal::show_left(&mut app.terminal, ui, inner, fp.as_deref());
+        let tab_idx = app.terminal.active_tab;
+        let card_h = crate::agent_turn_card::desired_card_height(app, tab_idx);
+        let term_rect = if card_h > 0.0 {
+            let reserve = (card_h + theme::INSET_FRAME * 2.0).min(inner.height() * 0.5);
+            Rect::from_min_max(inner.min, Pos2::new(inner.right(), inner.bottom() - reserve))
+        } else {
+            inner
+        };
+        let actions = crate::terminal::show_left(&mut app.terminal, ui, term_rect, fp.as_deref());
         crate::shell::execute_terminal_actions(app, actions);
+        let tab_idx = app.terminal.active_tab;
+        let card_h = crate::agent_turn_card::desired_card_height(app, tab_idx);
+        if card_h > 0.0 {
+            let reserve = (card_h + theme::INSET_FRAME * 2.0).min(inner.height() * 0.5);
+            let card_outer = Rect::from_min_max(Pos2::new(inner.left(), inner.bottom() - reserve), inner.max);
+            p.rect_filled(card_outer, 0.0, theme::BG);
+            widgets::hline(&p, card_outer.left(), card_outer.right(), card_outer.top(), theme::BORDER);
+            crate::agent_turn_card::show_in_rect(ui, app, tab_idx, card_outer);
+        }
         return;
     }
     if app.ui.rail == Some(crate::app::RailItem::Assets) {

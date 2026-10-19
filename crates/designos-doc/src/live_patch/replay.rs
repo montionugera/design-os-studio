@@ -4,6 +4,7 @@ use super::replay_comments::{resolve_comments, CommentRemap};
 use super::validate::insert_problem;
 use super::{LiveOp, LivePatch, SiblingHint, LIVE_PATCH_VERSION, STRUCTURAL_FIELDS};
 use crate::{Command, DocError, Document, Node, NodeId, NodeKind};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -56,11 +57,22 @@ fn resolve_id(remap: &BTreeMap<NodeId, NodeId>, replaced: &BTreeMap<NodeId, Node
 /// apply to the replacement.
 const SHAPE_FIELDS: [&str; 6] = ["transform", "size", "kind", "fill_geometry", "stroke_geometry", "corner_radii"];
 
+/// Kind of layer change applied by a [`LiveOp`] during [`replay_live_patch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TouchKind {
+    Inserted,
+    Updated,
+    Moved,
+    Removed,
+}
+
 /// What a replay did, for the toast, the post-replay layout pass and tests.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LivePatchReport {
     /// Roots of inserted subtrees, in insertion order.
     pub inserted_roots: Vec<NodeId>,
+    /// Layers touched by applied ops, in op order, using editor-side ids after remap.
+    pub touched: Vec<(NodeId, TouchKind)>,
     /// Nodes whose change can move or resize siblings in an auto-layout container: new or
     /// removed children, moves, and size, visibility or layout changes.
     pub needs_layout: Vec<NodeId>,
@@ -164,6 +176,7 @@ fn resolve(doc: &mut Document, op: &LiveOp, state: &mut LivePatchState, report: 
             if set.keys().chain(unset).any(|k| LAYOUT_FIELDS.contains(&k.as_str())) {
                 report.needs_layout.push(id);
             }
+            report.touched.push((id, TouchKind::Updated));
             Some(Command::Update { node: Box::new(merged) })
         }
         LiveOp::Reparent { id: agent_id, parent: agent_parent, at } => {
@@ -199,6 +212,7 @@ fn resolve(doc: &mut Document, op: &LiveOp, state: &mut LivePatchState, report: 
             }
             report.needs_layout.extend(node.parent);
             report.needs_layout.extend([parent, id]);
+            report.touched.push((id, TouchKind::Moved));
             Some(Command::Reparent { id, parent, index })
         }
         LiveOp::Remove { id } => {
@@ -212,6 +226,7 @@ fn resolve(doc: &mut Document, op: &LiveOp, state: &mut LivePatchState, report: 
                 return None;
             };
             report.needs_layout.push(parent);
+            report.touched.push((id, TouchKind::Removed));
             Some(Command::Remove { id })
         }
         LiveOp::Comments { added, changed, removed } => {
@@ -299,6 +314,7 @@ fn resolve_insert(
     let siblings = &doc.get(parent)?.children;
     let index = remap_hint(at, state).index_in(siblings);
     report.inserted_roots.push(nodes[0].id);
+    report.touched.push((nodes[0].id, TouchKind::Inserted));
     report.needs_layout.push(parent);
     Some(Command::Insert { parent, index, nodes })
 }

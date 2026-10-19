@@ -13,7 +13,7 @@ mod replay_comments;
 mod validate;
 
 pub use record::live_ops_for_command;
-pub use replay::{replay_live_patch, LivePatchReport, LivePatchState};
+pub use replay::{replay_live_patch, LivePatchReport, LivePatchState, TouchKind};
 
 use crate::{Comment, CommentAnchor, CommentThread, Node, NodeId};
 use serde::{Deserialize, Serialize};
