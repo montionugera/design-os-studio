@@ -1,3 +1,5 @@
+mod agent_mention;
+mod agent_mention_popup;
 mod agent_selection_chip;
 mod agent_start_failure;
 mod app;

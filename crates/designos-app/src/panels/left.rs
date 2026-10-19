@@ -17,7 +17,7 @@ pub fn show(app: &mut App, ui: &mut Ui, rect: Rect) {
     if matches!(app.ui.rail, Some(crate::app::RailItem::Agents | crate::app::RailItem::Tools)) {
         let fp = app.file_path.clone();
         let actions = crate::agent_selection_chip::with_selection_summary(&app.doc, app.page, &app.selection, |summary| {
-            crate::terminal::show_left_with_selection(&mut app.terminal, ui, inner, fp.as_deref(), summary)
+            crate::terminal::show_left_with_doc(&mut app.terminal, ui, inner, fp.as_deref(), summary, &app.doc, app.page)
         });
         crate::shell::execute_terminal_actions(app, actions);
         return;
