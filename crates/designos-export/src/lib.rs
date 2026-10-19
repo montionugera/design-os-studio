@@ -17,9 +17,10 @@ mod bounds;
 mod codegen;
 mod compose;
 mod css;
+pub mod design_context;
 mod geo;
 pub mod html;
-mod language;
+pub mod language;
 mod pdf;
 mod raster;
 mod react;
@@ -29,7 +30,7 @@ mod swiftui;
 mod tailwind;
 mod text;
 mod uikit;
-mod util;
+pub mod util;
 
 pub use agent_context::{escape_xml_attr, fmt_f32_2, metadata_xml, structural_lint_counts, xml_tag_name, MetadataOptions, MetadataXml};
 pub use android_xml::android_xml_for;
@@ -39,7 +40,7 @@ pub use codegen::{is_vector_asset, vector_assets};
 pub use compose::compose_for;
 pub use css::{css_for, font_family_css, paint_css, text_style_css};
 pub use html::{html_for, html_with, HtmlOptions};
-pub use language::CodeLanguage;
+pub use language::{CodeLanguage, CodeLanguageOptions};
 pub use pdf::export_pdf;
 pub use raster::{encode_jpg_pixmap, encode_png_pixmap, export_jpg, export_png, export_webp, render_export, rgba_bytes, ExportScale};
 pub use react::{react_for, react_with, ReactOptions};
@@ -48,7 +49,7 @@ pub use swiftui::swiftui_for;
 pub use tailwind::tailwind_for;
 pub use text::register_font;
 pub use uikit::uikit_for;
-pub use util::css_color;
+pub use util::{css_color, fmt_num};
 pub use {base64, designos_render, image, tiny_skia};
 
 /// Output file format of an export setting.
