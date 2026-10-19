@@ -110,10 +110,7 @@ mod tests {
 
     #[test]
     fn language_ids_round_trip_in_dropdown_order() {
-        assert_eq!(
-            CodeLanguage::ALL.map(CodeLanguage::id),
-            ["css", "tailwind", "swiftui", "uikit", "compose", "android-xml", "react", "html"]
-        );
+        assert_eq!(CodeLanguage::ALL.map(CodeLanguage::id), ["css", "tailwind", "swiftui", "uikit", "compose", "android-xml", "react", "html"]);
         for lang in CodeLanguage::ALL {
             assert_eq!(CodeLanguage::from_id(lang.id()), Some(lang));
         }
