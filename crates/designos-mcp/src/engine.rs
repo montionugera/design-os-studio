@@ -304,49 +304,7 @@ impl Engine {
                 std::fs::write(path, &bytes).map_err(|e| format!("Cannot write .fig file: {e}"))?;
                 Ok(json!({"output_path": a.output_path, "path": a.output_path, "bytes": bytes.len(), "saved": true}))
             }
-            "designos_query_xpath" | "query_nodes" => {
-                let a: QueryXpathArgs = parse(args)?;
-                let root = a.page_id.map(NodeId).or_else(|| self.resolve_default_page().ok());
-                let selector = a.selector.trim();
-                let mut matches = Vec::new();
-                let mut visit = |n: &Node| {
-                    let kind_upper = n.kind.default_name().to_ascii_uppercase();
-                    let matched = if selector.is_empty() || selector == "//*" || selector == "*" {
-                        true
-                    } else if let Some(tag) = selector.strip_prefix("//") {
-                        if let Some((tag_part, pred)) = tag.split_once('[') {
-                            let tag_ok = tag_part.is_empty() || tag_part == "*" || kind_upper == tag_part.to_ascii_uppercase();
-                            let pred_clean = pred.trim_end_matches(']');
-                            let name_ok = if let Some(val) = pred_clean.strip_prefix("@name=") {
-                                let unquoted = val.trim().trim_matches('\'').trim_matches('"');
-                                n.name == unquoted
-                            } else if pred_clean.contains("contains(@name") {
-                                let parts: Vec<&str> = pred_clean.split(['\'', '"']).collect();
-                                parts.get(1).is_some_and(|needle| n.name.to_lowercase().contains(&needle.to_lowercase()))
-                            } else {
-                                true
-                            };
-                            tag_ok && name_ok
-                        } else {
-                            kind_upper == tag.to_ascii_uppercase() || n.name.to_lowercase().contains(&tag.to_lowercase())
-                        }
-                    } else {
-                        n.name.to_lowercase().contains(&selector.to_lowercase()) || kind_upper == selector.to_ascii_uppercase()
-                    };
-                    if matched {
-                        matches.push(summary(n));
-                    }
-                };
-                if let Some(r) = root {
-                    self.doc.walk(r, |n, _| visit(n));
-                } else {
-                    for n in self.doc.nodes.values() {
-                        visit(n);
-                    }
-                }
-                let total = matches.len();
-                Ok(json!({"selector": a.selector, "page_id": root.map(|r| r.0), "nodes": matches, "total": total}))
-            }
+            "designos_query_xpath" | "query_nodes" => crate::tools::query::execute_query_xpath(&self.doc, self.resolve_default_page().ok(), args),
             "designos_lint" | "check_design" | "designos_lint_fix" => {
                 let a: LintArgs = parse(args)?;
                 if (a.page_id.is_some() && (a.node_ids.is_some() || a.node_id.is_some())) || (a.node_id.is_some() && a.node_ids.is_some()) {
@@ -745,14 +703,6 @@ pub(crate) struct ExportFigArgs {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct QueryXpathArgs {
-    #[serde(default, alias = "query")]
-    selector: String,
-    #[serde(default)]
-    page_id: Option<u64>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct LintArgs {
     #[serde(default)]
     page_id: Option<u64>,
@@ -909,6 +859,15 @@ pub fn tools() -> Vec<Value> {
             "cursor": {"type": "string"}
         }),
         vec![],
+        true,
+        true,
+    );
+    let (q_props, q_req) = crate::tools::query::tool_schema(&id);
+    add(
+        "query_xpath",
+        "Query layers in a page or subtree with a streaming single-pass XPath evaluator, node budget, cursor pagination, compact rows, and solver-backed linter predicates (has-problem, is-bound, has-hardcoded, @problems, @inProgress).",
+        q_props,
+        q_req,
         true,
         true,
     );

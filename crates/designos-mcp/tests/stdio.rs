@@ -10,7 +10,7 @@ async fn stdio_handshake_discovery_edit_and_error_recovery() {
         let client = ().serve(TokioChildProcess::new(command).unwrap()).await.unwrap();
         assert_eq!(client.peer_info().unwrap().server_info.as_ref().unwrap().name, "designos-mcp");
         let tools = client.list_all_tools().await.unwrap();
-        assert_eq!(tools.len(), 23);
+        assert_eq!(tools.len(), 24);
         assert!(tools.iter().all(|t| t.annotations.is_some()));
         let call = |name: &'static str, args: Value| CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone());
         let doc = client.call_tool(call("designos_get_document", json!({}))).await.unwrap();
@@ -36,6 +36,11 @@ async fn stdio_handshake_discovery_edit_and_error_recovery() {
             .await
             .unwrap();
         assert_eq!(applied.is_error, Some(false));
+        let queried = client.call_tool(call("designos_query_xpath", json!({"selector":"//Text","verbosity":"compact"}))).await.unwrap();
+        assert_eq!(queried.is_error, Some(false));
+        let qbody = queried.structured_content.unwrap();
+        assert_eq!(qbody["count"], 1);
+        assert_eq!(qbody["complete"], true);
         let linted = client.call_tool(call("designos_lint", json!({"preset":"agent"}))).await.unwrap();
         assert_eq!(linted.is_error, Some(false));
         let lint_body = linted.structured_content.unwrap();

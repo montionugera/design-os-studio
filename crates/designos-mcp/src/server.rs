@@ -392,8 +392,8 @@ impl Session {
                     return Err("Unsaved changes: save to a new .designos/.designos file, or set discard_changes=true".into());
                 }
                 let path = self.input_path(&a.path)?;
-                if fs::metadata(&path).map_err(|e| e.to_string())?.len() > 64 * 1024 * 1024 {
-                    return Err("Input file exceeds the 64 MiB import limit".into());
+                if fs::metadata(&path).map_err(|e| e.to_string())?.len() > 512 * 1024 * 1024 {
+                    return Err("Input file exceeds the 512 MiB import limit".into());
                 }
                 // Native files are checked before the loader repairs them, so a broken node graph is
                 // refused instead of silently rewritten.
@@ -570,9 +570,11 @@ fn parse_native_checked(raw: &str) -> Result<(designos_doc::Document, designos_d
 /// Reject broken graphs before recursive exporters or inherited-mode resolution use them.
 fn validate_document(doc: &designos_doc::Document) -> Result<(), String> {
     use std::collections::BTreeSet;
-    if doc.nodes.len() > 100_000 {
-        return Err("Document exceeds the 100000 layer limit".into());
+    if doc.nodes.len() > 1_200_000 {
+        return Err("Document exceeds the 1200000 layer limit".into());
     }
+    let mut total_child_links = 0usize;
+    let mut total_parent_links = 0usize;
     for (id, node) in &doc.nodes {
         if *id != node.id || id.0 == 0 {
             return Err("Document has inconsistent node IDs".into());
@@ -592,11 +594,19 @@ fn validate_document(doc: &designos_doc::Document) -> Result<(), String> {
                 return Err("Document has duplicate or inconsistent child links".into());
             }
         }
+        total_child_links += node.children.len();
         if let Some(parent) = node.parent {
-            if !doc.get(parent).is_some_and(|n| n.children.contains(id)) {
+            total_parent_links += 1;
+            let Some(pnode) = doc.get(parent) else {
+                return Err("Document references a missing parent".into());
+            };
+            if pnode.children.len() <= 64 && !pnode.children.contains(id) {
                 return Err("Document has inconsistent parent links".into());
             }
         }
+    }
+    if total_child_links != total_parent_links {
+        return Err("Document has inconsistent parent links".into());
     }
     if doc.pages.iter().any(|id| doc.get(*id).is_none_or(|n| n.parent.is_some() || !matches!(n.kind, designos_doc::NodeKind::Page { .. }))) {
         return Err("Document has invalid page roots".into());
@@ -892,5 +902,19 @@ mod tests {
 
         let _ = fs::remove_dir_all(&ws_dir);
         let _ = fs::remove_dir_all(&sess_dir);
+    }
+
+    #[test]
+    fn large_open_accepted() {
+        let mut doc = Document::new("TwoHundredThousandNodes");
+        let page = doc.add_page("Page 1");
+        let root_frame = doc.alloc_id();
+        doc.insert(page, designos_doc::Node::frame(root_frame, designos_doc::Rect::new(0.0, 0.0, 1920.0, 1080.0))).unwrap();
+        for _ in 0..199_998 {
+            let rid = doc.alloc_id();
+            doc.insert(root_frame, designos_doc::Node::rectangle(rid, designos_doc::Rect::new(0.0, 0.0, 10.0, 10.0))).unwrap();
+        }
+        assert_eq!(doc.nodes.len(), 200_000);
+        validate_document(&doc).expect("200,000-node document must be accepted under the 1,200,000 layer limit");
     }
 }
