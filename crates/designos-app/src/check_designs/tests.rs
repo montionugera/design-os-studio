@@ -600,6 +600,38 @@ fn a_fix_for_a_layer_that_changed_since_the_audit_is_refused_and_leaves_no_undo_
     assert_eq!(app.check_designs_fix_all(&[]), 0);
 }
 
+#[test]
+fn check_designs_and_linter_identical() {
+    use designos_doc::lint::{lint, LintConfig, NoLintEnv};
+    let d = fixture::document();
+    let cd_report = audit(&d, &Scope::Page(d.pages[0]));
+    let cd_hard: Vec<(NodeId, String, String)> = cd_report
+        .of(Rule::HardCodedValue)
+        .map(|f| {
+            let fix_str = match &f.fix {
+                Some(Fix::BindVariable { variable, .. }) | Some(Fix::BindVariables { variable, .. }) => {
+                    let v = d.variables.get(variable).expect("variable exists");
+                    format!("var:{}", v.name)
+                }
+                Some(Fix::ApplyStyle { style }) => format!("style:{}", d.style_name(style)),
+                _ => String::new(),
+            };
+            (f.node, f.property.clone(), fix_str)
+        })
+        .collect();
+
+    let lint_cfg = LintConfig::from_rule_list(&["hardcoded-value".into()]).unwrap();
+    let lint_report = lint(&d, &lint_cfg, &NoLintEnv);
+    let lint_hard: Vec<(NodeId, String, String)> = lint_report
+        .findings
+        .iter()
+        .map(|f| (f.node, f.property.clone().unwrap_or_default(), f.suggested_fix.as_ref().and_then(|s| s.to.as_str()).unwrap_or("").to_string()))
+        .collect();
+
+    assert_eq!(cd_hard.len(), 3);
+    assert_eq!(cd_hard, lint_hard);
+}
+
 fn white_page(f: &mut Fx) {
     f.doc.get_mut(f.page).unwrap().kind = NodeKind::Page { background: Color::WHITE };
 }

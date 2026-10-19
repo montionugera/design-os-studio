@@ -344,7 +344,7 @@ pub fn audit_step(doc: &Document, cur: &mut ScanCursor, budget: Duration) -> boo
             cur.prep_stack.extend(n.children.iter().rev().copied());
         }
 
-        cur.index = Some(hardcoded::Index::with_libraries(doc, &cur.libs));
+        cur.index = Some(hardcoded::Index::with_libraries(doc, &cur.libs.libs));
         cur.phase = Phase::Walk;
         if !cur.stack.is_empty() && steps >= min_steps && start.elapsed() >= budget {
             return false;

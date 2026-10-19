@@ -518,6 +518,12 @@ pub fn evaluate_contrast(ctx: &NodeEvalCtx<'_>, bounds: &SubtreeBounds, out: &mu
             backdrop_hex: Some(bg_hex),
             suggested_fix,
             fixable: false,
+            safe: false,
+            property: None,
+            value: None,
+            nearest: None,
+            scale_source: None,
+            candidates: None,
             ignored: false,
         });
     }

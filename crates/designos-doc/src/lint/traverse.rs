@@ -93,6 +93,8 @@ pub fn lint_subtree(doc: &Document, roots: &[NodeId], config: &LintConfig, env: 
 
     let components = if config.is_enabled("detached-instance") { detached::Components::new(doc) } else { detached::Components::default() };
     let contrast_bounds = contrast::SubtreeBounds::default();
+    let scales = super::rules::scale::scales_for(doc, config.archetype.as_ref());
+    let token_index = if config.is_enabled("hardcoded-value") { super::token_match::Index::new(doc) } else { super::token_match::Index::default() };
 
     let active_cursor = budget.cursor.as_deref().or(config.cursor.as_deref());
     let mut page_offset = 0usize;
@@ -176,6 +178,8 @@ pub fn lint_subtree(doc: &Document, roots: &[NodeId], config: &LintConfig, env: 
                 env,
                 components: &components,
                 contrast_bounds: &contrast_bounds,
+                scales: &scales,
+                token_index: &token_index,
             };
             if evaluate_node(&ctx, &mut raw_findings) {
                 pixel_evals += 1;

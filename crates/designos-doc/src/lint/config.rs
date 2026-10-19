@@ -1,6 +1,7 @@
 //! Configuration, presets, rule severity overrides, and thresholds for the unified linter.
 
 use super::registry::{all_preset_names, all_rule_ids, resolve_rule, Category, LintPreset, Severity, RULES};
+use super::rules::scale::ArchetypeScales;
 use crate::ContrastLevel;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -110,6 +111,8 @@ pub struct LintConfig {
     pub contrast_level: ContrastLevel,
     /// Numeric thresholds for rules.
     pub thresholds: LintThresholds,
+    /// Optional archetype scales overriding document variables/styles and defaults for `off-scale`.
+    pub archetype: Option<ArchetypeScales>,
     /// Maximum number of findings to return in a single page (`None` = unlimited).
     pub limit: Option<usize>,
     /// Continuation cursor (`"offset:<n>"` or `"stack:<ids>"`).
@@ -137,9 +140,16 @@ impl LintConfig {
             include_instances: false,
             contrast_level: ContrastLevel::AA,
             thresholds: LintThresholds::default(),
+            archetype: None,
             limit: None,
             cursor: None,
         }
+    }
+
+    /// Sets explicit archetype scales for `off-scale`.
+    pub fn with_archetype(mut self, archetype: ArchetypeScales) -> Self {
+        self.archetype = Some(archetype);
+        self
     }
 
     /// Parses a preset string:
@@ -167,6 +177,7 @@ impl LintConfig {
                 include_instances: false,
                 contrast_level: ContrastLevel::AA,
                 thresholds: LintThresholds::default(),
+                archetype: None,
                 limit: None,
                 cursor: None,
             });
@@ -184,6 +195,7 @@ impl LintConfig {
                 include_instances: false,
                 contrast_level: ContrastLevel::AA,
                 thresholds: LintThresholds::default(),
+                archetype: None,
                 limit: None,
                 cursor: None,
             });
@@ -206,6 +218,7 @@ impl LintConfig {
             include_instances: false,
             contrast_level: ContrastLevel::AA,
             thresholds: LintThresholds::default(),
+            archetype: None,
             limit: None,
             cursor: None,
         })
