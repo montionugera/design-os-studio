@@ -701,12 +701,18 @@ fn has_bound_text_number(n: &Node) -> bool {
 /// to, so binding it was the deliberate fix and a text style is not offered on top of it. When the
 /// binding resolves to something else in the layer's mode (`n` is the resolved view), the layer is
 /// painted as the resolved values and a style that equals them is still a valid suggestion.
-fn text_number_bound_in_place(doc: &Document, n: &Node) -> bool {
+pub(super) fn text_number_bound_in_place(doc: &Document, n: &Node) -> bool {
     if !has_bound_text_number(n) {
         return false;
     }
-    match (doc.get(n.id).map(|raw| &raw.kind), &n.kind) {
-        (Some(NodeKind::Text(stored)), NodeKind::Text(resolved)) => stored.style == resolved.style,
+    let raw_kind = doc.get(n.id).map(|raw| &raw.kind);
+    if let Some(rk) = raw_kind {
+        debug_assert_eq!(std::mem::discriminant(rk), std::mem::discriminant(&n.kind));
+    }
+    match (raw_kind, &n.kind) {
+        (Some(NodeKind::Text(stored)), NodeKind::Text(resolved)) => same_text_style(&stored.style, &resolved.style),
+        // Unreachable when `n.id` is in `doc` (`resolved_node` preserves the `NodeKind` variant);
+        // stay conservative and suppress in release builds or if `n.id` is absent from `doc`.
         _ => true,
     }
 }
