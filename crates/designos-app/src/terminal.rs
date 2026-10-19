@@ -1464,6 +1464,10 @@ impl TerminalState {
             if !tab.is_alive() {
                 let exit_code = tab.child.try_wait().ok().flatten().map(|status| status.exit_code());
                 if agent_start_failure::counts_as_failed_start(tab.spawned_at.elapsed(), exit_code) {
+                    let drain_deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+                    while tab.raw_log.lock().map(|log| log.is_empty()).unwrap_or(false) && std::time::Instant::now() < drain_deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
                     let output = tab.raw_log.lock().map(|log| log.clone()).unwrap_or_default();
                     tab.start_failure = Some(agent_start_failure::diagnose(tab.spawn_preset, tab.spawn_preset.is_installed(), exit_code, &output));
                 } else if exit_code != Some(0) && tab.session_failure.is_none() {
@@ -2285,7 +2289,8 @@ fn build_agent_shell_cmd(shell_bin: &str, agent_cli: &str) -> CommandBuilder {
         c.arg("-c");
         // Single command: `exec` so the agent is the PTY child; when it exits the child exits.
         // Compound commands keep their own fallback, with no `|| exec $SHELL`.
-        let inner = if agent_cli.contains("||") { agent_cli.to_string() } else { format!("exec {agent_cli}") };
+        let trimmed = agent_cli.trim_start();
+        let inner = if agent_cli.contains("||") || trimmed.starts_with("exec ") { agent_cli.to_string() } else { format!("exec {agent_cli}") };
         c.arg(inner);
     }
     c
@@ -5940,13 +5945,13 @@ Done!
         }
         assert!(!runtime_binary_available("stub-agent-673"), "stub name must not be on PATH or in install_dirs()");
 
-        let mut cmd = build_agent_shell_cmd(&default_shell_program(), &format!("exec '{}'", stub_path.display()));
+        let mut cmd = build_agent_shell_cmd(&default_shell_program(), &format!("'{}'", stub_path.display()));
         isolate_zsh_from_home(&mut cmd);
         let tab = TerminalTab::spawn_with_session_cmd(1, AgentCliPreset::Grok, 24, 80, None, None, Some(cmd)).expect("spawn stub tab");
         let mut st = TerminalState { tabs: vec![tab], active_tab: 0, ..Default::default() };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while st.active_tab_mut().unwrap().is_alive() {
-            assert!(std::time::Instant::now() < deadline, "stub agent must exit");
+        while st.active_tab_mut().unwrap().is_alive() || !st.active_tab().unwrap().raw_log.lock().map(|l| l.contains("unauthorized")).unwrap_or(false) {
+            assert!(std::time::Instant::now() < deadline, "stub agent must print unauthorized and exit");
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         st.active_tab_mut().unwrap().spawned_at = std::time::Instant::now();
