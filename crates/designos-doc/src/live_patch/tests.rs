@@ -281,6 +281,57 @@ fn variables_the_agent_adds_merge_into_the_editors_and_undo_removes_only_those()
     assert_eq!((full.variables.clone(), full.variable_collections.clone()), user_data);
 }
 
+/// The agent applies a spec that adds `easeui`/`easeui/v` on a scoped copy and then undoes it;
+/// returns the ops of both steps.
+fn agent_adds_then_undoes_easeui(full: &Document, page: NodeId) -> (Vec<LiveOp>, Vec<LiveOp>) {
+    let mut agent = scoped(full, page, 1);
+    let mut hist = History::default();
+    let mut apply_ops = Vec::new();
+    let id = agent.alloc_id();
+    let mut vars = agent.variables.clone();
+    vars.insert("easeui/v".into(), variable("easeui/v", "easeui"));
+    let mut colls = agent.variable_collections.clone();
+    colls.insert("easeui".into(), collection("easeui"));
+    let batch = Command::Batch(vec![
+        Command::SetVariables { variables: vars, collections: colls },
+        Command::Insert { parent: page, index: 0, nodes: vec![Node::rectangle(id, Rect::new(0.0, 0.0, 4.0, 4.0))] },
+    ]);
+    agent_exec(&mut agent, &mut hist, &mut apply_ops, batch);
+    let undo_ops = live_ops_for_command(&agent, &hist_peek(&hist)).unwrap();
+    (apply_ops, undo_ops)
+}
+
+#[test]
+fn an_agent_undo_never_removes_variables_the_editor_already_had() {
+    // The editor's file already holds the collection (an earlier preset created it) and layers use it.
+    let (mut full, page, tops) = full_doc(1, 0);
+    full.variable_collections.insert("easeui".into(), collection("easeui"));
+    full.variables.insert("easeui/v".into(), variable("easeui/v", "easeui"));
+    full.get_mut(tops[0]).unwrap().variables.bindings.insert("fills/0".into(), "easeui/v".into());
+    let before = (full.variables.clone(), full.variable_collections.clone());
+    let (apply_ops, undo_ops) = agent_adds_then_undoes_easeui(&full, page);
+
+    let mut state = LivePatchState::default();
+    replay(&mut full, apply_ops, &mut state);
+    replay(&mut full, undo_ops, &mut state);
+
+    assert_eq!((full.variables.clone(), full.variable_collections.clone()), before, "the editor's own collection must survive the agent's undo");
+}
+
+#[test]
+fn an_agent_apply_never_overwrites_a_variable_the_user_changed() {
+    let (mut full, page, _) = full_doc(1, 0);
+    full.variable_collections.insert("easeui".into(), collection("easeui"));
+    let mut edited = variable("easeui/v", "easeui");
+    edited.values.insert("m".into(), crate::VariableValue::Number(99.0));
+    full.variables.insert("easeui/v".into(), edited.clone());
+    let (apply_ops, _) = agent_adds_then_undoes_easeui(&full, page);
+
+    replay(&mut full, apply_ops, &mut LivePatchState::default());
+
+    assert_eq!(full.variables.get("easeui/v"), Some(&edited), "the user's edited value must stay");
+}
+
 #[test]
 fn a_variable_op_without_an_id_is_refused() {
     let (mut full, _, _) = full_doc(1, 0);
