@@ -10,7 +10,7 @@ async fn stdio_handshake_discovery_edit_and_error_recovery() {
         let client = ().serve(TokioChildProcess::new(command).unwrap()).await.unwrap();
         assert_eq!(client.peer_info().unwrap().server_info.as_ref().unwrap().name, "designos-mcp");
         let tools = client.list_all_tools().await.unwrap();
-        assert_eq!(tools.len(), 22);
+        assert_eq!(tools.len(), 23);
         assert!(tools.iter().all(|t| t.annotations.is_some()));
         let call = |name: &'static str, args: Value| CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone());
         let doc = client.call_tool(call("designos_get_document", json!({}))).await.unwrap();
@@ -36,6 +36,39 @@ async fn stdio_handshake_discovery_edit_and_error_recovery() {
             .await
             .unwrap();
         assert_eq!(applied.is_error, Some(false));
+        let batch_res = client
+            .call_tool(call(
+                "designos_apply_batch",
+                json!({
+                    "ops": [
+                        {
+                            "op": "apply_spec",
+                            "as": "hero",
+                            "parent": page,
+                            "spec": {
+                                "kind": "frame",
+                                "name": "Hero",
+                                "layout": { "direction": "column", "gap": 16 },
+                                "children": [
+                                    { "kind": "text", "name": "Title", "text": "Plan your week" }
+                                ]
+                            }
+                        },
+                        {
+                            "op": "update",
+                            "node": "@hero/Title",
+                            "opacity": 0.9
+                        }
+                    ],
+                    "dry_run": false
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(batch_res.is_error, Some(false));
+        let batch_body = batch_res.structured_content.unwrap();
+        assert_eq!(batch_body["created_count"], 2);
+        assert!(batch_body["name_to_id"]["hero/Title"].as_u64().is_some());
         let comments = client.call_tool(call("designos_list_comments", json!({}))).await.unwrap();
         assert_eq!(comments.is_error, Some(false));
         client.cancel().await.unwrap();
