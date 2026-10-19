@@ -1,8 +1,6 @@
 //! Typed, local document operations shared by the MCP transport and future bridges.
 use designos_doc::live_patch::{live_ops_for_command, LiveOp};
-use designos_doc::{
-    Annotation, Command, Comment, CommentAnchor, CommentThread, DevStatus, Document, History, Node, NodeId, NodeKind, NodeSpec, Rect, TextStyle, Vec2,
-};
+use designos_doc::{Annotation, Command, Comment, CommentAnchor, CommentThread, DevStatus, Document, History, Node, NodeId, NodeKind, NodeSpec, Vec2};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 
@@ -13,13 +11,17 @@ pub struct Engine {
     /// Edits executed since the last [`Engine::take_live_ops`], recorded while an open editor
     /// mirrors this session (`None` = not recording).
     pub live_ops: Option<Vec<LiveOp>>,
+    /// Undo-group label attached to the next [`designos_doc::live_patch::LivePatch`] line when set.
+    pub live_patch_label: Option<String>,
+    /// Optional RD-3 frame ownership lock: when `Some`, writes outside these root frames are refused.
+    pub owned_frames: Option<Vec<NodeId>>,
 }
 
 impl Default for Engine {
     fn default() -> Self {
         let mut doc = Document::new("Untitled");
         let page = doc.add_page("Page 1");
-        Self { doc, history: History::default(), active_page_id: Some(page), live_ops: None }
+        Self { doc, history: History::default(), active_page_id: Some(page), live_ops: None, live_patch_label: None, owned_frames: None }
     }
 }
 
@@ -428,6 +430,7 @@ impl Engine {
                 let report = designos_doc::lint::lint_subtree(&self.doc, &roots, &cfg, &designos_render::RenderLintEnv, &mut budget);
                 Ok(report.to_value())
             }
+            "designos_apply_batch" => crate::tools::batch::apply(self, args),
             "designos_undo" | "designos_redo" => {
                 let _: Empty = parse(args)?;
                 let undo = name == "designos_undo";
@@ -449,7 +452,7 @@ impl Engine {
     /// Re-solves auto layout under `root` and finishes what the pass had to defer. The editor
     /// drains deferred layout a step per frame; this engine has no window, and its document is
     /// read, saved and exported as is.
-    fn relayout(&mut self, root: NodeId) {
+    pub(crate) fn relayout(&mut self, root: NodeId) {
         self.doc.relayout_subtree(root);
         self.doc.flush_pending_relayout();
     }
@@ -460,14 +463,14 @@ impl Engine {
         self.doc.flush_pending_relayout();
     }
 
-    fn node(&self, id: u64) -> Result<&Node, String> {
+    pub(crate) fn node(&self, id: u64) -> Result<&Node, String> {
         if id == 0 {
             return Err("node IDs must be positive integers".into());
         }
         self.doc.get(NodeId(id)).ok_or_else(|| format!("node {id} not found"))
     }
 
-    fn exec(&mut self, command: Command) -> Result<(), String> {
+    pub(crate) fn exec(&mut self, command: Command) -> Result<(), String> {
         let ops = self.live_ops_for(&command)?;
         self.history.exec(&mut self.doc, command).map_err(|e| e.to_string())?;
         self.record(ops);
@@ -475,14 +478,14 @@ impl Engine {
     }
 
     /// The ops `command` will perform, when recording; refuses edits the editor cannot replay.
-    fn live_ops_for(&self, command: &Command) -> Result<Vec<LiveOp>, String> {
+    pub(crate) fn live_ops_for(&self, command: &Command) -> Result<Vec<LiveOp>, String> {
         if self.live_ops.is_none() {
             return Ok(Vec::new());
         }
         live_ops_for_command(&self.doc, command)
     }
 
-    fn record(&mut self, ops: Vec<LiveOp>) {
+    pub(crate) fn record(&mut self, ops: Vec<LiveOp>) {
         if let Some(log) = &mut self.live_ops {
             log.extend(ops);
         }
@@ -501,40 +504,7 @@ impl Engine {
             }
             None => self.resolve_default_page()?,
         };
-        let parent = self.node(parent_id.0)?;
-        if !parent.kind.is_container() {
-            return Err("parent_id must identify a container".into());
-        }
-        let index = parent.children.len();
-        geometry(a.x, a.y, a.width, a.height)?;
-        if let Some(name) = &a.name {
-            bounded_text("name", name, 1024)?;
-        }
-        if let Some(text) = &a.text {
-            bounded_text("text", text, 100_000)?;
-        }
-        if a.kind != "text" && a.text.is_some() {
-            return Err("text can only be set on text nodes".into());
-        }
-        let rect = Rect::new(a.x, a.y, a.width, a.height);
-        // Allocate only after every argument has passed validation.
-        let constructor: fn(NodeId, Rect) -> Node = match a.kind.as_str() {
-            "frame" => Node::frame,
-            "rectangle" => Node::rectangle,
-            "ellipse" => Node::ellipse,
-            "text" => |id, r| Node::text(id, r, "", TextStyle::default()),
-            _ => return Err("kind must be frame, rectangle, ellipse, or text".into()),
-        };
-        // Imported native files may carry a stale allocation counter. Derive a
-        // fresh ID from the actual nodes instead of risking an overwrite.
-        let id = self.doc.try_alloc_id().ok_or("Document has exhausted node IDs")?;
-        let mut node = constructor(id, rect);
-        if let Some(name) = a.name {
-            node.name = name;
-        }
-        if let (Some(text), NodeKind::Text(props)) = (a.text, &mut node.kind) {
-            props.content = text;
-        }
+        let (id, index, node) = crate::tools::build_created_node(&mut self.doc, parent_id, None, &a.kind, a.name, a.text, a.x, a.y, a.width, a.height)?;
         self.exec(Command::Insert { parent: parent_id, index, nodes: vec![node] })?;
         if let Some(page_id) = self.doc.page_of(id) {
             self.relayout(page_id);
@@ -543,49 +513,12 @@ impl Engine {
     }
 
     fn update(&mut self, a: UpdateArgs) -> Result<Value, String> {
-        let mut node = self.node(a.node_id)?.clone();
-        if node.parent.is_none() {
-            return Err("page roots cannot be updated by this tool".into());
-        }
-        if let Some(name) = a.name {
-            bounded_text("name", &name, 1024)?;
-            node.name = name;
-        }
-        if let Some(x) = a.x {
-            node.transform.tx = x;
-        }
-        if let Some(y) = a.y {
-            node.transform.ty = y;
-        }
-        if let Some(width) = a.width {
-            node.size.x = width;
-        }
-        if let Some(height) = a.height {
-            node.size.y = height;
-        }
-        geometry(node.transform.tx, node.transform.ty, node.size.x, node.size.y)?;
-        if let Some(visible) = a.visible {
-            node.visible = visible;
-        }
-        if let Some(opacity) = a.opacity {
-            if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
-                return Err("opacity must be between 0 and 1".into());
-            }
-            node.opacity = opacity;
-        }
-        if let Some(text) = a.text {
-            bounded_text("text", &text, 100_000)?;
-            let NodeKind::Text(props) = &mut node.kind else {
-                return Err("text can only be set on text nodes".into());
-            };
-            if props.content != text {
-                props.content = text;
-                props.runs.clear();
-                props.lists.clear();
-            }
-        }
+        let (node, changed) = crate::tools::build_updated_node(
+            &self.doc,
+            NodeId(a.node_id),
+            crate::tools::UpdateFields { name: a.name, text: a.text, x: a.x, y: a.y, width: a.width, height: a.height, visible: a.visible, opacity: a.opacity },
+        )?;
         let id = node.id;
-        let changed = self.doc.get(id) != Some(&node);
         if changed {
             self.exec(Command::Update { node: Box::new(node) })?;
             if let Some(page_id) = self.doc.page_of(id) {
@@ -602,25 +535,10 @@ fn summary(n: &Node) -> Value {
         "width":n.size.x,"height":n.size.y})
 }
 
-fn parse<T: DeserializeOwned>(args: Value) -> Result<T, String> {
+pub(crate) fn parse<T: DeserializeOwned>(args: Value) -> Result<T, String> {
     serde_json::from_value(args).map_err(|e| format!("invalid arguments: {e}"))
 }
-fn bounded_text(field: &str, value: &str, max: usize) -> Result<(), String> {
-    if value.len() > max {
-        Err(format!("{field} exceeds {max} UTF-8 bytes"))
-    } else {
-        Ok(())
-    }
-}
-fn geometry(x: f32, y: f32, width: f32, height: f32) -> Result<(), String> {
-    if [x, y, width, height].iter().any(|v| !v.is_finite() || v.abs() > 1_000_000.0) {
-        return Err("geometry must be finite and within +/-1000000".into());
-    }
-    if width < 0.0 || height < 0.0 {
-        return Err("width and height must be non-negative".into());
-    }
-    Ok(())
-}
+use crate::tools::bounded_text;
 fn default_limit() -> usize {
     100
 }
@@ -914,12 +832,14 @@ pub fn tools() -> Vec<Value> {
     );
     add("undo", "Undo the latest successful edit in this session; returns changed=false if the stack is empty.", json!({}), vec![], false, false);
     add("redo", "Redo the most recently undone edit in this session; returns changed=false if the stack is empty.", json!({}), vec![], false, false);
+    out.push(crate::tools::batch::tool_descriptor());
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use designos_doc::Rect;
 
     #[test]
     fn variable_inspection_and_codegen_resolve_inherited_cross_collection_aliases() {

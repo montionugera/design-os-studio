@@ -41,6 +41,39 @@ async fn stdio_handshake_discovery_edit_and_error_recovery() {
         let lint_body = linted.structured_content.unwrap();
         assert!(lint_body["findings"].is_array());
         assert!(lint_body.get("passed").is_none());
+        let batch_res = client
+            .call_tool(call(
+                "designos_apply_batch",
+                json!({
+                    "ops": [
+                        {
+                            "op": "apply_spec",
+                            "as": "hero",
+                            "parent": page,
+                            "spec": {
+                                "kind": "frame",
+                                "name": "Hero",
+                                "layout": { "direction": "column", "gap": 16 },
+                                "children": [
+                                    { "kind": "text", "name": "Title", "text": "Plan your week" }
+                                ]
+                            }
+                        },
+                        {
+                            "op": "update",
+                            "node": "@hero/Title",
+                            "opacity": 0.9
+                        }
+                    ],
+                    "dry_run": false
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(batch_res.is_error, Some(false));
+        let batch_body = batch_res.structured_content.unwrap();
+        assert_eq!(batch_body["created_count"], 2);
+        assert!(batch_body["name_to_id"]["hero/Title"].as_u64().is_some());
         let comments = client.call_tool(call("designos_list_comments", json!({}))).await.unwrap();
         assert_eq!(comments.is_error, Some(false));
         client.cancel().await.unwrap();
