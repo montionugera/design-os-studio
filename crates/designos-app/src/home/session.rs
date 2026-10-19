@@ -419,6 +419,7 @@ pub(crate) fn doc_hash(doc: &Document) -> u64 {
         &doc.library_page,
     )
         .serialize(HashSerializer(&mut h));
+    let _ = doc.check_designs.serialize(HashSerializer(&mut h));
     doc.images.len().hash(&mut h);
     for (k, v) in &doc.images {
         (k, v.len(), &v[..v.len().min(64)]).hash(&mut h);

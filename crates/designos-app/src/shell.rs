@@ -302,7 +302,7 @@ impl Shell {
             Some(p @ ("check-designs" | "check-designs-fixed")) => {
                 app.open_check_designs();
                 if p == "check-designs-fixed" {
-                    app.refresh_check_designs(false);
+                    app.refresh_check_designs(false, ctx);
                     let findings = app.check_designs.report.findings.clone();
                     app.check_designs_fix_all(&findings);
                     app.check_designs.invalidate();

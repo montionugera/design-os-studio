@@ -59,6 +59,8 @@ pub enum Command {
     SetPrototypeDevice {
         device: PrototypeDevice,
     },
+    /// Replace Check designs settings (rule toggles, contrast level, ignored findings).
+    SetCheckDesignsSettings(CheckDesignsSettings),
     /// Replace all variables and collections (variable edits).
     SetVariables {
         variables: BTreeMap<String, Variable>,
@@ -163,6 +165,10 @@ impl Command {
                 Command::SetGuides { page, guides: old.unwrap_or_default() }
             }
             Command::SetPrototypeDevice { device } => Command::SetPrototypeDevice { device: std::mem::replace(&mut doc.prototype_device, device) },
+            Command::SetCheckDesignsSettings(settings) => {
+                doc.bump_mutation_epoch();
+                Command::SetCheckDesignsSettings(std::mem::replace(&mut doc.check_designs, settings))
+            }
             Command::SetVariables { variables, collections } => {
                 doc.mark_full_dirty();
                 Command::SetVariables {
@@ -293,7 +299,11 @@ impl Command {
                     + collections.values_mut().map(finite_json::neutralize_in_place).sum::<usize>()
             }
             Command::Batch(cmds) => cmds.iter_mut().map(Self::neutralize_non_finite).sum(),
-            Command::Remove { .. } | Command::Reparent { .. } | Command::RemovePage { .. } | Command::SetImages { .. } => 0,
+            Command::Remove { .. }
+            | Command::Reparent { .. }
+            | Command::RemovePage { .. }
+            | Command::SetImages { .. }
+            | Command::SetCheckDesignsSettings(_) => 0,
         }
     }
 }

@@ -175,6 +175,9 @@ pub struct Document {
     /// Hidden page holding copies of library components; not in `pages`.
     #[serde(default)]
     pub library_page: Option<NodeId>,
+    /// Check designs rule toggles, contrast level, and ignored findings.
+    #[serde(default, skip_serializing_if = "CheckDesignsSettings::is_empty")]
+    pub check_designs: CheckDesignsSettings,
     /// Embedded images keyed by content hash (Figma `imageRef`).
     #[serde(default, with = "serde_images", skip_serializing_if = "BTreeMap::is_empty")]
     pub images: BTreeMap<String, Vec<u8>>,
@@ -555,6 +558,9 @@ impl Document {
                 out.push(node);
             }
         }
+        if !self.check_designs.ignored.is_empty() {
+            self.check_designs.ignored.retain(|k| self.nodes.contains_key(&k.node));
+        }
         if out.len() <= REMOVED_RING_CAP && parent.is_some() {
             if let Some(p) = parent {
                 self.mark_node_dirty(p);
@@ -692,6 +698,9 @@ impl Document {
         self.nodes.retain(|id, _| reachable.contains(id));
         let removed = before - self.nodes.len();
         if removed > 0 {
+            if !self.check_designs.ignored.is_empty() {
+                self.check_designs.ignored.retain(|k| reachable.contains(&k.node));
+            }
             self.mark_tree_full_dirty();
         }
         removed
@@ -711,6 +720,9 @@ impl Document {
 
     /// Like [`Document::to_json`], also returning how many non-finite numbers were replaced.
     pub fn to_json_counted(&self) -> serde_json::Result<(String, usize)> {
+        // Ignore keys of deleted layers are written as they are and dropped when the file is read
+        // back (`from_json_with_report`): pruning here would clone the whole document, images
+        // included, on every save after an ignored layer was deleted.
         finite_json::to_string_finite(self)
     }
 
@@ -777,6 +789,7 @@ impl Document {
         let (mut doc, non_finite_numbers): (Self, usize) = finite_json::from_str_repairing(s)?;
         let mut report = doc.validate_and_repair();
         report.non_finite_numbers = non_finite_numbers;
+        doc.check_designs.ignored.retain(|k| doc.nodes.contains_key(&k.node));
         doc.migrate_text();
         Ok((doc, report))
     }
