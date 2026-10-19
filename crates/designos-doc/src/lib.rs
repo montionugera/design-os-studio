@@ -57,8 +57,8 @@ mod styles_ops;
 mod text_fills;
 mod textmodel;
 mod variables;
-mod variables_edit;
 mod variables_apply;
+mod variables_edit;
 pub mod vector;
 mod vector_fit;
 

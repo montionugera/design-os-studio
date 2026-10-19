@@ -14,9 +14,10 @@ fn default_one_num_or_var() -> NumberOrVar {
 
 /// Declarative Auto-Layout 5.0 specification for a container frame.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LayoutSpec {
     /// `"row"` / `"horizontal"` or `"column"` / `"vertical"`.
-    #[serde(default, alias = "dir")]
+    #[serde(default)]
     pub direction: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wrap: bool,
@@ -41,6 +42,7 @@ pub struct LayoutSpec {
 
 /// Declarative node specification used by Agents and CLI/MCP tools (`apply_spec` / `export_spec`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
@@ -166,11 +168,22 @@ impl<'de> Deserialize<'de> for FalseLiteral {
 }
 
 /// Slot fill or disable specification in `NodeSpec::slots` / `OverrideSpec::slots` (E15-2).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum SlotFillSpec {
     Disabled(FalseLiteral),
     Fill(Vec<NodeSpec>),
+}
+
+impl<'de> Deserialize<'de> for SlotFillSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(deserializer)?;
+        match v {
+            serde_json::Value::Bool(false) => Ok(SlotFillSpec::Disabled(FalseLiteral)),
+            serde_json::Value::Array(_) => serde_json::from_value::<Vec<NodeSpec>>(v).map(SlotFillSpec::Fill).map_err(serde::de::Error::custom),
+            _ => Err(serde::de::Error::custom("INVALID_SLOT_VALUE: slot value must be false or [NodeSpec...]")),
+        }
+    }
 }
 
 /// Descendant override specification inside a `NodeSpec` of `kind: "instance"`.
@@ -199,6 +212,86 @@ pub struct OverrideSpec {
     pub props: BTreeMap<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub slots: BTreeMap<String, SlotFillSpec>,
+}
+
+fn spec_levenshtein(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let n = b_chars.len();
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0usize; n + 1];
+    for (i, &ca) in a_chars.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b_chars.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
+/// Parses a `serde` `unknown field` error string into `(received_field, closest_5_valid_fields)`.
+pub fn extract_unknown_field_options(err_msg: &str) -> Option<(String, Vec<String>)> {
+    let (_, after_prefix) = err_msg.split_once("unknown field `")?;
+    let (bad, rest) = after_prefix.split_once('`')?;
+    let mut raw_fields = Vec::new();
+    if let Some((_, expected_part)) = rest.split_once("expected ") {
+        let mut rem = expected_part;
+        while let Some((_, after_bt)) = rem.split_once('`') {
+            if let Some((tok, tail)) = after_bt.split_once('`') {
+                if !tok.is_empty() && !raw_fields.iter().any(|x: &String| x == tok) {
+                    raw_fields.push(tok.to_string());
+                }
+                rem = tail;
+            } else {
+                break;
+            }
+        }
+    }
+    // Filter out serde aliases when their canonical field name is present.
+    let alias_pairs = [
+        ("dir", "direction"),
+        ("justify", "primary_align"),
+        ("align", "counter_align"),
+        ("stroke_width", "stroke_weight"),
+        ("radius", "corner_radius"),
+        ("color", "text_color"),
+    ];
+    let filtered: Vec<String> = raw_fields
+        .iter()
+        .filter(|cand| !alias_pairs.iter().any(|(alias, canon)| cand.as_str() == *alias && raw_fields.iter().any(|x| x == canon)))
+        .cloned()
+        .collect();
+
+    let bad_lower = bad.to_ascii_lowercase();
+    let mut scored: Vec<(usize, usize, String)> = filtered
+        .into_iter()
+        .take(10_000)
+        .enumerate()
+        .map(|(idx, cand)| {
+            let dist = spec_levenshtein(&bad_lower, &cand.to_ascii_lowercase());
+            (dist, idx, cand)
+        })
+        .collect();
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let valid_options: Vec<String> = scored.into_iter().take(5).map(|(_, _, c)| c).collect();
+    Some((bad.to_string(), valid_options))
+}
+
+/// Formats a `NodeSpec` / `LayoutSpec` / `OverrideSpec` `serde_json::Error` with `UNKNOWN_FIELD`
+/// and the 5 closest valid field names so Studio's live-spec toast and CLI/MCP share the same diagnostic.
+pub fn format_spec_serde_error(err: &serde_json::Error) -> String {
+    let msg = err.to_string();
+    if let Some((bad, valid)) = extract_unknown_field_options(&msg) {
+        if valid.is_empty() {
+            format!("UNKNOWN_FIELD: unknown field `{bad}`")
+        } else {
+            format!("UNKNOWN_FIELD: unknown field `{bad}` (valid_options: {})", valid.join(", "))
+        }
+    } else {
+        msg
+    }
 }
 
 /// A canvas comment thread enriched with its resolved world position and the
@@ -427,12 +520,7 @@ impl Document {
     /// references against local document tokens/styles and returning a [`SpecApplyReport`].
     pub fn apply_spec_with_report(&mut self, parent: NodeId, spec: &NodeSpec) -> Result<SpecApplyReport, SpecBindError> {
         let r = self.apply_spec_with_libraries(parent, spec, &[]).map_err(SpecBindError::from)?;
-        Ok(SpecApplyReport {
-            root_node_id: r.root_node_id,
-            bindings_created: r.bindings_created,
-            styles_linked: r.styles_linked,
-            warnings: r.warnings,
-        })
+        Ok(SpecApplyReport { root_node_id: r.root_node_id, bindings_created: r.bindings_created, styles_linked: r.styles_linked, warnings: r.warnings })
     }
 
     #[allow(clippy::result_large_err)]
@@ -458,10 +546,21 @@ impl Document {
         };
 
         if kind_str.eq_ignore_ascii_case("instance") {
-            return self.build_instance_spec_node(parent, spec, ctx);
+            return self.build_instance_spec_node(parent, spec, ctx).map_err(|mut e| {
+                if !path.is_empty() && path != "spec" && !e.path.starts_with("spec.") && !e.path.starts_with(path) {
+                    e.path = if e.path.is_empty() { path.to_string() } else { format!("{path}.{}", e.path) };
+                }
+                e
+            });
         }
         if !spec.slots.is_empty() {
-            return Err(crate::spec_instance::SpecError::plain("slots can only be set on instance nodes"));
+            return Err(crate::spec_instance::SpecError::named(
+                "OVERRIDE_FIELD_NOT_APPLICABLE",
+                "slots can only be set on instance nodes",
+                Some(format!("{path}.slots")),
+                Vec::new(),
+                None,
+            ));
         }
 
         let id = self.try_alloc_id().ok_or_else(|| SpecBindError {
@@ -509,7 +608,15 @@ impl Document {
                     path: format!("{path}.kind"),
                     received: Some(other.to_string()),
                     expected: Some("frame, rectangle, ellipse, text, section, component, instance".to_string()),
-                    valid_options: vec!["frame".into(), "rectangle".into(), "ellipse".into(), "text".into(), "section".into(), "component".into(), "instance".into()],
+                    valid_options: vec![
+                        "frame".into(),
+                        "rectangle".into(),
+                        "ellipse".into(),
+                        "text".into(),
+                        "section".into(),
+                        "component".into(),
+                        "instance".into(),
+                    ],
                     corrected_example: None,
                     safe_to_retry: true,
                 }
@@ -705,8 +812,15 @@ impl Document {
 
         // 2. Effect style link
         if let Some(eff_ref) = &spec.effect_style {
-            let style_key =
-                crate::resolve_style_ref(self, &mut ctx.bind_index, libraries, eff_ref, StyleProperty::Effect, "effect_style", &format!("{path}.effect_style"))?;
+            let style_key = crate::resolve_style_ref(
+                self,
+                &mut ctx.bind_index,
+                libraries,
+                eff_ref,
+                StyleProperty::Effect,
+                "effect_style",
+                &format!("{path}.effect_style"),
+            )?;
             if let Some(style) = self.styles.get(&style_key).cloned() {
                 if let Some(n) = self.get_mut(id) {
                     n.style_refs.insert("effect".to_string(), style_key.clone());
@@ -819,8 +933,7 @@ impl Document {
                     if let Some(n) = self.get_mut(id) {
                         n.style_refs.remove("fill");
                     }
-                    ctx.bind_report.bindings_created +=
-                        crate::apply_variable_binding(self, id, &["fills/0"], &var_id, &fpath, &mut ctx.bind_report.warnings);
+                    ctx.bind_report.bindings_created += crate::apply_variable_binding(self, id, &["fills/0"], &var_id, &fpath, &mut ctx.bind_report.warnings);
                 }
                 ResolvedColourRef::Style { style_key, .. } => {
                     if let Some(style) = self.styles.get(&style_key).cloned() {
@@ -869,8 +982,7 @@ impl Document {
                     if let Some(n) = self.get_mut(id) {
                         n.style_refs.remove("stroke");
                     }
-                    ctx.bind_report.bindings_created +=
-                        crate::apply_variable_binding(self, id, &["strokes/0"], &var_id, &fpath, &mut ctx.bind_report.warnings);
+                    ctx.bind_report.bindings_created += crate::apply_variable_binding(self, id, &["strokes/0"], &var_id, &fpath, &mut ctx.bind_report.warnings);
                 }
                 ResolvedColourRef::Style { style_key, .. } => {
                     if let Some(style) = self.styles.get(&style_key).cloned() {
@@ -1057,8 +1169,15 @@ impl Document {
                 })?;
 
                 if let Some(ts_ref) = &spec.text_style {
-                    let style_key =
-                        crate::resolve_style_ref(self, &mut ctx.bind_index, libraries, ts_ref, StyleProperty::Text, "text_style", &format!("{path}.text_style"))?;
+                    let style_key = crate::resolve_style_ref(
+                        self,
+                        &mut ctx.bind_index,
+                        libraries,
+                        ts_ref,
+                        StyleProperty::Text,
+                        "text_style",
+                        &format!("{path}.text_style"),
+                    )?;
                     if let Some(s) = self.styles.get(&style_key).cloned() {
                         if let Some(tn) = self.get_mut(tid) {
                             tn.style_refs.insert("text".to_string(), style_key.clone());

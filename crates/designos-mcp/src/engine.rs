@@ -1,4 +1,5 @@
 //! Typed, local document operations shared by the MCP transport and future bridges.
+use crate::tools::errors::{tool_output_schema, ErrorCode, ToolError};
 use designos_doc::live_patch::{live_ops_for_command, LiveOp};
 use designos_doc::{Annotation, Command, Comment, CommentAnchor, CommentThread, DevStatus, Document, History, Node, NodeId, NodeKind, NodeSpec, Vec2};
 use serde::{de::DeserializeOwned, Deserialize};
@@ -15,13 +16,15 @@ pub struct Engine {
     pub live_patch_label: Option<String>,
     /// Optional RD-3 frame ownership lock: when `Some`, writes outside these root frames are refused.
     pub owned_frames: Option<Vec<NodeId>>,
+    /// Monotonic in-memory mutation counter used by [`crate::server::Session`] to compute `safe_to_retry`.
+    pub revision: u64,
 }
 
 impl Default for Engine {
     fn default() -> Self {
         let mut doc = Document::new("Untitled");
         let page = doc.add_page("Page 1");
-        Self { doc, history: History::default(), active_page_id: Some(page), live_ops: None, live_patch_label: None, owned_frames: None }
+        Self { doc, history: History::default(), active_page_id: Some(page), live_ops: None, live_patch_label: None, owned_frames: None, revision: 0 }
     }
 }
 
@@ -29,14 +32,35 @@ impl Engine {
     /// Resolves the target page when a tool call omits `parent_id` / `page_id`:
     /// prefers `self.active_page_id` (the user's currently selected page in `design:os studio`)
     /// if valid in `self.doc.pages`, falling back to `self.doc.pages.first()`.
-    pub fn resolve_default_page(&self) -> Result<NodeId, String> {
+    pub fn resolve_default_page(&self) -> Result<NodeId, ToolError> {
         self.active_page_id
             .filter(|p| self.doc.pages.contains(p))
             .or_else(|| self.doc.pages.first().copied())
-            .ok_or_else(|| "Document has no pages".to_string())
+            .ok_or_else(|| ToolError::new(ErrorCode::PageNotFound, "/page_id", "Document has no pages"))
     }
 
-    pub fn call(&mut self, name: &str, args: Value) -> Result<Value, String> {
+    pub(crate) fn collect_library_snapshots(&self, _spec: &NodeSpec) -> Vec<designos_doc::LibrarySnapshot> {
+        crate::tools::library_source::load_enabled_snapshots(&self.doc)
+    }
+
+    pub(crate) fn check_owned_frames(&self, target: NodeId, path: &str) -> Result<(), ToolError> {
+        let env_owned: Option<Vec<NodeId>> = std::env::var("DESIGNOS_OWNED_FRAMES")
+            .ok()
+            .map(|s| s.split(',').filter_map(|p| p.trim().parse::<u64>().ok()).filter(|&id| id > 0).map(NodeId).collect())
+            .filter(|v: &Vec<NodeId>| !v.is_empty());
+        let Some(frames) = self.owned_frames.as_deref().or(env_owned.as_deref()) else {
+            return Ok(());
+        };
+        let allowed = frames.iter().any(|&f| f == target || self.doc.is_ancestor(f, target));
+        if !allowed {
+            let valid: Vec<String> = frames.iter().map(|f| f.0.to_string()).collect();
+            return Err(ToolError::new(ErrorCode::OutsideOwnedFrames, path, format!("node {} is outside this agent run's owned frames", target.0))
+                .with_valid_options(valid));
+        }
+        Ok(())
+    }
+
+    pub fn call(&mut self, name: &str, args: Value) -> Result<Value, ToolError> {
         // Nothing here drains the lazy layout queue between calls, so no tool may start from, read,
         // or serialize a document with deferred layout still in it.
         self.settle_layout();
@@ -59,10 +83,12 @@ impl Engine {
             "designos_list_nodes" => {
                 let a: ListArgs = parse(args)?;
                 if a.limit == 0 || a.limit > 500 {
-                    return Err("limit must be between 1 and 500".into());
+                    return Err(
+                        ToolError::new(ErrorCode::ValueOutOfRange, "/limit", "limit must be between 1 and 500").with_corrected_example(json!({ "limit": 100 }))
+                    );
                 }
                 if let Some(id) = a.parent_id {
-                    self.node(id)?;
+                    self.node_at(id, "/parent_id")?;
                 }
                 if let Some(q) = &a.query {
                     bounded_text("query", q, 1024)?;
@@ -124,7 +150,15 @@ impl Engine {
                     "compose" => designos_export::compose_for(&doc, id),
                     "android-xml" => designos_export::android_xml_for(&doc, id),
                     "svg" => designos_export::export_svg(&doc, id, &Default::default()),
-                    _ => return Err("language must be css, tailwind, react, swiftui, uikit, compose, android-xml, or svg".into()),
+                    _ => {
+                        return Err(ToolError::new(
+                            ErrorCode::UnknownLanguage,
+                            "/language",
+                            "language must be css, tailwind, react, swiftui, uikit, compose, android-xml, or svg",
+                        )
+                        .with_valid_options(vec!["css", "tailwind", "react", "swiftui", "uikit", "compose", "android-xml", "svg"])
+                        .with_corrected_example(json!({ "node_id": a.node_id, "language": "react" })));
+                    }
                 };
                 Ok(json!({"node_id":id,"language":a.language,"code":code}))
             }
@@ -134,9 +168,11 @@ impl Engine {
                 let a: NodeArgs = parse(args)?;
                 let n = self.node(a.node_id)?;
                 if n.parent.is_none() {
-                    return Err("page roots cannot be deleted by this tool".into());
+                    return Err(ToolError::new(ErrorCode::PageRootProtected, "/node_id", "page roots cannot be deleted by this tool")
+                        .with_corrected_example(json!({ "node_id": 2 })));
                 }
                 let id = n.id;
+                self.check_owned_frames(id, "/node_id")?;
                 self.exec(Command::Remove { id })?;
                 Ok(json!({"node_id":id,"deleted":true}))
             }
@@ -156,22 +192,27 @@ impl Engine {
             "designos_add_comment" => {
                 let a: AddCommentArgs = parse(args)?;
                 if a.text.trim().is_empty() {
-                    return Err("text must not be empty".into());
+                    return Err(ToolError::new(ErrorCode::ValueOutOfRange, "/text", "text must not be empty")
+                        .with_corrected_example(json!({ "text": "Review padding" })));
                 }
                 bounded_text("text", &a.text, 10_000)?;
                 if let Some(author) = &a.author {
                     bounded_text("author", author, 256)?;
                 }
                 if !a.x.is_finite() || !a.y.is_finite() {
-                    return Err("x and y must be finite".into());
+                    return Err(
+                        ToolError::new(ErrorCode::ValueOutOfRange, "/x", "x and y must be finite").with_corrected_example(json!({ "x": 0.0, "y": 0.0 }))
+                    );
                 }
                 let page = if let Some(nid) = a.node_id {
                     self.node(nid)?;
-                    self.doc.page_of(NodeId(nid)).ok_or_else(|| format!("node {nid} does not belong to a page"))?
+                    self.doc
+                        .page_of(NodeId(nid))
+                        .ok_or_else(|| ToolError::new(ErrorCode::PageNotFound, "/node_id", format!("node {nid} does not belong to a page")))?
                 } else if let Some(pid) = a.page_id {
                     let p = NodeId(pid);
                     if !self.doc.pages.contains(&p) {
-                        return Err(format!("page {pid} not found"));
+                        return Err(ToolError::new(ErrorCode::PageNotFound, "/page_id", format!("page {pid} not found")));
                     }
                     p
                 } else {
@@ -203,10 +244,15 @@ impl Engine {
                     resolved: false,
                 });
                 self.exec(Command::SetComments { comments })?;
-                let resolved = self.doc.resolve_comment_targets().into_iter().find(|t| t.id == thread_id).ok_or("Failed to resolve comment thread")?;
-                let mut out = serde_json::to_value(&resolved).map_err(|e| e.to_string())?;
+                let resolved = self
+                    .doc
+                    .resolve_comment_targets()
+                    .into_iter()
+                    .find(|t| t.id == thread_id)
+                    .ok_or_else(|| ToolError::new(ErrorCode::InternalError, "", "Failed to resolve comment thread"))?;
+                let mut out = serde_json::to_value(&resolved).map_err(|e| ToolError::new(ErrorCode::InternalError, "", e.to_string()))?;
                 if let Some(obj) = out.as_object_mut() {
-                    obj.insert("thread".into(), serde_json::to_value(&resolved).map_err(|e| e.to_string())?);
+                    obj.insert("thread".into(), serde_json::to_value(&resolved).map_err(|e| ToolError::new(ErrorCode::InternalError, "", e.to_string()))?);
                     obj.insert("changed".into(), json!(true));
                 }
                 Ok(out)
@@ -214,14 +260,19 @@ impl Engine {
             "designos_reply_comment" => {
                 let a: ReplyCommentArgs = parse(args)?;
                 if a.text.trim().is_empty() {
-                    return Err("text must not be empty".into());
+                    return Err(ToolError::new(ErrorCode::ValueOutOfRange, "/text", "text must not be empty")
+                        .with_corrected_example(json!({ "thread_id": a.thread_id, "text": "Addressed" })));
                 }
                 bounded_text("text", &a.text, 10_000)?;
                 if let Some(author) = &a.author {
                     bounded_text("author", author, 256)?;
                 }
                 let mut comments = self.doc.comments.clone();
-                let t = comments.iter_mut().find(|t| t.id == a.thread_id).ok_or_else(|| format!("comment thread '{}' not found", a.thread_id))?;
+                let valid_threads: Vec<String> = comments.iter().map(|t| t.id.clone()).collect();
+                let t = comments.iter_mut().find(|t| t.id == a.thread_id).ok_or_else(|| {
+                    ToolError::new(ErrorCode::CommentNotFound, "/thread_id", format!("comment thread '{}' not found", a.thread_id))
+                        .with_valid_options(valid_threads)
+                })?;
                 let msg_id = format!("{}-{}", t.id, t.messages.len() + 1);
                 t.messages.push(Comment {
                     id: msg_id,
@@ -236,13 +287,22 @@ impl Engine {
                     t.resolved = resolved;
                 }
                 self.exec(Command::SetComments { comments })?;
-                let resolved_thread = self.doc.resolve_comment_targets().into_iter().find(|t| t.id == a.thread_id).ok_or("Failed to resolve comment thread")?;
+                let resolved_thread = self
+                    .doc
+                    .resolve_comment_targets()
+                    .into_iter()
+                    .find(|t| t.id == a.thread_id)
+                    .ok_or_else(|| ToolError::new(ErrorCode::InternalError, "", "Failed to resolve comment thread"))?;
                 Ok(json!({"thread": resolved_thread, "changed": true}))
             }
             "designos_resolve_comment" => {
                 let a: ResolveCommentArgs = parse(args)?;
                 let mut comments = self.doc.comments.clone();
-                let t = comments.iter_mut().find(|t| t.id == a.thread_id).ok_or_else(|| format!("comment thread '{}' not found", a.thread_id))?;
+                let valid_threads: Vec<String> = comments.iter().map(|t| t.id.clone()).collect();
+                let t = comments.iter_mut().find(|t| t.id == a.thread_id).ok_or_else(|| {
+                    ToolError::new(ErrorCode::CommentNotFound, "/thread_id", format!("comment thread '{}' not found", a.thread_id))
+                        .with_valid_options(valid_threads)
+                })?;
                 let changed = t.resolved != a.resolved;
                 t.resolved = a.resolved;
                 if changed {
@@ -252,20 +312,24 @@ impl Engine {
             }
             "designos_apply_spec" => {
                 if let Some(raw_spec) = args.get("spec") {
-                    designos_doc::validate_raw_spec_slots(raw_spec).map_err(|e| e.to_string())?;
+                    designos_doc::validate_raw_spec_slots(raw_spec).map_err(|e| crate::tools::errors::from_spec_error(e, "/spec"))?;
                 }
-                let a: ApplySpecArgs = parse(args)?;
-                let parent = a
-                    .parent_id
-                    .filter(|&id| id != 0)
-                    .map(NodeId)
-                    .or_else(|| self.resolve_default_page().ok())
-                    .ok_or_else(|| "Document has no pages".to_string())?;
-                if !self.node(parent.0)?.kind.is_container() {
-                    return Err("parent_id must identify a container".into());
+                let a: ApplySpecArgs = parse_spec(args)?;
+                let parent = match a.parent_id.filter(|&id| id != 0) {
+                    Some(id) => {
+                        self.node_at(id, "/parent_id")?;
+                        NodeId(id)
+                    }
+                    None => self.resolve_default_page()?,
+                };
+                self.check_owned_frames(parent, "/parent_id")?;
+                if !self.node_at(parent.0, "/parent_id")?.kind.is_container() {
+                    return Err(ToolError::new(ErrorCode::NotAContainer, "/parent_id", "parent_id must identify a container")
+                        .with_corrected_example(json!({ "parent_id": 1 })));
                 }
-                let snapshots = crate::tools::library_source::load_enabled_snapshots(&self.doc);
-                let (cmd, report) = designos_doc::apply_spec_command(&mut self.doc, parent, &a.spec, &snapshots).map_err(|e| e.to_string())?;
+                let snapshots = self.collect_library_snapshots(&a.spec);
+                let (cmd, report) = designos_doc::apply_spec_command(&mut self.doc, parent, &a.spec, &snapshots)
+                    .map_err(|e| crate::tools::errors::from_spec_error(e, "/spec"))?;
                 self.exec_apply_spec(cmd)?;
                 self.relayout(parent);
                 let root_id = report.root_node_id;
@@ -289,18 +353,27 @@ impl Engine {
             }
             "designos_export_spec" => {
                 let a: NodeArgs = parse(args)?;
-                let spec = self.doc.export_spec(NodeId(a.node_id))?;
+                let spec = self.doc.export_spec(NodeId(a.node_id)).map_err(|e| ToolError::new(ErrorCode::NodeNotFound, "/node_id", e))?;
                 Ok(json!({"node_id": a.node_id, "spec": spec}))
             }
             "designos_set_dev_status" => {
                 let a: SetDevStatusArgs = parse(args)?;
                 let mut node = self.node(a.node_id)?.clone();
+                self.check_owned_frames(node.id, "/node_id")?;
                 if let Some(status) = &a.status {
                     node.dev.status = match status.trim().to_ascii_lowercase().as_str() {
                         "ready" | "ready_for_dev" | "readyfordev" => Some(DevStatus::ReadyForDev),
                         "completed" | "done" => Some(DevStatus::Completed),
                         "clear" | "none" | "" => None,
-                        other => return Err(format!("status must be 'ready', 'completed', or 'clear' (got '{other}')")),
+                        other => {
+                            return Err(ToolError::new(
+                                ErrorCode::InvalidArguments,
+                                "/status",
+                                format!("status must be 'ready', 'completed', or 'clear' (got '{other}')"),
+                            )
+                            .with_valid_options(vec!["ready", "completed", "clear", "none"])
+                            .with_corrected_example(json!({ "node_id": a.node_id, "status": "ready" })));
+                        }
                     };
                 }
                 if let Some(annotation) = &a.annotation {
@@ -317,58 +390,43 @@ impl Engine {
                 let a: ExportFigArgs = parse(args)?;
                 let path = std::path::Path::new(&a.output_path);
                 if path.extension().and_then(|x| x.to_str()) != Some("fig") {
-                    return Err("output_path must end in .fig".into());
+                    return Err(ToolError::new(ErrorCode::UnsupportedExtension, "/output_path", "output_path must end in .fig")
+                        .with_valid_options(vec![".fig"])
+                        .with_corrected_example(json!({ "output_path": "export.fig" })));
                 }
-                let bytes = designos_fig::export_fig(&self.doc).map_err(|e| format!("Failed to export .fig: {e}"))?;
-                std::fs::write(path, &bytes).map_err(|e| format!("Cannot write .fig file: {e}"))?;
+                let bytes = designos_fig::export_fig(&self.doc)
+                    .map_err(|e| ToolError::new(ErrorCode::IoError, "/output_path", format!("Failed to export .fig: {e}")))?;
+                std::fs::write(path, &bytes).map_err(|e| ToolError::new(ErrorCode::IoError, "/output_path", format!("Cannot write .fig file: {e}")))?;
                 Ok(json!({"output_path": a.output_path, "path": a.output_path, "bytes": bytes.len(), "saved": true}))
             }
             "designos_query_xpath" | "query_nodes" => {
                 let a: QueryXpathArgs = parse(args)?;
-                let root = a.page_id.map(NodeId).or_else(|| self.resolve_default_page().ok());
-                let selector = a.selector.trim();
-                let mut matches = Vec::new();
-                let mut visit = |n: &Node| {
-                    let kind_upper = n.kind.default_name().to_ascii_uppercase();
-                    let matched = if selector.is_empty() || selector == "//*" || selector == "*" {
-                        true
-                    } else if let Some(tag) = selector.strip_prefix("//") {
-                        if let Some((tag_part, pred)) = tag.split_once('[') {
-                            let tag_ok = tag_part.is_empty() || tag_part == "*" || kind_upper == tag_part.to_ascii_uppercase();
-                            let pred_clean = pred.trim_end_matches(']');
-                            let name_ok = if let Some(val) = pred_clean.strip_prefix("@name=") {
-                                let unquoted = val.trim().trim_matches('\'').trim_matches('"');
-                                n.name == unquoted
-                            } else if pred_clean.contains("contains(@name") {
-                                let parts: Vec<&str> = pred_clean.split(['\'', '"']).collect();
-                                parts.get(1).is_some_and(|needle| n.name.to_lowercase().contains(&needle.to_lowercase()))
-                            } else {
-                                true
-                            };
-                            tag_ok && name_ok
-                        } else {
-                            kind_upper == tag.to_ascii_uppercase() || n.name.to_lowercase().contains(&tag.to_lowercase())
-                        }
-                    } else {
-                        n.name.to_lowercase().contains(&selector.to_lowercase()) || kind_upper == selector.to_ascii_uppercase()
-                    };
-                    if matched {
-                        matches.push(summary(n));
+                let root = if let Some(pid) = a.page_id {
+                    let p = NodeId(pid);
+                    if !self.doc.pages.contains(&p) {
+                        return Err(ToolError::new(ErrorCode::PageNotFound, "/page_id", format!("page {pid} not found")));
                     }
-                };
-                if let Some(r) = root {
-                    self.doc.walk(r, |n, _| visit(n));
+                    Some(p)
                 } else {
-                    for n in self.doc.nodes.values() {
-                        visit(n);
-                    }
-                }
+                    self.resolve_default_page().ok()
+                };
+                let selector = a.selector.trim();
+                validate_xpath_selector(selector)?;
+                let matches: Vec<Value> = query_xpath_nodes(&self.doc, root, selector).into_iter().map(summary).collect();
                 let total = matches.len();
                 Ok(json!({"selector": a.selector, "page_id": root.map(|r| r.0), "nodes": matches, "total": total}))
             }
             "designos_lint" | "check_design" => {
                 let a: LintArgs = parse(args)?;
-                let root = a.page_id.map(NodeId).or_else(|| self.resolve_default_page().ok());
+                let root = if let Some(pid) = a.page_id {
+                    let p = NodeId(pid);
+                    if !self.doc.pages.contains(&p) {
+                        return Err(ToolError::new(ErrorCode::PageNotFound, "/page_id", format!("page {pid} not found")));
+                    }
+                    Some(p)
+                } else {
+                    self.resolve_default_page().ok()
+                };
                 let mut findings = Vec::new();
                 let mut check_node = |n: &Node| {
                     if matches!(n.kind, NodeKind::Page { .. }) {
@@ -401,13 +459,17 @@ impl Engine {
                     Some(command) => self.live_ops_for(command)?,
                     None => Vec::new(),
                 };
-                let changed = if undo { self.history.undo(&mut self.doc) } else { self.history.redo(&mut self.doc) }.map_err(|e| e.to_string())?;
+                let changed = if undo { self.history.undo(&mut self.doc) } else { self.history.redo(&mut self.doc) }
+                    .map_err(|e| ToolError::new(ErrorCode::InternalError, "", e.to_string()))?;
+                if changed {
+                    self.revision = self.revision.wrapping_add(1);
+                }
                 // Undo and redo defer a deep layout tail to later frames; this engine has no frames.
                 self.settle_layout();
                 self.record(ops);
                 Ok(json!({"changed":changed,"can_undo":self.history.can_undo(),"can_redo":self.history.can_redo()}))
             }
-            _ => Err(format!("unknown tool: {name}")),
+            _ => Err(ToolError::new(ErrorCode::UnknownTool, "", format!("unknown tool: {name}"))),
         }
     }
 
@@ -425,28 +487,34 @@ impl Engine {
         self.doc.flush_pending_relayout();
     }
 
-    pub(crate) fn node(&self, id: u64) -> Result<&Node, String> {
-        if id == 0 {
-            return Err("node IDs must be positive integers".into());
-        }
-        self.doc.get(NodeId(id)).ok_or_else(|| format!("node {id} not found"))
+    pub(crate) fn node(&self, id: u64) -> Result<&Node, ToolError> {
+        self.node_at(id, "/node_id")
     }
 
-    pub(crate) fn exec(&mut self, command: Command) -> Result<(), String> {
+    pub(crate) fn node_at(&self, id: u64, path: &str) -> Result<&Node, ToolError> {
+        if id == 0 {
+            return Err(ToolError::new(ErrorCode::ValueOutOfRange, path, "node IDs must be positive integers").with_corrected_example(json!(1)));
+        }
+        self.doc.get(NodeId(id)).ok_or_else(|| ToolError::new(ErrorCode::NodeNotFound, path, format!("node {id} not found")))
+    }
+
+    pub(crate) fn exec(&mut self, command: Command) -> Result<(), ToolError> {
         let ops = self.live_ops_for(&command)?;
-        self.history.exec(&mut self.doc, command).map_err(|e| e.to_string())?;
+        self.history.exec(&mut self.doc, command).map_err(|e| ToolError::new(ErrorCode::InternalError, "", e.to_string()))?;
+        self.revision = self.revision.wrapping_add(1);
         self.record(ops);
         Ok(())
     }
 
-    fn exec_apply_spec(&mut self, command: Command) -> Result<(), String> {
+    fn exec_apply_spec(&mut self, command: Command) -> Result<(), ToolError> {
         let ops = if self.live_ops.is_some() {
             let filtered = Self::filter_live_command(&command);
             self.live_ops_for(&filtered)?
         } else {
             Vec::new()
         };
-        self.history.exec(&mut self.doc, command).map_err(|e| e.to_string())?;
+        self.history.exec(&mut self.doc, command).map_err(|e| ToolError::new(ErrorCode::InternalError, "", e.to_string()))?;
+        self.revision = self.revision.wrapping_add(1);
         self.record(ops);
         Ok(())
     }
@@ -460,11 +528,11 @@ impl Engine {
     }
 
     /// The ops `command` will perform, when recording; refuses edits the editor cannot replay.
-    pub(crate) fn live_ops_for(&self, command: &Command) -> Result<Vec<LiveOp>, String> {
+    pub(crate) fn live_ops_for(&self, command: &Command) -> Result<Vec<LiveOp>, ToolError> {
         if self.live_ops.is_none() {
             return Ok(Vec::new());
         }
-        live_ops_for_command(&self.doc, command)
+        live_ops_for_command(&self.doc, command).map_err(|e| ToolError::new(ErrorCode::InternalError, "", e))
     }
 
     pub(crate) fn record(&mut self, ops: Vec<LiveOp>) {
@@ -478,14 +546,15 @@ impl Engine {
         self.live_ops.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
-    fn create(&mut self, a: CreateArgs) -> Result<Value, String> {
+    fn create(&mut self, a: CreateArgs) -> Result<Value, ToolError> {
         let parent_id = match a.parent_id {
             Some(id) => {
-                self.node(id)?;
+                self.node_at(id, "/parent_id")?;
                 NodeId(id)
             }
             None => self.resolve_default_page()?,
         };
+        self.check_owned_frames(parent_id, "/parent_id")?;
         let (id, index, node) = crate::tools::build_created_node(&mut self.doc, parent_id, None, &a.kind, a.name, a.text, a.x, a.y, a.width, a.height)?;
         self.exec(Command::Insert { parent: parent_id, index, nodes: vec![node] })?;
         if let Some(page_id) = self.doc.page_of(id) {
@@ -494,7 +563,8 @@ impl Engine {
         Ok(json!({"node":self.doc.get(id),"parent_id":parent_id.0,"changed":true}))
     }
 
-    fn update(&mut self, a: UpdateArgs) -> Result<Value, String> {
+    fn update(&mut self, a: UpdateArgs) -> Result<Value, ToolError> {
+        self.check_owned_frames(NodeId(a.node_id), "/node_id")?;
         let (node, changed) = crate::tools::build_updated_node(
             &self.doc,
             NodeId(a.node_id),
@@ -511,15 +581,134 @@ impl Engine {
     }
 }
 
+fn validate_xpath_selector(selector: &str) -> Result<(), ToolError> {
+    let mut depth = 0i32;
+    for ch in selector.chars() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(ToolError::new(ErrorCode::InvalidSelector, "/selector", format!("invalid XPath selector '{selector}': unmatched ']'"))
+                        .with_corrected_example(json!({ "selector": "//FRAME[@name='Card']" })));
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 || (selector.starts_with('/') && !selector.starts_with("//")) {
+        return Err(ToolError::new(ErrorCode::InvalidSelector, "/selector", format!("invalid XPath selector '{selector}'"))
+            .with_corrected_example(json!({ "selector": "//FRAME[@name='Card']" })));
+    }
+    Ok(())
+}
+
+fn matches_single_step(doc: &Document, n: &Node, step: &str) -> bool {
+    let kind_upper = n.kind.default_name().to_ascii_uppercase();
+    if step.is_empty() || step == "*" {
+        return true;
+    }
+    if let Some((tag_part, rest)) = step.split_once('[') {
+        let tag_ok = tag_part.is_empty() || tag_part == "*" || kind_upper == tag_part.to_ascii_uppercase();
+        if !tag_ok {
+            return false;
+        }
+        let pred_clean = rest.trim_end_matches(']').trim();
+        if let Some(val) = pred_clean.strip_prefix("@name=") {
+            let unquoted = val.trim().trim_matches('\'').trim_matches('"');
+            n.name == unquoted
+        } else if pred_clean.contains("contains(@name") {
+            let parts: Vec<&str> = pred_clean.split(['\'', '"']).collect();
+            parts.get(1).is_some_and(|needle| n.name.to_lowercase().contains(&needle.to_lowercase()))
+        } else if let Some(val) = pred_clean.strip_prefix("@component=") {
+            let unquoted = val.trim().trim_matches('\'').trim_matches('"');
+            designos_doc::instance_component(n).and_then(|cid| doc.get(cid)).is_some_and(|cn| {
+                cn.name == unquoted || cn.parent.and_then(|pid| doc.get(pid)).is_some_and(|p| matches!(p.kind, NodeKind::ComponentSet(_)) && p.name == unquoted)
+            })
+        } else if pred_clean == "@fill" {
+            !n.fills.is_empty()
+        } else {
+            true
+        }
+    } else {
+        kind_upper == step.to_ascii_uppercase() || n.name.to_lowercase().contains(&step.to_lowercase())
+    }
+}
+
+fn query_xpath_nodes<'a>(doc: &'a Document, root: Option<NodeId>, selector: &str) -> Vec<&'a Node> {
+    let mut matches = Vec::new();
+    let steps: Vec<&str> = if let Some(rest) = selector.strip_prefix("//") { rest.split("//").filter(|s| !s.is_empty()).collect() } else { Vec::new() };
+
+    let candidate_ids: Vec<NodeId> = if let Some(r) = root {
+        let mut ids = Vec::new();
+        doc.walk(r, |n, _| ids.push(n.id));
+        ids
+    } else {
+        doc.nodes.keys().copied().collect()
+    };
+
+    for nid in candidate_ids {
+        let Some(n) = doc.get(nid) else {
+            continue;
+        };
+        let matched = if selector.is_empty() || selector == "//*" || selector == "*" {
+            true
+        } else if steps.len() >= 2 {
+            let last = steps[steps.len() - 1];
+            if !matches_single_step(doc, n, last) {
+                false
+            } else {
+                let mut cur_parent = n.parent;
+                let mut idx = steps.len() - 1;
+                while idx > 0 {
+                    let target_step = steps[idx - 1];
+                    let mut found = None;
+                    while let Some(pid) = cur_parent {
+                        if let Some(pnode) = doc.get(pid) {
+                            if matches_single_step(doc, pnode, target_step) {
+                                found = pnode.parent;
+                                break;
+                            }
+                            cur_parent = pnode.parent;
+                        } else {
+                            break;
+                        }
+                    }
+                    if found.is_some() || (idx == 1 && cur_parent.is_some()) {
+                        cur_parent = found;
+                        idx -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                idx == 0
+            }
+        } else if let Some(&only) = steps.first() {
+            matches_single_step(doc, n, only)
+        } else {
+            matches_single_step(doc, n, selector)
+        };
+        if matched {
+            matches.push(n);
+        }
+    }
+    matches
+}
+
 fn summary(n: &Node) -> Value {
     json!({"node_id":n.id,"name":n.name,"kind":n.kind.default_name(),"parent_id":n.parent,
         "child_count":n.children.len(),"visible":n.visible,"x":n.transform.tx,"y":n.transform.ty,
         "width":n.size.x,"height":n.size.y})
 }
 
-pub(crate) fn parse<T: DeserializeOwned>(args: Value) -> Result<T, String> {
-    serde_json::from_value(args).map_err(|e| format!("invalid arguments: {e}"))
+pub(crate) fn parse<T: DeserializeOwned>(args: Value) -> Result<T, ToolError> {
+    serde_json::from_value(args).map_err(|e| crate::tools::errors::from_serde_error(&e, "", false))
 }
+
+pub(crate) fn parse_spec<T: DeserializeOwned>(args: Value) -> Result<T, ToolError> {
+    serde_json::from_value(args).map_err(|e| crate::tools::errors::from_serde_error(&e, "", true))
+}
+
 use crate::tools::bounded_text;
 fn default_limit() -> usize {
     100
@@ -666,16 +855,32 @@ pub fn tools() -> Vec<Value> {
     let text = json!({"type":"string","maxLength":100000,"description":"Plain text; limited to 100000 UTF-8 bytes."});
     let name = json!({"type":"string","maxLength":1024,"description":"Layer name; limited to 1024 UTF-8 bytes."});
     let mut out = Vec::new();
-    let mut add = |tool: &str, description: &str, properties: Value, required: Vec<&str>, read_only: bool, idempotent: bool| {
-        out.push(json!({"name":format!("designos_{tool}"),"description":description,
+    let mut add =
+        |tool: &str, description: &str, properties: Value, required: Vec<&str>, out_props: Value, out_req: &[&str], read_only: bool, idempotent: bool| {
+            out.push(json!({"name":format!("designos_{tool}"),"description":description,
             "inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},
+            "outputSchema":tool_output_schema(out_props, out_req),
             "annotations":{"readOnlyHint":read_only,"destructiveHint":!read_only,"idempotentHint":idempotent,"openWorldHint":false}}));
-    };
+        };
     add(
         "get_document",
         "Summarize the current in-memory document: pages, counts, shared styles (fill, text, effect, grid) with their values, and undo state.",
         json!({}),
         vec![],
+        json!({
+            "name": {"type": "string"},
+            "kind": {"type": "string"},
+            "active_page_id": {"type": ["integer", "null"]},
+            "pages": {"type": "array"},
+            "node_count": {"type": "integer"},
+            "variable_count": {"type": "integer"},
+            "comment_count": {"type": "integer"},
+            "style_count": {"type": "integer"},
+            "styles": {"type": "array"},
+            "can_undo": {"type": "boolean"},
+            "can_redo": {"type": "boolean"}
+        }),
+        &["name", "pages", "node_count", "can_undo", "can_redo"],
         true,
         true,
     );
@@ -684,15 +889,37 @@ pub fn tools() -> Vec<Value> {
         "List node summaries in numeric ID order. Query matches names case-insensitively; parent_id filters direct children. Use next_offset to paginate.",
         json!({"parent_id":id,"query":{"type":"string","maxLength":1024},"offset":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":500,"default":100}}),
         vec![],
+        json!({
+            "nodes": {"type": "array"},
+            "total": {"type": "integer"},
+            "offset": {"type": "integer"},
+            "next_offset": {"type": ["integer", "null"]}
+        }),
+        &["nodes", "total", "offset"],
         true,
         true,
     );
-    add("get_node", "Read the full native node including geometry, paints, text, bindings, and child IDs.", json!({"node_id":id}), vec!["node_id"], true, true);
+    add(
+        "get_node",
+        "Read the full native node including geometry, paints, text, bindings, and child IDs.",
+        json!({"node_id":id}),
+        vec!["node_id"],
+        json!({ "node": {"type": "object"} }),
+        &["node"],
+        true,
+        true,
+    );
     add(
         "get_variables",
         "Read variable definitions and collections. With node_id, also resolve that node's direct bindings using inherited collection modes.",
         json!({"node_id":id}),
         vec![],
+        json!({
+            "variables": {"type": "object"},
+            "collections": {"type": "object"},
+            "effective_bindings": {"type": ["array", "null"]}
+        }),
+        &["variables", "collections"],
         true,
         true,
     );
@@ -701,18 +928,52 @@ pub fn tools() -> Vec<Value> {
         "Generate developer handoff code or SVG for a layer using resolved variable values. Returns source text; writes no files.",
         json!({"node_id":id,"language":{"type":"string","enum":["css","tailwind","react","swiftui","uikit","compose","android-xml","svg"]}}),
         vec!["node_id", "language"],
+        json!({
+            "node_id": {"type": "integer"},
+            "language": {"type": "string"},
+            "code": {"type": "string"}
+        }),
+        &["node_id", "language", "code"],
         true,
         true,
     );
-    add("create_node","Create one layer in a container; defaults to x/y=0, width/height=100. Supports undo. Text is only valid for text layers. Changes are in memory until saved.",
-        json!({"parent_id":id,"kind":{"type":"string","enum":["frame","rectangle","ellipse","text"]},"name":name,"text":text,"x":coordinate,"y":coordinate,"width":size,"height":size}),vec!["parent_id","kind"],false,false);
-    add("update_node","Update specified fields of one non-page layer. Coordinates are parent-relative. Replacing text clears text runs and list ranges. Supports undo; changes remain in memory until saved.",
-        json!({"node_id":id,"name":name,"text":text,"x":coordinate,"y":coordinate,"width":size,"height":size,"visible":{"type":"boolean"},"opacity":{"type":"number","minimum":0,"maximum":1}}),vec!["node_id"],false,true);
+    add(
+        "create_node",
+        "Create one layer in a container; defaults to x/y=0, width/height=100. Supports undo. Text is only valid for text layers. Changes are in memory until saved.",
+        json!({"parent_id":id,"kind":{"type":"string","enum":["frame","rectangle","ellipse","text"]},"name":name,"text":text,"x":coordinate,"y":coordinate,"width":size,"height":size}),
+        vec!["parent_id", "kind"],
+        json!({
+            "node": {"type": "object"},
+            "parent_id": {"type": "integer"},
+            "changed": {"type": "boolean"}
+        }),
+        &["node", "parent_id", "changed"],
+        false,
+        false,
+    );
+    add(
+        "update_node",
+        "Update specified fields of one non-page layer. Coordinates are parent-relative. Replacing text clears text runs and list ranges. Supports undo; changes remain in memory until saved.",
+        json!({"node_id":id,"name":name,"text":text,"x":coordinate,"y":coordinate,"width":size,"height":size,"visible":{"type":"boolean"},"opacity":{"type":"number","minimum":0,"maximum":1}}),
+        vec!["node_id"],
+        json!({
+            "node": {"type": "object"},
+            "changed": {"type": "boolean"}
+        }),
+        &["node", "changed"],
+        false,
+        true,
+    );
     add(
         "delete_node",
         "Remove a non-page layer and its entire subtree. Supports undo; changes remain in memory until saved.",
         json!({"node_id":id}),
         vec!["node_id"],
+        json!({
+            "node_id": {"type": "integer"},
+            "deleted": {"type": "boolean"}
+        }),
+        &["node_id", "deleted"],
         false,
         false,
     );
@@ -721,6 +982,11 @@ pub fn tools() -> Vec<Value> {
         "List canvas comment threads enriched with resolved world coordinates, target node ID/name/kind, and top-level frame ID/name. Filter by resolved state, page_id, or node_id.",
         json!({"resolved":{"type":"boolean"},"page_id":id,"node_id":id}),
         vec![],
+        json!({
+            "comments": {"type": "array"},
+            "total": {"type": "integer"}
+        }),
+        &["comments", "total"],
         true,
         true,
     );
@@ -729,6 +995,12 @@ pub fn tools() -> Vec<Value> {
         "Pin a new comment thread to a node (with local offset x/y) or page coordinates. Supports undo.",
         json!({"text":{"type":"string","minLength":1,"maxLength":10000},"author":{"type":"string","maxLength":256},"node_id":id,"page_id":id,"x":coordinate,"y":coordinate}),
         vec!["text"],
+        json!({
+            "id": {"type": "string"},
+            "thread": {"type": "object"},
+            "changed": {"type": "boolean"}
+        }),
+        &["id", "thread", "changed"],
         false,
         false,
     );
@@ -737,6 +1009,11 @@ pub fn tools() -> Vec<Value> {
         "Append a reply message to an existing canvas comment thread and optionally mark it resolved/unresolved. Supports undo.",
         json!({"thread_id":{"type":"string","minLength":1},"text":{"type":"string","minLength":1,"maxLength":10000},"author":{"type":"string","maxLength":256},"resolved":{"type":"boolean"}}),
         vec!["thread_id", "text"],
+        json!({
+            "thread": {"type": "object"},
+            "changed": {"type": "boolean"}
+        }),
+        &["thread", "changed"],
         false,
         false,
     );
@@ -745,14 +1022,43 @@ pub fn tools() -> Vec<Value> {
         "Mark a canvas comment thread resolved (default true) or unresolved (false). Supports undo.",
         json!({"thread_id":{"type":"string","minLength":1},"resolved":{"type":"boolean","default":true}}),
         vec!["thread_id"],
+        json!({
+            "thread_id": {"type": "string"},
+            "resolved": {"type": "boolean"},
+            "changed": {"type": "boolean"}
+        }),
+        &["thread_id", "resolved", "changed"],
         false,
         true,
     );
     add(
         "apply_spec",
-        "Build a complete UI subtree from a declarative NodeSpec (supports EaseUI BrainWave 2.0 presets like easeui-screen/easeui-card/easeui-button-primary, $easeui.* tokens, and Auto-Layout 5.0 row/column/wrap/hug/fill) in a single atomic undoable step together with the variables it creates. Replies with bindings_created, styles_linked and warnings (for example DEPRECATED_EASEUI_TOKEN).",
+        concat!(
+            "Build a complete UI subtree from a declarative NodeSpec (supports EaseUI BrainWave 2.0 presets like easeui-screen/easeui-card/easeui-button-primary, $easeui.* tokens, and Auto-Layout 5.0 row/column/wrap/hug/fill) in a single atomic undoable step together with the variables it creates. Replies with bindings_created, styles_linked and warnings (for example DEPRECATED_EASEUI_TOKEN).\n\n",
+            "Examples:\n",
+            "1) Token-bound frame with auto-layout:\n",
+            "{\"parent_id\":1,\"spec\":{\"kind\":\"frame\",\"name\":\"Hero\",\"layout\":{\"direction\":\"column\",\"gap\":16,\"padding\":24},\"fill\":\"var:Color/Surface\",\"children\":[{\"kind\":\"text\",\"name\":\"Title\",\"text\":\"Welcome\"}]}}\n",
+            "2) Component instance with variant and overrides:\n",
+            "{\"parent_id\":1,\"spec\":{\"kind\":\"instance\",\"name\":\"PrimaryCTA\",\"component\":\"Button\",\"variant\":{\"Size\":\"lg\",\"State\":\"default\"},\"overrides\":[{\"path\":\"Label\",\"text\":\"Continue\"}]}}\n",
+            "3) Component instance with filled slots:\n",
+            "{\"parent_id\":1,\"spec\":{\"kind\":\"instance\",\"name\":\"SettingsCard\",\"component\":\"Card\",\"slots\":{\"header\":[{\"kind\":\"instance\",\"component\":\"CardHeader\"}],\"body\":[{\"kind\":\"instance\",\"component\":\"FormRow\"}],\"footer\":false}}}"
+        ),
         json!({"parent_id":id,"spec":{"type":"object","description":"Declarative NodeSpec tree (kind, name, preset, width, height, width_sizing, height_sizing, fill, stroke, corner_radius, text, font_size, layout, dev_status, annotations, children)."}}),
         vec!["spec"],
+        json!({
+            "root_node_id": {"type": "integer"},
+            "parent_id": {"type": "integer"},
+            "node": {"type": "object"},
+            "changed": {"type": "boolean"},
+            "name_to_id": {"type": "object"},
+            "instances": {"type": "array"},
+            "imported_assets": {"type": "array"},
+            "issues": {"type": "array"},
+            "bindings_created": {"type": "integer"},
+            "styles_linked": {"type": "integer"},
+            "warnings": {"type": "array"}
+        }),
+        &["root_node_id", "parent_id", "node", "changed", "name_to_id", "instances", "issues"],
         false,
         false,
     );
@@ -761,6 +1067,11 @@ pub fn tools() -> Vec<Value> {
         "Export a node and its descendants as a declarative NodeSpec JSON tree, enriched with Dev Mode status/annotations and any canvas comment threads pinned within the subtree.",
         json!({"node_id":id}),
         vec!["node_id"],
+        json!({
+            "node_id": {"type": "integer"},
+            "spec": {"type": "object"}
+        }),
+        &["node_id", "spec"],
         true,
         true,
     );
@@ -769,6 +1080,12 @@ pub fn tools() -> Vec<Value> {
         "Set a layer's Dev Mode handoff status ('ready', 'completed', or 'clear') and/or append a developer annotation. Supports undo.",
         json!({"node_id":id,"status":{"type":"string","enum":["ready","completed","clear","none"]},"annotation":{"type":"string","maxLength":10000}}),
         vec!["node_id"],
+        json!({
+            "node_id": {"type": "integer"},
+            "dev": {"type": "object"},
+            "changed": {"type": "boolean"}
+        }),
+        &["node_id", "dev", "changed"],
         false,
         false,
     );
@@ -777,11 +1094,83 @@ pub fn tools() -> Vec<Value> {
         "Export the current session document to a Figma binary .fig container (with fig-kiwi header and deflate chunks) inside the workspace.",
         json!({"output_path":{"type":"string","description":"Destination .fig path inside the workspace."}}),
         vec!["output_path"],
+        json!({
+            "output_path": {"type": "string"},
+            "path": {"type": "string"},
+            "bytes": {"type": "integer"},
+            "saved": {"type": "boolean"}
+        }),
+        &["output_path", "bytes", "saved"],
         false,
         true,
     );
-    add("undo", "Undo the latest successful edit in this session; returns changed=false if the stack is empty.", json!({}), vec![], false, false);
-    add("redo", "Redo the most recently undone edit in this session; returns changed=false if the stack is empty.", json!({}), vec![], false, false);
+    add(
+        "query_xpath",
+        concat!(
+            "Query layers in the document using an XPath-like selector (tag, @name, @component, @fill, and //descendant steps).\n\n",
+            "Examples:\n",
+            "1) Find instances by component name:\n",
+            "{\"selector\":\"//INSTANCE[@component='Button']\"}\n",
+            "2) Find text descendants inside a named frame:\n",
+            "{\"selector\":\"//FRAME[@name='Hero']//TEXT\"}\n",
+            "3) Find layers that have a fill:\n",
+            "{\"selector\":\"//RECTANGLE[@fill]\",\"page_id\":1}"
+        ),
+        json!({"selector":{"type":"string","description":"XPath-style selector (e.g. //FRAME[@name='Card']//TEXT)."},"page_id":id}),
+        vec!["selector"],
+        json!({
+            "selector": {"type": "string"},
+            "page_id": {"type": ["integer", "null"]},
+            "nodes": {"type": "array"},
+            "total": {"type": "integer"}
+        }),
+        &["selector", "nodes", "total"],
+        true,
+        true,
+    );
+    add(
+        "lint",
+        "Run design-system lint rules (zero-bounds, default-layer-name) across a page or the whole document.",
+        json!({"page_id":id}),
+        vec![],
+        json!({
+            "page_id": {"type": ["integer", "null"]},
+            "findings": {"type": "array"},
+            "total": {"type": "integer"},
+            "passed": {"type": "boolean"}
+        }),
+        &["findings", "total", "passed"],
+        true,
+        true,
+    );
+    add(
+        "undo",
+        "Undo the latest successful edit in this session; returns changed=false if the stack is empty.",
+        json!({}),
+        vec![],
+        json!({
+            "changed": {"type": "boolean"},
+            "can_undo": {"type": "boolean"},
+            "can_redo": {"type": "boolean"}
+        }),
+        &["changed", "can_undo", "can_redo"],
+        false,
+        false,
+    );
+    add(
+        "redo",
+        "Redo the most recently undone edit in this session; returns changed=false if the stack is empty.",
+        json!({}),
+        vec![],
+        json!({
+            "changed": {"type": "boolean"},
+            "can_undo": {"type": "boolean"},
+            "can_redo": {"type": "boolean"}
+        }),
+        &["changed", "can_undo", "can_redo"],
+        false,
+        false,
+    );
     out.push(crate::tools::batch::tool_descriptor());
     out
 }
@@ -934,7 +1323,7 @@ mod tests {
         let xml = e.call("designos_generate_code", json!({"node_id":id,"language":"android-xml"})).unwrap();
         assert!(xml["code"].as_str().unwrap().starts_with("<!-- res/layout/card.xml -->"), "{xml}");
         let err = e.call("designos_generate_code", json!({"node_id":id,"language":"vue"})).unwrap_err();
-        assert!(err.contains("uikit") && err.contains("android-xml"), "{err}");
+        assert!(err.message.contains("uikit") && err.message.contains("android-xml"), "{err}");
         assert!(e.call("designos_list_nodes", json!({"limit":501})).is_err());
         assert!(e.call("designos_get_node", json!({"node_id":"2"})).is_err());
     }
@@ -1187,7 +1576,7 @@ mod tests {
                 ]}}),
             )
             .unwrap_err();
-        assert!(err.contains("UNKNOWN_VARIABLE"), "{err}");
+        assert_eq!(err.code, ErrorCode::UnknownVariable, "{err}");
         assert!(e.doc.variable_collections.is_empty());
         assert!(e.doc.variables.is_empty());
         assert_eq!(e.history.undo_depth(), depth);
@@ -1312,8 +1701,7 @@ mod tests {
                 }),
             )
             .unwrap_err();
-        let parsed_err: designos_doc::SpecError = serde_json::from_str(&err_str).unwrap();
-        assert_eq!(parsed_err.code, "INVALID_SLOT_VALUE");
+        assert_eq!(err_str.code, ErrorCode::InvalidSlotValue);
         assert!(!e.history.can_undo());
 
         // Filling `body` with a recommended FormRow + a non-recommended raw frame succeeds and returns `issues`

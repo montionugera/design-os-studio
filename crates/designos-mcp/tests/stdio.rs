@@ -10,8 +10,8 @@ async fn stdio_handshake_discovery_edit_and_error_recovery() {
         let client = ().serve(TokioChildProcess::new(command).unwrap()).await.unwrap();
         assert_eq!(client.peer_info().unwrap().server_info.as_ref().unwrap().name, "designos-mcp");
         let tools = client.list_all_tools().await.unwrap();
-        assert_eq!(tools.len(), 23);
-        assert!(tools.iter().all(|t| t.annotations.is_some()));
+        assert_eq!(tools.len(), 25);
+        assert!(tools.iter().all(|t| t.annotations.is_some() && t.output_schema.is_some()));
         let call = |name: &'static str, args: Value| CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone());
         let doc = client.call_tool(call("designos_get_document", json!({}))).await.unwrap();
         assert_eq!(doc.is_error, Some(false));
@@ -20,6 +20,8 @@ async fn stdio_handshake_discovery_edit_and_error_recovery() {
         let id = created.structured_content.unwrap()["node"]["id"].clone();
         let invalid = client.call_tool(call("designos_update_node", json!({"node_id":id,"width":-1}))).await.unwrap();
         assert_eq!(invalid.is_error, Some(true));
+        assert_eq!(invalid.structured_content.as_ref().unwrap()["error"]["code"], "VALUE_OUT_OF_RANGE");
+        assert_eq!(invalid.structured_content.as_ref().unwrap()["error"]["safe_to_retry"], true);
         let code = client.call_tool(call("designos_generate_code", json!({"node_id":id,"language":"css"}))).await.unwrap();
         assert!(code.structured_content.unwrap()["code"].as_str().unwrap().contains("120px"));
         client.call_tool(call("designos_undo", json!({}))).await.unwrap();

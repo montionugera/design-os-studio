@@ -1093,7 +1093,28 @@ pub(crate) fn apply_overrides_with_ctx(
     overrides: &[OverrideSpec],
     ctx: &mut SpecBuildCtx<'_>,
 ) -> Result<(), SpecError> {
-    for ov in overrides {
+    for (ov_idx, ov) in overrides.iter().enumerate() {
+        apply_single_override_with_ctx(doc, instance_root, ov, ctx).map_err(|mut e| {
+            let sub = if e.path == "overrides" {
+                String::new()
+            } else if let Some(rest) = e.path.strip_prefix("overrides.") {
+                format!(".{rest}")
+            } else if e.path == "component" {
+                ".swap".to_string()
+            } else if !e.path.is_empty() {
+                format!(".{}", e.path)
+            } else {
+                String::new()
+            };
+            e.path = format!("overrides[{ov_idx}]{sub}");
+            e
+        })?;
+    }
+    Ok(())
+}
+
+fn apply_single_override_with_ctx(doc: &mut Document, instance_root: NodeId, ov: &OverrideSpec, ctx: &mut SpecBuildCtx<'_>) -> Result<(), SpecError> {
+    {
         let target_id = resolve_override_target(doc, instance_root, ov)?;
 
         // 1. Instance swap (`swap`)
