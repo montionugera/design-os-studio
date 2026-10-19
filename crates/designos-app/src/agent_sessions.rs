@@ -181,7 +181,7 @@ where
             let same_owner = existing.pid == my_pid && existing.window == window;
             if !same_owner && pid_alive(existing.pid) {
                 let fallback_dir = std::env::temp_dir().join("designos-sessions").join(fallback_id);
-                let _ = std::fs::create_dir_all(&fallback_dir);
+                let _ = crate::agent_session_files::ensure_session_dir(&fallback_dir);
                 return LockOutcome::Fallback { dir: fallback_dir, message: ANOTHER_WINDOW_OWNS_SESSION_MSG.to_string() };
             }
         }

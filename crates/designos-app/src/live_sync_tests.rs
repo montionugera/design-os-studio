@@ -110,6 +110,7 @@ fn mcp_apply_spec_on_scoped_canvas_keeps_full_document() {
 
     // 1. The editor publishes its live canvas for the agent.
     app.terminal.sync_live_file_context(&app.doc, app.page, &app.selection, None);
+    app.terminal.flush_live_sync();
 
     // 2. The real MCP session edits that canvas: one apply_spec and one update_node.
     let mut session = designos_mcp::server::Session::with_session_dir(&workspace, &session_dir).expect("mcp session");
@@ -229,6 +230,7 @@ fn agent_comments_never_overwrite_user_threads() {
     let workspace = std::env::temp_dir().join(format!("designos-live-sync-ws-{}", unique_tab_id()));
     std::fs::create_dir_all(&workspace).unwrap();
     app.terminal.sync_live_file_context(&app.doc, app.page, &app.selection, None);
+    app.terminal.flush_live_sync();
     let mut session = designos_mcp::server::Session::with_session_dir(&workspace, &session_dir).expect("mcp session");
     let replay = |app: &mut App| {
         let actions = app.terminal.poll_live_agent_bridge();
@@ -305,6 +307,7 @@ fn agent_undo_after_a_canvas_reload_never_touches_user_layers() {
     let workspace = std::env::temp_dir().join(format!("designos-live-sync-ws-{}", unique_tab_id()));
     std::fs::create_dir_all(&workspace).unwrap();
     app.terminal.sync_live_file_context(&app.doc, app.page, &app.selection, None);
+    app.terminal.flush_live_sync();
     let mut session = designos_mcp::server::Session::with_session_dir(&workspace, &session_dir).expect("mcp session");
     let replay = |app: &mut App| {
         let actions = app.terminal.poll_live_agent_bridge();
@@ -359,6 +362,7 @@ fn mcp_apply_spec_on_a_real_file_keeps_every_screen() {
     let workspace = std::env::temp_dir().join(format!("designos-live-sync-real-{}", unique_tab_id()));
     std::fs::create_dir_all(&workspace).unwrap();
     app.terminal.sync_live_file_context(&app.doc, app.page, &app.selection, None);
+    app.terminal.flush_live_sync();
     let mut session = designos_mcp::server::Session::with_session_dir(&workspace, &session_dir).expect("mcp session");
     let applied = session
         .call(

@@ -240,6 +240,27 @@ REGRESSIONS: List[Tuple[str, str, str, str, str]] = [
         'title: "Boost resolution",',
         'title: concat !("Boost ", stringify!(resolution)),',
     ),
+    (
+        "32. global /tmp/designos-live-doc.json fallback reintroduced in terminal.rs",
+        "Z15",
+        "terminal.rs",
+        'cmd.env("DESIGNOS_AGENT_RUNTIME", preset.binary_name());',
+        'cmd.env("DESIGNOS_AGENT_RUNTIME", preset.binary_name());\n    cmd.env("DESIGNOS_LIVE_DOC", "/tmp/designos-live-doc.json");',
+    ),
+    (
+        "33. global /tmp/designos-live-doc.json fallback reintroduced in mcp/server.rs",
+        "Z15",
+        "mcp/server.rs",
+        'std::env::var_os("DESIGNOS_SESSION_DIR")',
+        'std::env::var_os("DESIGNOS_SESSION_DIR").or_else(|| Some("/tmp/designos-live-doc.json".into()))',
+    ),
+    (
+        "34. obfuscated concat!(\"/tmp/designos-\", \"live-agent-out.spec.json\") in terminal.rs",
+        "Z15",
+        "terminal.rs",
+        'cmd.env("DESIGNOS_AGENT_RUNTIME", preset.binary_name());',
+        'cmd.env("DESIGNOS_AGENT_RUNTIME", preset.binary_name());\n    let _ = concat!("/tmp/designos-", "live-agent-out.spec.json");',
+    ),
 ]
 
 
@@ -318,6 +339,13 @@ def main() -> int:
             "panels/mod.rs",
             "pub mod toolbar;",
             "pub mod toolbar;\npub const QUOTE: char = '\"';\npub const NEXT: &str = \"Boost resolution\";",
+        ),
+        (
+            "comment-only mention of /tmp/designos-live- in mcp/server.rs is ignored",
+            "Z15",
+            "mcp/server.rs",
+            'std::env::var_os("DESIGNOS_SESSION_DIR")',
+            '/* retired: /tmp/designos-live-doc.json */ std::env::var_os("DESIGNOS_SESSION_DIR")',
         ),
     ]
     for label, check_id, rel, anchor, replacement in controls:
