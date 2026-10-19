@@ -5,14 +5,16 @@ pub mod finding;
 pub mod fix;
 pub mod registry;
 pub mod rules;
+pub mod token_match;
 pub mod traverse;
 
 pub use config::{LintConfig, LintConfigError, LintThresholds, RuleSeverityConfig, RuleSeverityLevel};
-pub use finding::{Finding, FixSuggestion, LintFinding, LintFix, LintPage, LintReport, LintSummary, SkippedRule};
+pub use finding::{Finding, FixSuggestion, LintFinding, LintFix, LintPage, LintReport, LintSummary, ScaleSource, SkippedRule};
 pub use fix::{lint_fix_commands, lint_fix_document, lint_fix_with_history};
 pub use registry::{
     all_preset_names, all_rule_ids, canonical_rule_id, preset_rule_ids, resolve_rule, rule_aliases, Category, LintPreset, RuleNeeds, RuleSpec, Severity, RULES,
 };
+pub use rules::scale::{scales_for, ArchetypeScales, Scale, Scales};
 pub use traverse::{lint_subtree, Budget};
 
 use crate::{Color, Document, LineHeight, Node, NodeId, Rect, TextAutoResize, TextProps, Vec2};
@@ -153,12 +155,16 @@ mod tests {
             ("small-touch-target", "touch-target"),
             ("misaligned-siblings", "unaligned-siblings"),
             ("misaligned-siblings", "inconsistent-sibling-alignment"),
-            ("inconsistent-spacing", "irregular-autolayout-spacing"),
+            ("off-scale", "inconsistent-spacing"),
+            ("off-scale", "irregular-autolayout-spacing"),
+            ("off-scale", "non-scale-font-size"),
+            ("off-scale", "raw-font-size"),
+            ("off-scale", "inconsistent-radius"),
             ("clipped-partial", "clipped-content"),
             ("detached-instance", "REQUIRE_NO_DETACHED_COMPONENTS"),
             ("hardcoded-color", "REQUIRE_FILL_COLOR_VARIABLES"),
             ("hardcoded-color", "color-token-compliance"),
-            ("non-scale-font-size", "raw-font-size"),
+            ("hardcoded-value", "hardcoded-token"),
             ("detached-text-style", "REQUIRE_TEXT_STYLES"),
         ];
 
@@ -197,11 +203,14 @@ mod tests {
         assert!(agent.is_enabled("text-missing-fill"));
         assert!(agent.is_enabled("absolute-in-auto-layout"));
         assert!(agent.is_enabled("placeholder-text"));
+        assert!(agent.is_enabled("off-scale"));
+        assert!(agent.is_enabled("hardcoded-value"));
         assert!(!agent.is_enabled("detached-instance"));
         assert!(!agent.is_enabled("hardcoded-color"));
 
         let check_designs = LintConfig::from_preset_str("check-designs").unwrap();
         assert!(check_designs.is_enabled("detached-instance"));
+        assert!(check_designs.is_enabled("hardcoded-value"));
         assert!(!check_designs.is_enabled("default-layer-name"));
 
         let recommended = LintConfig::from_preset_str("recommended").unwrap();

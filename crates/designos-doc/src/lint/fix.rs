@@ -1,9 +1,11 @@
 //! Deterministic auto-fixes for lint rules, routed through [`Command`] / [`History`].
 
 use super::registry::canonical_rule_id;
-use super::rules::{is_default_layer_name, nearest_on_scale, on_scale, FONT_SCALE, RADIUS_SCALE, SPACING_SCALE};
+use super::rules::scale::scales_for;
+use super::rules::{is_default_layer_name, nearest_on_scale, on_scale, SPACING_SCALE};
+use super::token_match::{Index as TokenIndex, Match, PADDING_KEYS, RADIUS_KEYS};
 use crate::openpencil::{infer_role_hint, xpath_type_name};
-use crate::{Command, DocError, Document, History, LayoutDirection, NodeId, NodeKind};
+use crate::{Command, DocError, Document, History, LayoutDirection, NodeId, NodeKind, PaintKind};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -16,11 +18,22 @@ pub fn lint_fix_commands(doc: &Document, page: Option<NodeId>, rules: Option<&[S
             None => true,
             Some(list) if list.is_empty() => true,
             Some(list) => list.iter().any(|r| {
+                if r.eq_ignore_ascii_case(rule) || r.eq_ignore_ascii_case(canonical) {
+                    return true;
+                }
                 let rc = canonical_rule_id(r).unwrap_or(r.as_str());
-                rc.eq_ignore_ascii_case(canonical) || r.eq_ignore_ascii_case(rule)
+                // If the caller asked for a specific legacy sub-alias of `off-scale`
+                // (e.g. `inconsistent-spacing`), only match that sub-rule or `off-scale` itself.
+                if canonical == "off-scale" && rule != "off-scale" {
+                    return r.eq_ignore_ascii_case("off-scale") || r.eq_ignore_ascii_case(rule);
+                }
+                rc.eq_ignore_ascii_case(canonical)
             }),
         }
     };
+
+    let scales = scales_for(doc, None);
+    let token_index = TokenIndex::new(doc);
 
     let roots: Vec<NodeId> = match page {
         Some(p) => vec![p],
@@ -150,14 +163,14 @@ pub fn lint_fix_commands(doc: &Document, page: Option<NodeId>, rules: Option<&[S
             }
         }
 
-        if allow("non-scale-font-size") {
+        if allow("non-scale-font-size") && !n.style_refs.contains_key("text") && !n.variables.bindings.contains_key("fontSize") {
             if let Some(t) = n.kind.any_text_mut() {
-                if !on_scale(t.style.font_size, &FONT_SCALE) {
-                    let snapped = nearest_on_scale(t.style.font_size, &FONT_SCALE);
+                if !on_scale(t.style.font_size, &scales.typography.steps) {
+                    let snapped = nearest_on_scale(t.style.font_size, &scales.typography.steps);
                     t.style.font_size = snapped;
                     modified = true;
                     changes.push(json!({
-                        "rule": "non-scale-font-size",
+                        "rule": "off-scale",
                         "node_id": id.0,
                         "action": format!("snapped font_size to {snapped}px"),
                     }));
@@ -193,32 +206,40 @@ pub fn lint_fix_commands(doc: &Document, page: Option<NodeId>, rules: Option<&[S
             }
         }
 
-        if allow("inconsistent-radius") && n.corner_radii != [0.0; 4] {
-            let r0 = nearest_on_scale(n.corner_radii[0], &RADIUS_SCALE);
+        if allow("inconsistent-radius")
+            && n.corner_radii != [0.0; 4]
+            && !RADIUS_KEYS.iter().any(|k| n.variables.bindings.contains_key(*k))
+            && !n.variables.bindings.contains_key("cornerRadius")
+        {
+            let r0 = nearest_on_scale(n.corner_radii[0], &scales.radius.steps);
             if n.corner_radii != [r0; 4] {
                 n.corner_radii = [r0; 4];
                 modified = true;
                 changes.push(json!({
-                    "rule": "inconsistent-radius",
+                    "rule": "off-scale",
                     "node_id": id.0,
                     "action": format!("normalized corner_radii to {r0}px"),
                 }));
             }
         }
 
+        let item_spacing_bound = n.variables.bindings.keys().any(|k| k == "itemSpacing" || k == "item_spacing");
         if let Some(fp) = n.kind.frame_props_mut() {
             if let Some(al) = &mut fp.auto_layout {
-                if allow("inconsistent-spacing") && !on_scale(al.item_spacing, &SPACING_SCALE) {
-                    let snapped = nearest_on_scale(al.item_spacing, &SPACING_SCALE);
+                if allow("inconsistent-spacing") && !item_spacing_bound && !on_scale(al.item_spacing, &scales.spacing.steps) {
+                    let snapped = nearest_on_scale(al.item_spacing, &scales.spacing.steps);
                     al.item_spacing = snapped;
                     modified = true;
                     changes.push(json!({
-                        "rule": "inconsistent-spacing",
+                        "rule": "off-scale",
                         "node_id": id.0,
                         "action": format!("snapped item_spacing to {snapped}px"),
                     }));
                 }
-                if allow("unbalanced-padding") && ((al.padding[0] - al.padding[2]).abs() > 0.1 || (al.padding[1] - al.padding[3]).abs() > 0.1) {
+                if allow("unbalanced-padding")
+                    && !PADDING_KEYS.iter().any(|k| n.variables.bindings.contains_key(*k))
+                    && ((al.padding[0] - al.padding[2]).abs() > 0.1 || (al.padding[1] - al.padding[3]).abs() > 0.1)
+                {
                     let v = nearest_on_scale((al.padding[0] + al.padding[2]) * 0.5, &SPACING_SCALE);
                     let h = nearest_on_scale((al.padding[1] + al.padding[3]) * 0.5, &SPACING_SCALE);
                     al.padding = [v, h, v, h];
@@ -229,6 +250,31 @@ pub fn lint_fix_commands(doc: &Document, page: Option<NodeId>, rules: Option<&[S
                         "action": format!("balanced padding to [{v}, {h}, {v}, {h}]"),
                     }));
                 }
+            }
+        }
+
+        if allow("hardcoded-value") && !token_index.by_rgb.is_empty() && !n.style_refs.contains_key("fill") {
+            let mut to_bind = Vec::new();
+            for (i, p) in n.fills.iter().enumerate() {
+                let PaintKind::Solid(c) = &p.kind else { continue };
+                let key = format!("fills/{i}");
+                if !p.visible || n.variables.bindings.contains_key(&key) {
+                    continue;
+                }
+                if let Match::One(entry) = token_index.find(doc, &n, &key, c) {
+                    if entry.constant {
+                        to_bind.push((key, entry.fix_id.clone(), entry.token_name()));
+                    }
+                }
+            }
+            for (key, fix_id, token_name) in to_bind {
+                n.variables.bindings.insert(key.clone(), fix_id);
+                modified = true;
+                changes.push(json!({
+                    "rule": "hardcoded-value",
+                    "node_id": id.0,
+                    "action": format!("bound {key} to variable '{token_name}'"),
+                }));
             }
         }
 
