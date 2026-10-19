@@ -43,7 +43,7 @@ pub struct StartFailure {
     pub fix: FixAction,
 }
 
-fn install_url(preset: AgentCliPreset) -> &'static str {
+pub fn install_url(preset: AgentCliPreset) -> &'static str {
     match preset {
         AgentCliPreset::Claude => "https://docs.claude.com/en/docs/claude-code/setup",
         AgentCliPreset::Codex => "https://github.com/openai/codex",

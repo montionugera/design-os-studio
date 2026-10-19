@@ -15,6 +15,7 @@ pub fn show(app: &mut App, ui: &mut Ui, rect: Rect) {
     widgets::vline(&p, rect.right() - theme::BORDER_WIDTH, rect.top(), rect.bottom(), theme::BORDER);
     let inner = Rect::from_min_max(rect.min, Pos2::new(rect.right() - theme::BORDER_WIDTH, rect.bottom()));
     if matches!(app.ui.rail, Some(crate::app::RailItem::Agents | crate::app::RailItem::Tools)) {
+        app.terminal.prompt_context = crate::agent_sample_prompts::prompt_context(&app.doc, app.page, &app.selection);
         let fp = app.file_path.clone();
         let actions = crate::terminal::show_left(&mut app.terminal, ui, inner, fp.as_deref());
         crate::shell::execute_terminal_actions(app, actions);

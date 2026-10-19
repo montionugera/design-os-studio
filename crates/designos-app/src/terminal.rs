@@ -199,6 +199,7 @@ impl AgentCliPreset {
 }
 
 /// Prompt sent by the `"Make design (First Draft)"` action (`#681` §3 rule 5, §13).
+#[allow(dead_code)]
 pub const MAKE_DESIGN_FIRST_DRAFT_PROMPT: &str =
     "Design a first draft for the selected frame, or for this page if nothing is selected, using this file's variables and styles.";
 
@@ -693,7 +694,10 @@ pub struct TerminalState {
     /// Fix clicked on a tab's "failed to start" panel, applied by the surface that knows the open file.
     pub pending_start_fix: Option<FixAction>,
     /// Which of the Figma Agent categories (`0..3`) is expanded when in legacy chat mode.
+    #[allow(dead_code)]
     pub expanded_agent_cat: Option<usize>,
+    /// Context that selects which starter sample prompts appear in the empty state (`#688`).
+    pub prompt_context: crate::agent_sample_prompts::PromptContext,
     /// Active CLI runtime (`Claude`, `Codex`, `Antigravity`, `Grok`, `Shell`).
     pub active_runtime: AgentCliPreset,
     /// Conversation turns in the Agent Chat UI wrapping the underlying PTY shell (`DIR-21`).
@@ -780,6 +784,7 @@ impl TerminalState {
             runtime_dropdown_open: false,
             pending_start_fix: None,
             expanded_agent_cat: None,
+            prompt_context: crate::agent_sample_prompts::PromptContext::NoSelection,
             active_runtime: AgentCliPreset::Shell,
             chat_turns: Vec::new(),
             chat_scroll: 0.0,
@@ -791,6 +796,25 @@ impl TerminalState {
             stub_cli: None,
             #[cfg(test)]
             path_override: None,
+        }
+    }
+
+    /// Returns `true` when at least one supported agent CLI (`Claude`, `Codex`, `Antigravity`, `Grok`) is installed (`#688` §3 rule 6).
+    pub fn any_agent_cli_installed(&self) -> bool {
+        const AGENT_PRESETS: [AgentCliPreset; 4] = [AgentCliPreset::Claude, AgentCliPreset::Codex, AgentCliPreset::Antigravity, AgentCliPreset::Grok];
+        #[cfg(test)]
+        {
+            if self.stub_cli.is_some() {
+                return true;
+            }
+            if let Some(ref p) = self.path_override {
+                return AGENT_PRESETS.iter().any(|preset| runtime_binary_available_in(preset.binary_name(), Some(p.as_os_str()), false));
+            }
+            true
+        }
+        #[cfg(not(test))]
+        {
+            AGENT_PRESETS.iter().any(|preset| preset.is_installed())
         }
     }
 
@@ -856,6 +880,7 @@ impl TerminalState {
     /// so any CLI agent (`claude`, `codex`, `agy`, `grok`) in this file's terminal automatically
     /// targets THIS file and its currently selected page.
     pub fn sync_live_file_context(&mut self, doc: &Document, page: NodeId, selection: &[NodeId], file_path: Option<&Path>) {
+        self.prompt_context = crate::agent_sample_prompts::prompt_context(doc, page, selection);
         let _ = std::fs::create_dir_all(&self.session_dir);
         self.current_page_id = page.0;
         self.current_page_name = doc.get(page).map(|n| n.name.clone()).unwrap_or_else(|| "Page 1".into());
@@ -1104,7 +1129,7 @@ impl TerminalState {
         let display_cmd = if is_raw_shell { raw_cmd.clone() } else { real_cli_cmd.clone() };
 
         let is_agent_runtime = !matches!(runtime, AgentCliPreset::Shell | AgentCliPreset::DesignOsHelp);
-        const _RETAINED_MIC_ICON_VARIANT: crate::icons::Icon = crate::icons::Icon::Microphone;
+        const _RETAINED_ICON_VARIANTS: [crate::icons::Icon; 3] = [crate::icons::Icon::Microphone, crate::icons::Icon::Wand, crate::icons::Icon::StarFour];
         let bin_available = runtime_binary_available(runtime.binary_name());
         #[cfg(test)]
         let bin_available = if self.stub_cli.is_some() {
@@ -2903,142 +2928,17 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
     // ---- C. Center Area (`between runtime bar and bottom composer`)
     let center_rect = Rect::from_min_max(Pos2::new(rect.left(), top_y), Pos2::new(rect.right(), (composer_rect.top() - 8.0).max(top_y + 32.0)));
 
+    let mut sample_prompt_clicked = false;
     if !state.chat_turns.is_empty() {
         // Mode 3: Pure Chat UI Wrapper Over Live PTY Shell (`Claude Code`, `Codex`, `Antigravity CLI`)
         render_agent_chat_thread(state, ui, center_rect, &mut actions);
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
     } else {
-        // Mode 1 (Default): 1:1 Figma Desktop 126.9.13 `What's next?` View
+        let cli_installed = state.any_agent_cli_installed();
+        let prompt_ctx = state.prompt_context;
         clipped(ui, center_rect, |ui| {
-            let p = ui.painter().clone();
-            let badge_center = Pos2::new(center_rect.center().x, center_rect.top() + 44.0);
-            paint_agents_grid_plus_badge(&p, badge_center);
-
-            p.text(
-                Pos2::new(center_rect.center().x, center_rect.top() + 82.0),
-                Align2::CENTER_CENTER,
-                "What's next?",
-                theme::font_large_strong(),
-                Color32::WHITE,
-            );
-
-            let mut y = center_rect.top() + 108.0;
-            let card_x = center_rect.left() + 14.0;
-            let card_w = (center_rect.width() - 28.0).max(100.0);
-            let card_h = 40.0;
-
-            for (cat_idx, cat_id, cat_title) in [
-                (0usize, "agents-cat-tidy", "Tidy and polish"),
-                (1usize, "agents-cat-generate", "Generate designs"),
-                (2usize, "agents-cat-plugins", "Create plugins and shaders"),
-            ] {
-                let card_r = Rect::from_min_size(Pos2::new(card_x, y), Vec2::new(card_w, card_h));
-                let card_resp = ui.interact(card_r, Id::new(cat_id), Sense::click());
-                let is_expanded = state.expanded_agent_cat == Some(cat_idx);
-                let fill = if card_resp.hovered() || is_expanded { Color32::from_rgb(0x2E, 0x2E, 0x2E) } else { Color32::from_rgb(0x25, 0x25, 0x25) };
-                p.rect_filled(card_r, CornerRadius::same(10), fill);
-                p.rect_stroke(card_r, CornerRadius::same(10), Stroke::new(1.0, Color32::from_rgb(0x38, 0x38, 0x38)), StrokeKind::Inside);
-
-                let icon_pos = Pos2::new(card_r.left() + 18.0, card_r.center().y);
-                let icon_col = Color32::from_rgb(0xB3, 0xB3, 0xB3);
-                match cat_idx {
-                    0 => paint_wand_sparkle_icon(&p, icon_pos, icon_col),
-                    1 => paint_four_point_star_icon(&p, icon_pos, icon_col),
-                    _ => paint_toolbox_icon(&p, icon_pos, icon_col),
-                }
-
-                let label = widgets::elide(&p, cat_title, &theme::font_body_strong(), (card_w - 58.0).max(32.0));
-                p.text(Pos2::new(card_r.left() + 34.0, card_r.center().y), Align2::LEFT_CENTER, label, theme::font_body_strong(), Color32::WHITE);
-
-                let ch_c = Pos2::new(card_r.right() - 16.0, card_r.center().y);
-                let ch_stroke = Stroke::new(1.4, icon_col);
-                if is_expanded {
-                    p.line_segment([Pos2::new(ch_c.x - 4.0, ch_c.y + 2.0), Pos2::new(ch_c.x, ch_c.y - 2.0)], ch_stroke);
-                    p.line_segment([Pos2::new(ch_c.x, ch_c.y - 2.0), Pos2::new(ch_c.x + 4.0, ch_c.y + 2.0)], ch_stroke);
-                } else {
-                    p.line_segment([Pos2::new(ch_c.x - 4.0, ch_c.y - 2.0), Pos2::new(ch_c.x, ch_c.y + 2.0)], ch_stroke);
-                    p.line_segment([Pos2::new(ch_c.x, ch_c.y + 2.0), Pos2::new(ch_c.x + 4.0, ch_c.y - 2.0)], ch_stroke);
-                }
-
-                widgets::record(ui, cat_id, card_r);
-                if card_resp.clicked() {
-                    state.expanded_agent_cat = if is_expanded { None } else { Some(cat_idx) };
-                }
-                y += card_h + 10.0;
-
-                if is_expanded {
-                    let sub_items: &[(&str, &str, &str, &str)] = match cat_idx {
-                        0 => &[
-                            (
-                                "term-ai-rename-layers",
-                                "Rename layers semantically",
-                                "Rename Layers",
-                                "Semantically rename generic Frame/Rect/Text layers across selection",
-                            ),
-                            ("term-ai-design-gate", "Design Gate audit & auto-fix", "Design Gate", "\"$DESIGNOS_BIN\" \"$DESIGNOS_FILE\" --inspect-json"),
-                            (
-                                "term-ai-translate",
-                                "Translate selection (VI <-> EN)",
-                                "Translate VI/EN",
-                                "Translate selected UI copy between Vietnamese and English",
-                            ),
-                        ],
-                        1 => &[
-                            ("term-ai-make-design", "Make design (First Draft)", "Make Design", MAKE_DESIGN_FIRST_DRAFT_PROMPT),
-                            (
-                                "term-ai-make-proto",
-                                "Make prototype flows",
-                                "Make Prototype",
-                                "Auto-wire OnClick -> NavigateTo SmartAnimate flows across frames",
-                            ),
-                            (
-                                "term-ai-populate",
-                                "Populate realistic data",
-                                "Populate Content",
-                                "Populate realistic SaaS metrics, names, and statuses into repeated cards",
-                            ),
-                        ],
-                        _ => &[
-                            ("agents-open-pty", "Open Live PTY Terminal", "Open PTY", ""),
-                            ("term-left-send-sel", "Send selection & comments to PTY", "Send Selection", ""),
-                            ("term-left-apply-out", "Apply NodeSpec from PTY output", "Apply Spec", ""),
-                            ("term-left-sync-disk", "Sync canvas from disk", "Sync Canvas", ""),
-                        ],
-                    };
-                    for &(sub_id, sub_label, task_title, cli_prompt) in sub_items {
-                        let sub_r = Rect::from_min_size(Pos2::new(card_x + 6.0, y), Vec2::new((card_w - 12.0).max(80.0), 28.0));
-                        let sub_resp = ui.interact(sub_r, Id::new(sub_id), Sense::click());
-                        p.rect_filled(sub_r, CornerRadius::same(6), if sub_resp.hovered() { TERM_BG_HOVER } else { Color32::from_rgb(0x1E, 0x1E, 0x1E) });
-                        p.rect_stroke(sub_r, CornerRadius::same(6), Stroke::new(1.0, Color32::from_rgb(0x33, 0x33, 0x33)), StrokeKind::Inside);
-                        let elided = widgets::elide(&p, sub_label, &theme::font_caption_medium(), (sub_r.width() - 20.0).max(24.0));
-                        p.text(Pos2::new(sub_r.left() + 10.0, sub_r.center().y), Align2::LEFT_CENTER, elided, theme::font_caption_medium(), theme::TEXT);
-                        widgets::record(ui, sub_id, sub_r);
-                        if sub_resp.clicked() {
-                            match sub_id {
-                                "agents-open-pty" => {
-                                    state.side_panel_pty_open = true;
-                                }
-                                "term-left-send-sel" => actions.push(TerminalAction::ExportSelectionToTerminal),
-                                "term-left-apply-out" => {
-                                    if let Some(act) = resolve_apply_spec_action(state) {
-                                        actions.push(act);
-                                    }
-                                }
-                                "term-left-sync-disk" => actions.push(TerminalAction::ReloadFromDisk),
-                                "term-ai-make-design" => {
-                                    state.submit_chat_prompt(cli_prompt, file_path);
-                                }
-                                _ => {
-                                    state.submit_chat_prompt(cli_prompt, file_path);
-                                    state.dispatch_figma_ai_prompt(task_title, cli_prompt, file_path);
-                                }
-                            }
-                        }
-                        y += 32.0;
-                    }
-                    y += 4.0;
-                }
-            }
+            sample_prompt_clicked =
+                crate::agent_sample_prompts::paint_empty_state(ui, center_rect, prompt_ctx, cli_installed, &mut state.input_line, &mut state.viewport_focused);
         });
     }
 
@@ -3061,7 +2961,15 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
             .text_color(Color32::WHITE)
             .hint_text(RichText::new("Ask for changes").font(theme::font_body()).color(Color32::from_rgb(0x8C, 0x8C, 0x8C)));
         let resp = ui.add(te);
-        if resp.clicked() || resp.has_focus() {
+        if sample_prompt_clicked {
+            resp.request_focus();
+            if let Some(mut te_state) = egui::TextEdit::load_state(ui.ctx(), resp.id) {
+                let ccursor = egui::text::CCursor::new(state.input_line.chars().count());
+                te_state.cursor.set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
+                te_state.store(ui.ctx(), resp.id);
+            }
+        }
+        if resp.clicked() || resp.has_focus() || sample_prompt_clicked {
             state.viewport_focused = false;
         }
         if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
@@ -3390,24 +3298,6 @@ fn render_agent_chat_thread(state: &mut TerminalState, ui: &mut Ui, center_rect:
             }
         }
     }
-}
-
-fn paint_agents_grid_plus_badge(p: &egui::Painter, center: Pos2) {
-    p.circle_filled(center, 19.0, Color32::from_rgb(0x2D, 0x36, 0x4D));
-    let col = Color32::from_rgb(0x6E, 0xA8, 0xFE);
-    icons::paint(p, Icon::GridView, center, 18.0, col);
-}
-
-fn paint_wand_sparkle_icon(p: &egui::Painter, c: Pos2, col: Color32) {
-    icons::paint(p, Icon::Wand, c, 14.0, col);
-}
-
-fn paint_four_point_star_icon(p: &egui::Painter, c: Pos2, col: Color32) {
-    icons::paint(p, Icon::StarFour, c, 14.0, col);
-}
-
-fn paint_toolbox_icon(p: &egui::Painter, c: Pos2, col: Color32) {
-    icons::paint(p, Icon::Tools, c, 14.0, col);
 }
 
 fn paint_open_book_icon(p: &egui::Painter, c: Pos2, col: Color32) {
@@ -4339,7 +4229,7 @@ Done!
         assert!(!pty_all_text.contains(&"Learn more"), "AI credits banner must be removed");
         st.runtime_dropdown_open = false;
 
-        // 2. Also verify chat/categories view when side_panel_pty_open is false
+        // 2. Also verify chat/sample-prompts view when side_panel_pty_open is false
         st.side_panel_pty_open = false;
         st.chat_mode = false;
         crate::lint::take_icons();
@@ -4353,9 +4243,10 @@ Done!
         assert!(all_text.contains(&"Shared"), "Subtitle 'Shared' must be painted: {all_text:?}");
         assert!(all_text.contains(&"AI"), "Badge 'AI' must be painted: {all_text:?}");
         assert!(all_text.contains(&"What's next?"), "Heading 'What's next?' must be painted: {all_text:?}");
-        assert!(all_text.contains(&"Tidy and polish"), "Category 'Tidy and polish' must be painted: {all_text:?}");
-        assert!(all_text.contains(&"Generate designs"), "Category 'Generate designs' must be painted: {all_text:?}");
-        assert!(all_text.contains(&"Create plugins and shaders"), "Category 'Create plugins and shaders' must be painted: {all_text:?}");
+        assert!(all_text.contains(&"Describe this page"), "Sample prompt 'Describe this page' must be painted: {all_text:?}");
+        assert!(all_text.contains(&"Find design problems"), "Sample prompt 'Find design problems' must be painted: {all_text:?}");
+        assert!(all_text.contains(&"Build a new screen"), "Sample prompt 'Build a new screen' must be painted: {all_text:?}");
+        assert!(all_text.contains(&"Name the layers"), "Sample prompt 'Name the layers' must be painted: {all_text:?}");
         assert!(!all_text.contains(&"Learn more"), "Credits banner 'Learn more' must NOT be painted: {all_text:?}");
 
         let text_findings = crate::lint::check_text(&texts, &boxes);
@@ -4363,9 +4254,13 @@ Done!
         assert!(text_findings.is_empty(), "Agents side panel text lint findings: {text_findings:?}");
         assert!(icon_findings.is_empty(), "Agents side panel icon lint findings: {icon_findings:?}");
 
-        // Also verify expanded categories and in-panel PTY mode render cleanly
-        for cat in [Some(0), Some(1), Some(2)] {
-            st.expanded_agent_cat = cat;
+        // Also verify all 3 prompt contexts and in-panel PTY mode pass layout lint cleanly
+        for pctx in [
+            crate::agent_sample_prompts::PromptContext::EmptyFile,
+            crate::agent_sample_prompts::PromptContext::Frame,
+            crate::agent_sample_prompts::PromptContext::NoSelection,
+        ] {
+            st.prompt_context = pctx;
             let raw2 = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0))), ..Default::default() };
             let out2 = ctx.run_ui(raw2, |ui| {
                 let _ = show_left(&mut st, ui, panel_rect, None);
@@ -5966,15 +5861,20 @@ Done!
         crate::theme::install_fonts(&ctx);
         crate::theme::apply(&ctx);
         let panel_rect = Rect::from_min_size(Pos2::new(48.0, 0.0), Vec2::new(260.0, 800.0));
-        let mut st =
-            TerminalState { side_panel_pty_open: false, chat_mode: true, expanded_agent_cat: Some(1), stub_cli: Some(stub), ..TerminalState::for_tab(68105) };
+        let mut st = TerminalState {
+            side_panel_pty_open: false,
+            chat_mode: true,
+            input_line: MAKE_DESIGN_FIRST_DRAFT_PROMPT.to_string(),
+            stub_cli: Some(stub),
+            ..TerminalState::for_tab(68105)
+        };
 
         let _ = ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0))), ..Default::default() }, |ui| {
             let _ = show_left(&mut st, ui, panel_rect, None);
         });
         assert!(ctx.data(|d| d.get_temp::<Rect>(Id::new(("test-rect", "agents-cat-prd".to_string())))).is_none(), "agents-cat-prd category must be removed");
-        let make_design_rect: Rect = ctx.data(|d| d.get_temp(Id::new(("test-rect", "term-ai-make-design".to_string())))).expect("term-ai-make-design recorded");
-        let pos = make_design_rect.center();
+        let send_rect: Rect = ctx.data(|d| d.get_temp(Id::new(("test-rect", "agents-composer-send".to_string())))).expect("agents-composer-send recorded");
+        let pos = send_rect.center();
 
         let mut actions = Vec::new();
         let raw = egui::RawInput {
@@ -5992,12 +5892,12 @@ Done!
 
         assert!(
             st.chat_turns.iter().any(|t| t.role == AgentChatRole::User && t.text == MAKE_DESIGN_FIRST_DRAFT_PROMPT),
-            "clicking term-ai-make-design must record a User turn with MAKE_DESIGN_FIRST_DRAFT_PROMPT: {:?}",
+            "sending MAKE_DESIGN_FIRST_DRAFT_PROMPT must record a User turn with MAKE_DESIGN_FIRST_DRAFT_PROMPT: {:?}",
             st.chat_turns
         );
         assert!(
             !actions.iter().any(|a| matches!(a, TerminalAction::ApplySpecJson(_) | TerminalAction::ApplySpecFile(_))),
-            "clicking term-ai-make-design must not return ApplySpecJson or ApplySpecFile: {actions:?}"
+            "sending MAKE_DESIGN_FIRST_DRAFT_PROMPT must not return ApplySpecJson or ApplySpecFile: {actions:?}"
         );
         kill_tabs(&mut st);
     }
@@ -6020,6 +5920,249 @@ Done!
         let (texts, _) = crate::lint::scan_shapes(&out.shapes);
         for t in &texts {
             assert!(!t.text.contains("Audit the selected frame against the PRD"), "painted text must not contain fake voice prompt: {:?}", t.text);
+        }
+        kill_tabs(&mut st);
+    }
+
+    #[test]
+    fn the_three_contexts_show_their_prompts() {
+        use crate::agent_sample_prompts::{sample_prompts, PromptContext};
+        use designos_doc::{FrameProps, Node, NodeKind};
+
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx);
+        let panel_rect = Rect::from_min_size(Pos2::new(48.0, 0.0), Vec2::new(320.0, 800.0));
+
+        let mut doc = Document::new("688 Three Contexts");
+        let page = doc.add_page("Page 1");
+        let mut st = TerminalState { side_panel_pty_open: false, chat_mode: true, ..TerminalState::for_tab(68801) };
+
+        // 1. EmptyFile context
+        st.sync_live_file_context(&doc, page, &[], None);
+        assert_eq!(st.prompt_context, PromptContext::EmptyFile);
+        let out_empty =
+            ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0))), ..Default::default() }, |ui| {
+                let _ = show_left(&mut st, ui, panel_rect, None);
+            });
+        let (texts_empty, _) = crate::lint::scan_shapes(&out_empty.shapes);
+        for (idx, expected) in sample_prompts(PromptContext::EmptyFile).iter().enumerate() {
+            assert!(
+                ctx.data(|d| d.get_temp::<Rect>(Id::new(("test-rect", format!("agents-sample-prompt-{idx}"))))).is_some(),
+                "EmptyFile prompt row {idx} must be recorded"
+            );
+            assert!(texts_empty.iter().any(|t| t.text == expected.label), "EmptyFile prompt label {:?} must be painted: {:?}", expected.label, texts_empty);
+        }
+
+        // 2. Frame context (when a frame is selected)
+        let frame_id = doc.alloc_id();
+        let mut frame_node = Node::new(frame_id, NodeKind::Frame(FrameProps::default()));
+        frame_node.name = "Card".into();
+        let frame_id = doc.insert(page, frame_node).expect("insert frame");
+        st.sync_live_file_context(&doc, page, &[frame_id], None);
+        assert_eq!(st.prompt_context, PromptContext::Frame);
+        let out_frame =
+            ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0))), ..Default::default() }, |ui| {
+                let _ = show_left(&mut st, ui, panel_rect, None);
+            });
+        let (texts_frame, _) = crate::lint::scan_shapes(&out_frame.shapes);
+        for (idx, expected) in sample_prompts(PromptContext::Frame).iter().enumerate() {
+            assert!(
+                ctx.data(|d| d.get_temp::<Rect>(Id::new(("test-rect", format!("agents-sample-prompt-{idx}"))))).is_some(),
+                "Frame prompt row {idx} must be recorded"
+            );
+            assert!(texts_frame.iter().any(|t| t.text == expected.label), "Frame prompt label {:?} must be painted: {:?}", expected.label, texts_frame);
+        }
+
+        // 3. NoSelection context (non-empty file, empty selection)
+        st.sync_live_file_context(&doc, page, &[], None);
+        assert_eq!(st.prompt_context, PromptContext::NoSelection);
+        let out_nosel =
+            ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0))), ..Default::default() }, |ui| {
+                let _ = show_left(&mut st, ui, panel_rect, None);
+            });
+        let (texts_nosel, _) = crate::lint::scan_shapes(&out_nosel.shapes);
+        for (idx, expected) in sample_prompts(PromptContext::NoSelection).iter().enumerate() {
+            assert!(
+                ctx.data(|d| d.get_temp::<Rect>(Id::new(("test-rect", format!("agents-sample-prompt-{idx}"))))).is_some(),
+                "NoSelection prompt row {idx} must be recorded"
+            );
+            assert!(texts_nosel.iter().any(|t| t.text == expected.label), "NoSelection prompt label {:?} must be painted: {:?}", expected.label, texts_nosel);
+        }
+        kill_tabs(&mut st);
+    }
+
+    #[test]
+    fn a_click_fills_the_composer_and_changes_nothing_else() {
+        use crate::agent_sample_prompts::{sample_prompts, PromptContext};
+
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx);
+        let panel_rect = Rect::from_min_size(Pos2::new(48.0, 0.0), Vec2::new(320.0, 800.0));
+
+        let mut doc = Document::new("688 Click Fills Composer");
+        let page = doc.add_page("Page 1");
+        let doc_hash = |d: &Document| -> u64 {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            d.to_json().expect("doc.to_json").hash(&mut h);
+            h.finish()
+        };
+        let hash_before = doc_hash(&doc);
+
+        let mut st = TerminalState { side_panel_pty_open: false, chat_mode: true, ..TerminalState::for_tab(68802) };
+        st.spawn_tab(AgentCliPreset::Shell, None).expect("spawn shell tab");
+        let rec = attach_recorder(st.active_tab_mut().expect("active tab"));
+        st.sync_live_file_context(&doc, page, &[], None);
+        assert_eq!(st.prompt_context, PromptContext::EmptyFile);
+
+        let _ = ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0))), ..Default::default() }, |ui| {
+            let _ = show_left(&mut st, ui, panel_rect, None);
+        });
+        let row0: Rect = ctx.data(|d| d.get_temp(Id::new(("test-rect", "agents-sample-prompt-0".to_string())))).expect("agents-sample-prompt-0 recorded");
+        let pos = row0.center();
+
+        let mut actions = Vec::new();
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0))),
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+            ],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(raw, |ui| {
+            actions = show_left(&mut st, ui, panel_rect, None);
+        });
+
+        let expected_text = &sample_prompts(PromptContext::EmptyFile)[0].text;
+        assert_eq!(&st.input_line, expected_text, "clicking sample prompt must set input_line to the full prompt text");
+        assert!(st.chat_turns.is_empty(), "clicking sample prompt must never submit a chat turn: {:?}", st.chat_turns);
+        assert!(actions.is_empty(), "clicking sample prompt must emit no TerminalAction: {actions:?}");
+        assert_eq!(doc_hash(&doc), hash_before, "document hash must be unchanged");
+        assert!(rec.lock().unwrap().is_empty(), "PTY must receive 0 bytes when clicking a sample prompt");
+        assert!(ctx.memory(|m| m.has_focus(Id::new("agents-ask-for-changes-input"))), "clicking sample prompt must focus the composer input");
+        kill_tabs(&mut st);
+    }
+
+    #[test]
+    fn a_click_appends_to_an_existing_draft() {
+        use crate::agent_sample_prompts::{sample_prompts, PromptContext};
+
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx);
+        let panel_rect = Rect::from_min_size(Pos2::new(48.0, 0.0), Vec2::new(320.0, 800.0));
+
+        let mut st = TerminalState {
+            side_panel_pty_open: false,
+            chat_mode: true,
+            prompt_context: PromptContext::Frame,
+            input_line: "Keep the header intact.".to_string(),
+            ..TerminalState::for_tab(68803)
+        };
+
+        let _ = ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0))), ..Default::default() }, |ui| {
+            let _ = show_left(&mut st, ui, panel_rect, None);
+        });
+        let row1: Rect = ctx.data(|d| d.get_temp(Id::new(("test-rect", "agents-sample-prompt-1".to_string())))).expect("agents-sample-prompt-1 recorded");
+        let pos = row1.center();
+
+        for click_round in 1..=2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0))),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+                    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+                ],
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(raw, |ui| {
+                let _ = show_left(&mut st, ui, panel_rect, None);
+            });
+            let p_text = &sample_prompts(PromptContext::Frame)[1].text;
+            if click_round == 1 {
+                assert_eq!(st.input_line, format!("Keep the header intact. {p_text}"));
+            } else {
+                assert_eq!(st.input_line, format!("Keep the header intact. {p_text} {p_text}"));
+            }
+        }
+        assert!(st.chat_turns.is_empty());
+        kill_tabs(&mut st);
+    }
+
+    #[test]
+    fn no_cli_installed_shows_install_guidance() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx);
+        let panel_rect = Rect::from_min_size(Pos2::new(48.0, 0.0), Vec2::new(320.0, 800.0));
+
+        let mut st =
+            TerminalState { side_panel_pty_open: false, chat_mode: true, path_override: Some(std::ffi::OsString::new()), ..TerminalState::for_tab(68804) };
+        assert!(!st.any_agent_cli_installed(), "empty PATH must report no agent CLI installed");
+
+        let out = ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0))), ..Default::default() }, |ui| {
+            let _ = show_left(&mut st, ui, panel_rect, None);
+        });
+        let (texts, boxes) = crate::lint::scan_shapes(&out.shapes);
+        assert!(crate::lint::check_text(&texts, &boxes).is_empty(), "no-CLI guidance must pass text layout lint");
+        assert!(texts.iter().any(|t| t.text.contains("No agent CLI found")), "No agent CLI found line must be painted: {texts:?}");
+
+        for idx in 0..6 {
+            assert!(
+                ctx.data(|d| d.get_temp::<Rect>(Id::new(("test-rect", format!("agents-sample-prompt-{idx}"))))).is_none(),
+                "sample prompt row {idx} must NOT be recorded when no CLI is installed"
+            );
+        }
+        for id in ["agents-install-claude", "agents-install-codex", "agents-install-agy", "agents-install-grok"] {
+            assert!(
+                ctx.data(|d| d.get_temp::<Rect>(Id::new(("test-rect", id.to_string())))).is_some(),
+                "install guidance row {id} must be recorded when no CLI is installed"
+            );
+        }
+        kill_tabs(&mut st);
+    }
+
+    #[test]
+    fn old_category_cards_are_gone() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx);
+        let panel_rect = Rect::from_min_size(Pos2::new(48.0, 0.0), Vec2::new(320.0, 800.0));
+        let mut st = TerminalState { side_panel_pty_open: false, chat_mode: true, ..TerminalState::for_tab(68805) };
+
+        let out = ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0))), ..Default::default() }, |ui| {
+            let _ = show_left(&mut st, ui, panel_rect, None);
+        });
+        for retired_id in [
+            "agents-cat-tidy",
+            "agents-cat-generate",
+            "agents-cat-plugins",
+            "agents-cat-prd",
+            "term-ai-rename-layers",
+            "term-ai-design-gate",
+            "term-ai-translate",
+            "term-ai-make-design",
+            "term-ai-make-proto",
+            "term-ai-populate",
+        ] {
+            assert!(
+                ctx.data(|d| d.get_temp::<Rect>(Id::new(("test-rect", retired_id.to_string())))).is_none(),
+                "retired category/action id {retired_id} must not be recorded"
+            );
+        }
+        assert!(
+            ctx.data(|d| d.get_temp::<Rect>(Id::new(("test-rect", "agents-empty-attach-hint".to_string())))).is_none(),
+            "attach hint must not be recorded when neither #654 nor #655 is present"
+        );
+        let (texts, _) = crate::lint::scan_shapes(&out.shapes);
+        for t in &texts {
+            assert!(!t.text.contains("Click the selection chip"), "unshipped #654 hint must not be painted");
+            assert!(!t.text.contains("Type @ to mention layers"), "unshipped #655 hint must not be painted");
         }
         kill_tabs(&mut st);
     }
