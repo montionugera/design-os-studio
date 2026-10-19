@@ -10,7 +10,7 @@ async fn stdio_handshake_discovery_edit_and_error_recovery() {
         let client = ().serve(TokioChildProcess::new(command).unwrap()).await.unwrap();
         assert_eq!(client.peer_info().unwrap().server_info.as_ref().unwrap().name, "designos-mcp");
         let tools = client.list_all_tools().await.unwrap();
-        assert_eq!(tools.len(), 22);
+        assert_eq!(tools.len(), 23);
         assert!(tools.iter().all(|t| t.annotations.is_some()));
         let call = |name: &'static str, args: Value| CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone());
         let doc = client.call_tool(call("designos_get_document", json!({}))).await.unwrap();
@@ -18,6 +18,12 @@ async fn stdio_handshake_discovery_edit_and_error_recovery() {
         let page = doc.structured_content.unwrap()["pages"][0]["node_id"].clone();
         let created = client.call_tool(call("designos_create_node", json!({"parent_id":page,"kind":"rectangle","name":"MCP test","width":120}))).await.unwrap();
         let id = created.structured_content.unwrap()["node"]["id"].clone();
+        let shot = client.call_tool(call("designos_get_screenshot", json!({"node_id":id}))).await.unwrap();
+        assert_eq!(shot.is_error, Some(false));
+        assert!(shot.content.first().and_then(|c| c.as_image()).is_some());
+        let shot_meta = shot.structured_content.unwrap();
+        assert_eq!(shot_meta["width"], 60);
+        assert_eq!(shot_meta["bounds"]["width"], 120.0);
         let invalid = client.call_tool(call("designos_update_node", json!({"node_id":id,"width":-1}))).await.unwrap();
         assert_eq!(invalid.is_error, Some(true));
         let code = client.call_tool(call("designos_generate_code", json!({"node_id":id,"language":"css"}))).await.unwrap();
