@@ -1,14 +1,14 @@
 //! Agent side: turn a command about to be executed into the [`LiveOp`]s it performs.
 
 use super::{LiveOp, SiblingHint, ThreadChange, STRUCTURAL_FIELDS};
-use crate::{Command, CommentThread, Document, Node, Variable, VariableCollection};
+use crate::{Command, CommentThread, Document, Node, Style, StyleMeta, Variable, VariableCollection};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
 /// The [`LiveOp`]s `cmd` performs when applied to `doc`, read from the state before it runs.
 ///
 /// Errors for commands whose effect cannot be replayed on a document the agent only partly
-/// holds (page, style, flow, library, guide and device edits); the caller should
+/// holds (page, flow, library, guide and device edits); the caller should
 /// refuse to run them while a live editor is attached instead of letting them vanish.
 pub fn live_ops_for_command(doc: &Document, cmd: &Command) -> Result<Vec<LiveOp>, String> {
     let mut out = Vec::new();
@@ -42,6 +42,11 @@ pub fn live_ops_for_command(doc: &Document, cmd: &Command) -> Result<Vec<LiveOp>
         }
         Command::SetVariables { variables, collections } => {
             if let Some(op) = variable_changes(doc, variables, collections) {
+                out.push(op);
+            }
+        }
+        Command::SetStyles { styles, style_meta } => {
+            if let Some(op) = style_changes(doc, styles, style_meta) {
                 out.push(op);
             }
         }
@@ -89,6 +94,19 @@ fn variable_changes(doc: &Document, variables: &BTreeMap<String, Variable>, coll
     any.then_some(LiveOp::Variables { collections, variables, removed_collections, removed_variables })
 }
 
+/// What `SetStyles` changes in `doc`'s shared styles and metadata, by style key.
+fn style_changes(doc: &Document, styles: &BTreeMap<String, Style>, style_meta: &BTreeMap<String, StyleMeta>) -> Option<LiveOp> {
+    fn diff<T: Clone + PartialEq>(before: &BTreeMap<String, T>, after: &BTreeMap<String, T>) -> (BTreeMap<String, T>, Vec<String>) {
+        let set = after.iter().filter(|(k, v)| before.get(*k) != Some(*v)).map(|(k, v)| (k.clone(), v.clone())).collect::<BTreeMap<_, _>>();
+        let removed = before.keys().filter(|k| !after.contains_key(*k)).cloned().collect();
+        (set, removed)
+    }
+    let (styles_set, styles_removed) = diff(&doc.styles, styles);
+    let (meta_set, meta_removed) = diff(&doc.style_meta, style_meta);
+    let any = !styles_set.is_empty() || !styles_removed.is_empty() || !meta_set.is_empty() || !meta_removed.is_empty();
+    any.then_some(LiveOp::Styles { styles_set, styles_removed, meta_set, meta_removed })
+}
+
 fn comment_changes(before: &[CommentThread], after: &[CommentThread]) -> Option<LiveOp> {
     let find = |list: &[CommentThread], id: &str| list.iter().find(|t| t.id == id).cloned();
     let added: Vec<_> = after.iter().filter(|t| find(before, &t.id).is_none()).cloned().collect();
@@ -114,7 +132,6 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::InsertPage { .. } => "Adding a page",
         Command::RemovePage { .. } => "Removing a page",
         Command::SetFlows { .. } => "Editing prototype flows",
-        Command::SetStyles { .. } => "Editing shared styles",
         Command::SetLibraryState { .. } => "Editing library state",
         Command::SetGuides { .. } => "Editing guides",
         Command::SetPrototypeDevice { .. } => "Editing the prototype device",

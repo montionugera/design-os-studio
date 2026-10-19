@@ -136,6 +136,8 @@ fn merge(total: &mut LivePatchReport, r: LivePatchReport) {
     total.needs_layout.extend(r.needs_layout);
     total.applied += r.applied;
     total.duplicates += r.duplicates;
+    total.tokens_applied += r.tokens_applied;
+    total.tokens_duplicates += r.tokens_duplicates;
     total.skipped.extend(r.skipped);
 }
 

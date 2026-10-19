@@ -10,14 +10,16 @@
 mod record;
 mod replay;
 mod replay_comments;
+mod replay_tokens;
 mod validate;
 
 pub use record::live_ops_for_command;
 pub use replay::{replay_live_patch, LivePatchReport, LivePatchState};
 
-use crate::{Comment, CommentAnchor, CommentThread, Node, NodeId, Variable, VariableCollection};
+use crate::{Comment, CommentAnchor, CommentThread, Node, NodeId, Style, StyleMeta, Variable, VariableCollection};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 
 /// Format version written in every [`LivePatch`].
 pub const LIVE_PATCH_VERSION: u32 = 1;
@@ -160,14 +162,25 @@ pub enum LiveOp {
     /// lack variables the editor has (a scoped canvas), so the editor merges these into its own
     /// maps instead of taking the agent's maps whole.
     Variables {
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "collections_set")]
         collections: Vec<VariableCollection>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "variables_set")]
         variables: Vec<Variable>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "collections_removed")]
         removed_collections: Vec<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "variables_removed")]
         removed_variables: Vec<String>,
+    },
+    /// Shared styles and their metadata the agent added, replaced or removed, by style key.
+    Styles {
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        styles_set: BTreeMap<String, Style>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        styles_removed: Vec<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        meta_set: BTreeMap<String, StyleMeta>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        meta_removed: Vec<String>,
     },
     /// Comment threads the agent created, edited or deleted, by thread id. The agent's copy can
     /// lack threads the editor has, so ids it picks may already be taken there.

@@ -1,9 +1,10 @@
 //! Editor side: replay a [`LivePatch`] on the full document as ordinary [`Command`]s.
 
 use super::replay_comments::{resolve_comments, CommentRemap};
+use super::replay_tokens::{filter_missing_token_links_on_insert, filter_missing_token_links_on_update, resolve_styles, resolve_variables};
 use super::validate::insert_problem;
 use super::{LiveOp, LivePatch, SiblingHint, LIVE_PATCH_VERSION, STRUCTURAL_FIELDS};
-use crate::{Command, DocError, Document, Node, NodeId, NodeKind, Variable, VariableCollection};
+use crate::{Command, DocError, Document, Node, NodeId, NodeKind};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,10 +24,11 @@ pub struct LivePatchState {
     /// shape builder's remainder of a layer). Used only while the old id is gone, so undoing the
     /// replacement sends edits back to the restored layer.
     replaced: BTreeMap<NodeId, NodeId>,
-    /// Variable and collection ids this session's replays added to the editor. An agent undo
-    /// removes only these; anything the editor had before is left alone.
-    introduced_variables: BTreeSet<String>,
-    introduced_collections: BTreeSet<String>,
+    /// Variable, collection and style ids this session's replays added to the editor. An agent
+    /// undo of a spec apply removes only these; anything the editor had before is left alone.
+    pub(super) introduced_variables: BTreeSet<String>,
+    pub(super) introduced_collections: BTreeSet<String>,
+    pub(super) introduced_styles: BTreeSet<String>,
 }
 
 impl LivePatchState {
@@ -72,6 +74,10 @@ pub struct LivePatchReport {
     pub applied: usize,
     /// Ops already reflected in the document (a repeated delivery).
     pub duplicates: usize,
+    /// Token ops (`Variables` / `Styles`) that turned into commands.
+    pub tokens_applied: usize,
+    /// Token ops (`Variables` / `Styles`) already reflected in the document.
+    pub tokens_duplicates: usize,
     /// Ops that could not be replayed, with the reason.
     pub skipped: Vec<String>,
 }
@@ -101,6 +107,7 @@ pub fn replay_live_patch(
         // layers may use it by now, so an undo of an older edit must not remove it.
         state.introduced_variables.clear();
         state.introduced_collections.clear();
+        state.introduced_styles.clear();
         // Its replaced layers are gone from that canvas, so their old ids mean nothing there. The
         // first patch of a session has no earlier canvas to be newer than.
         if state.base.is_some() {
@@ -108,8 +115,10 @@ pub fn replay_live_patch(
         }
         state.base = patch.base;
     }
+    let is_spec_seed = patch.ops.iter().any(|o| matches!(o, LiveOp::Insert { .. }));
+    let is_spec_undo = patch.ops.iter().any(|o| matches!(o, LiveOp::Remove { .. }));
     for op in &patch.ops {
-        if let Some(cmd) = resolve(doc, op, state, &mut report) {
+        if let Some(cmd) = resolve(doc, op, is_spec_seed, is_spec_undo, state, &mut report) {
             if let Err(e) = exec(doc, cmd) {
                 *state = saved;
                 return Err(e);
@@ -120,7 +129,14 @@ pub fn replay_live_patch(
     Ok(report)
 }
 
-fn resolve(doc: &mut Document, op: &LiveOp, state: &mut LivePatchState, report: &mut LivePatchReport) -> Option<Command> {
+fn resolve(
+    doc: &mut Document,
+    op: &LiveOp,
+    is_spec_seed: bool,
+    is_spec_undo: bool,
+    state: &mut LivePatchState,
+    report: &mut LivePatchReport,
+) -> Option<Command> {
     match op {
         LiveOp::Insert { parent: agent_parent, at, nodes } => {
             let (parent, redirected) = resolve_id(&state.remap, &state.replaced, doc, *agent_parent);
@@ -149,15 +165,18 @@ fn resolve(doc: &mut Document, op: &LiveOp, state: &mut LivePatchState, report: 
                 report.skipped.push(format!("update of missing node {}", id.0));
                 return None;
             };
-            let merged = match merge_fields(cur, set, unset) {
+            let mut merged = match merge_fields(cur, set, unset) {
                 Ok(n) => n,
                 Err(e) => {
                     report.skipped.push(format!("update of node {}: {e}", id.0));
                     return None;
                 }
             };
+            let skipped_links = filter_missing_token_links_on_update(doc, cur, &mut merged, report);
             if merged == *cur {
-                report.duplicates += 1;
+                if skipped_links == 0 {
+                    report.duplicates += 1;
+                }
                 return None;
             }
             let is_page = |n: &Node| matches!(n.kind, NodeKind::Page { .. });
@@ -223,7 +242,10 @@ fn resolve(doc: &mut Document, op: &LiveOp, state: &mut LivePatchState, report: 
             Some(Command::Remove { id })
         }
         LiveOp::Variables { collections, variables, removed_collections, removed_variables } => {
-            resolve_variables(doc, collections, variables, removed_collections, removed_variables, state, report)
+            resolve_variables(doc, collections, variables, removed_collections, removed_variables, is_spec_seed, is_spec_undo, state, report)
+        }
+        LiveOp::Styles { styles_set, styles_removed, meta_set, meta_removed } => {
+            resolve_styles(doc, styles_set, styles_removed, meta_set, meta_removed, is_spec_seed, is_spec_undo, state, report)
         }
         LiveOp::Comments { added, changed, removed } => {
             let (remap, replaced) = (&state.remap, &state.replaced);
@@ -231,55 +253,6 @@ fn resolve(doc: &mut Document, op: &LiveOp, state: &mut LivePatchState, report: 
             resolve_comments(doc, added, changed, removed, &mut state.comments, &node, report)
         }
     }
-}
-
-/// The agent's variable and collection changes merged into the editor's own maps, which can hold
-/// more than the agent's copy did. Only ids the editor lacks are added, and only ids added here
-/// are ever removed again (an agent undo): data the editor already had, or the user edited, is
-/// never overwritten or deleted by an agent edit. Entries without an id are refused: the log is a
-/// file any local process can write.
-fn resolve_variables(
-    doc: &Document,
-    collections: &[VariableCollection],
-    variables: &[Variable],
-    removed_collections: &[String],
-    removed_variables: &[String],
-    state: &mut LivePatchState,
-    report: &mut LivePatchReport,
-) -> Option<Command> {
-    let mut merged_vars = doc.variables.clone();
-    let mut merged_colls = doc.variable_collections.clone();
-    for id in removed_variables {
-        if state.introduced_variables.remove(id) {
-            merged_vars.remove(id);
-        }
-    }
-    for id in removed_collections {
-        if state.introduced_collections.remove(id) {
-            merged_colls.remove(id);
-        }
-    }
-    for v in variables {
-        if v.id.is_empty() {
-            report.skipped.push("a variable without an id was not replayed".to_string());
-        } else if !merged_vars.contains_key(&v.id) {
-            merged_vars.insert(v.id.clone(), v.clone());
-            state.introduced_variables.insert(v.id.clone());
-        }
-    }
-    for c in collections {
-        if c.id.is_empty() {
-            report.skipped.push("a variable collection without an id was not replayed".to_string());
-        } else if !merged_colls.contains_key(&c.id) {
-            merged_colls.insert(c.id.clone(), c.clone());
-            state.introduced_collections.insert(c.id.clone());
-        }
-    }
-    if merged_vars == doc.variables && merged_colls == doc.variable_collections {
-        report.duplicates += 1;
-        return None;
-    }
-    Some(Command::SetVariables { variables: merged_vars, collections: merged_colls })
 }
 
 /// `set` and `unset` of an edit to a replaced layer without the shape fields, each of which is
@@ -355,6 +328,7 @@ fn resolve_insert(
     for n in &mut nodes {
         n.children.retain(|c| ids.contains(c));
     }
+    filter_missing_token_links_on_insert(doc, &mut nodes, report);
     nodes[0].parent = Some(parent);
     let siblings = &doc.get(parent)?.children;
     let index = remap_hint(at, state).index_in(siblings);
