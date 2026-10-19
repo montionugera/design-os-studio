@@ -55,6 +55,29 @@ pub fn save_author(root: &Path, name: &str) -> Result<(), String> {
     designos_library::write_atomic(&root.join(FILE), text.as_bytes()).map_err(|e| format!("Cannot save settings: {e}"))
 }
 
+/// Loads user-level `auto_fix` settings from `settings.json` (`E15-13` §3.4).
+#[allow(dead_code)]
+pub fn load_auto_fix(root: &Path) -> Option<designos_doc::AutoFixSettings> {
+    read(root).get("auto_fix").and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
+/// Saves user-level `auto_fix` settings to `settings.json` (`E15-13` §3.4).
+#[allow(dead_code)]
+pub fn save_auto_fix(root: &Path, settings: Option<&designos_doc::AutoFixSettings>) -> Result<(), String> {
+    let mut map = read(root);
+    match settings {
+        Some(s) if !s.is_empty() => {
+            let val = serde_json::to_value(s).map_err(|e| e.to_string())?;
+            map.insert("auto_fix".into(), val);
+        }
+        _ => {
+            map.remove("auto_fix");
+        }
+    }
+    let text = serde_json::to_string_pretty(&serde_json::Value::Object(map)).map_err(|e| e.to_string())?;
+    designos_library::write_atomic(&root.join(FILE), text.as_bytes()).map_err(|e| format!("Cannot save settings: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,6 +111,19 @@ mod tests {
         assert_eq!(load_author(&d), None);
         save_author(&d, "Ann").unwrap();
         assert_eq!(load_author(&d).as_deref(), Some("Ann"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn auto_fix_roundtrip_keeps_other_keys() {
+        let d = tmp("af");
+        assert_eq!(load_auto_fix(&d), None);
+        let mut af = designos_doc::AutoFixSettings { mode: Some(designos_doc::AutoFixMode::ReportOnly), ..Default::default() };
+        af.rules.insert("sizing-conflict".into(), false);
+        save_auto_fix(&d, Some(&af)).unwrap();
+        assert_eq!(load_auto_fix(&d), Some(af));
+        save_auto_fix(&d, None).unwrap();
+        assert_eq!(load_auto_fix(&d), None);
         let _ = std::fs::remove_dir_all(&d);
     }
 

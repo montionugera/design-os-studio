@@ -190,6 +190,9 @@ pub struct Document {
     /// Check designs rule toggles, contrast level, and ignored findings.
     #[serde(default, skip_serializing_if = "CheckDesignsSettings::is_empty")]
     pub check_designs: CheckDesignsSettings,
+    /// Per-document engine auto-fix configuration (`E15-13`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_fix: Option<AutoFixSettings>,
     /// Embedded images keyed by content hash (Figma `imageRef`).
     #[serde(default, with = "serde_images", skip_serializing_if = "BTreeMap::is_empty")]
     pub images: BTreeMap<String, Vec<u8>>,

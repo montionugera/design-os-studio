@@ -572,6 +572,12 @@ pub(crate) fn import_rest_value_owned<'a>(
     }
     let doc_lint_ignores =
         v.get("document").and_then(|d| d.get("pluginData")).and_then(|pd| pd.get("designos:lint_ignores")).and_then(Value::as_str).map(str::to_string);
+    let doc_auto_fix = v
+        .get("document")
+        .and_then(|d| d.get("pluginData"))
+        .and_then(|pd| pd.get("designos:auto_fix"))
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_str::<designos_doc::AutoFixSettings>(s).ok());
     let pages: Vec<Value> = if has_doc {
         let root = v.get_mut("document").unwrap();
         if fstr(root, "type") == Some("CANVAS") {
@@ -610,6 +616,7 @@ pub(crate) fn import_rest_value_owned<'a>(
     }
     cx.finish(expand_instances);
     restore_lint_ignores(&mut cx.doc, &cx.ids, doc_lint_ignores.as_deref());
+    cx.doc.auto_fix = doc_auto_fix;
     cx.register_library_assets();
     cx.doc.kind = DocumentKind::Design;
     if !cx.connectors.is_empty() {
@@ -659,6 +666,11 @@ pub(crate) fn import_rest_value_with_blobs<'a>(
         None => return Err(FigError::Format("REST JSON has no `document`".into())),
     };
     let doc_lint_ignores = root.get("pluginData").and_then(|pd| pd.get("designos:lint_ignores")).and_then(Value::as_str);
+    let doc_auto_fix = root
+        .get("pluginData")
+        .and_then(|pd| pd.get("designos:auto_fix"))
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_str::<designos_doc::AutoFixSettings>(s).ok());
     let large_file = fast_derived_map.is_some();
     let mut cx = Ctx {
         doc: Document::new(fstr(v, "name").unwrap_or("Untitled")),
@@ -721,6 +733,7 @@ pub(crate) fn import_rest_value_with_blobs<'a>(
     }
     cx.finish(expand_instances);
     restore_lint_ignores(&mut cx.doc, &cx.ids, doc_lint_ignores);
+    cx.doc.auto_fix = doc_auto_fix;
     cx.register_library_assets();
     cx.doc.kind = if crate::board::is_figjam(v) { DocumentKind::Board } else { DocumentKind::Design };
     if cx.doc.kind == DocumentKind::Board {

@@ -5,6 +5,16 @@ use designos_doc::{Annotation, Command, Comment, CommentAnchor, CommentThread, D
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 
+/// Pre-auto-fix checkpoint saved when an `Auto-fix` undo entry is pushed during a mutating call (`E15-13` §8.4, §10).
+#[derive(Clone)]
+pub struct AutoFixCheckpoint {
+    pub pre_doc: Document,
+    pub pre_undo_depth: usize,
+    pub post_undo_depth: usize,
+    pub pre_revision: u64,
+    pub pre_reply: Value,
+}
+
 pub struct Engine {
     pub doc: Document,
     pub history: History,
@@ -18,6 +28,15 @@ pub struct Engine {
     pub owned_frames: Option<Vec<NodeId>>,
     /// Per-session options (`designos_configure_session`, E15-12).
     pub session_options: crate::tools::session_options::SessionOptions,
+    /// Optional user-level auto-fix settings (`E15-13` §3.4).
+    pub user_auto_fix: Option<designos_doc::AutoFixSettings>,
+    /// Live ops recorded specifically for the separate `Auto-fix` undo entry of the last mutating call (`E15-13` §3.3).
+    pub auto_fix_live_ops: Vec<LiveOp>,
+    /// Pre-auto-fix checkpoint of the last mutating call (`E15-13` §8.4, §10).
+    pub last_auto_fix_checkpoint: Option<AutoFixCheckpoint>,
+    /// Optional test hook for injecting extra findings per auto-fix pass (`E15-13` §10 `two_pass_limit`).
+    #[allow(clippy::type_complexity)]
+    pub test_lint_hook: Option<std::sync::Arc<dyn Fn(&Document, &[NodeId], usize) -> Vec<designos_doc::lint::Finding> + Send + Sync>>,
     /// When `true` (used by headless tests), disables the text-shaping engine so text rules are
     /// reported in `issues_skipped_rules` (`E15-12` §8.5).
     pub disable_text_lint_engine: bool,
@@ -37,6 +56,10 @@ impl Default for Engine {
             live_patch_label: None,
             owned_frames: None,
             session_options: crate::tools::session_options::SessionOptions::default(),
+            user_auto_fix: None,
+            auto_fix_live_ops: Vec::new(),
+            last_auto_fix_checkpoint: None,
+            test_lint_hook: None,
             disable_text_lint_engine: false,
             revision: 0,
         }
@@ -51,6 +74,52 @@ impl Engine {
         } else {
             &designos_render::RenderLintEnv
         }
+    }
+
+    pub(crate) fn resolved_owned_frames(&self) -> Option<Vec<NodeId>> {
+        if let Some(frames) = &self.owned_frames {
+            return Some(frames.clone());
+        }
+        std::env::var("DESIGNOS_OWNED_FRAMES")
+            .ok()
+            .map(|s| s.split(',').filter_map(|p| p.trim().parse::<u64>().ok()).filter(|&id| id > 0).map(NodeId).collect())
+            .filter(|v: &Vec<NodeId>| !v.is_empty())
+    }
+
+    pub(crate) fn effective_user_auto_fix(&self) -> Option<designos_doc::AutoFixSettings> {
+        if let Some(af) = &self.user_auto_fix {
+            return Some(af.clone());
+        }
+        for var in ["DESIGNOS_LIBRARY", "DESIGNOS_LIBRARY_DIR"] {
+            if let Some(p) = std::env::var_os(var).filter(|p| !p.is_empty()) {
+                let path = std::path::PathBuf::from(p).join("settings.json");
+                if let Ok(raw) = std::fs::read_to_string(path) {
+                    if let Some(af) =
+                        serde_json::from_str::<Value>(&raw).ok().and_then(|v| v.get("auto_fix").cloned()).and_then(|v| serde_json::from_value(v).ok())
+                    {
+                        return Some(af);
+                    }
+                }
+                return None;
+            }
+        }
+        #[cfg(not(test))]
+        {
+            let path = designos_library::Library::default_root().join("settings.json");
+            if let Ok(raw) = std::fs::read_to_string(path) {
+                if let Some(af) = serde_json::from_str::<Value>(&raw).ok().and_then(|v| v.get("auto_fix").cloned()).and_then(|v| serde_json::from_value(v).ok())
+                {
+                    return Some(af);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn resolved_auto_fix_config(&self, doc: &Document) -> designos_doc::lint::ResolvedAutoFixConfig {
+        let session_af = self.session_options.auto_fix.to_settings();
+        let user_af = self.effective_user_auto_fix();
+        designos_doc::lint::ResolvedAutoFixConfig::resolve(Some(&session_af), doc.auto_fix.as_ref(), user_af.as_ref())
     }
 
     /// Resolves the target page when a tool call omits `parent_id` / `page_id`:
@@ -68,11 +137,7 @@ impl Engine {
     }
 
     pub(crate) fn check_owned_frames(&self, target: NodeId, path: &str) -> Result<(), ToolError> {
-        let env_owned: Option<Vec<NodeId>> = std::env::var("DESIGNOS_OWNED_FRAMES")
-            .ok()
-            .map(|s| s.split(',').filter_map(|p| p.trim().parse::<u64>().ok()).filter(|&id| id > 0).map(NodeId).collect())
-            .filter(|v: &Vec<NodeId>| !v.is_empty());
-        let Some(frames) = self.owned_frames.as_deref().or(env_owned.as_deref()) else {
+        let Some(frames) = self.resolved_owned_frames() else {
             return Ok(());
         };
         let allowed = frames.iter().any(|&f| f == target || self.doc.is_ancestor(f, target));
@@ -85,6 +150,8 @@ impl Engine {
     }
 
     pub fn call(&mut self, name: &str, args: Value) -> Result<Value, ToolError> {
+        self.auto_fix_live_ops.clear();
+        self.last_auto_fix_checkpoint = None;
         // Nothing here drains the lazy layout queue between calls, so no tool may start from, read,
         // or serialize a document with deferred layout still in it.
         self.settle_layout();
@@ -203,15 +270,7 @@ impl Engine {
                 self.exec(Command::Remove { id })?;
                 self.relayout(former_parent);
                 let mut out = json!({"node_id":id,"deleted":true});
-                crate::tools::issues::attach_issues_block(
-                    &self.doc,
-                    &[former_parent],
-                    &self.session_options.issues,
-                    a.lint,
-                    &baseline,
-                    self.lint_env(),
-                    &mut out,
-                );
+                crate::tools::issues::finish_mutating_call(self, &[former_parent], a.lint, &baseline, None, &mut out);
                 Ok(out)
             }
             "designos_list_comments" => {
@@ -393,7 +452,7 @@ impl Engine {
                 if !report.stale_library_assets.is_empty() {
                     resp["stale_library_assets"] = json!(report.stale_library_assets);
                 }
-                crate::tools::issues::attach_issues_block(&self.doc, &[root_id], &self.session_options.issues, a.lint, &baseline, self.lint_env(), &mut resp);
+                crate::tools::issues::finish_mutating_call(self, &[root_id], a.lint, &baseline, Some(root_id), &mut resp);
                 Ok(resp)
             }
             "designos_export_spec" => {
@@ -473,37 +532,21 @@ impl Engine {
                 }
                 let limit = a.limit.unwrap_or(100);
                 if !(1..=500).contains(&limit) {
-                    return Err(ToolError::new(
-                        ErrorCode::ValueOutOfRange,
-                        "/limit",
-                        "limit must be between 1 and 500 (safe_to_retry: true)",
-                    ));
+                    return Err(ToolError::new(ErrorCode::ValueOutOfRange, "/limit", "limit must be between 1 and 500 (safe_to_retry: true)"));
                 }
                 let roots: Vec<NodeId> = if let Some(pid) = a.page_id {
                     if pid == 0 || self.doc.get(NodeId(pid)).is_none() {
-                        return Err(ToolError::new(
-                            ErrorCode::NodeNotFound,
-                            "/page_id",
-                            format!("NODE_NOT_FOUND: page {pid} not found (safe_to_retry: true)"),
-                        ));
+                        return Err(ToolError::new(ErrorCode::NodeNotFound, "/page_id", format!("NODE_NOT_FOUND: page {pid} not found (safe_to_retry: true)")));
                     }
                     vec![NodeId(pid)]
                 } else if let Some(nid) = a.node_id {
                     if nid == 0 || self.doc.get(NodeId(nid)).is_none() {
-                        return Err(ToolError::new(
-                            ErrorCode::NodeNotFound,
-                            "/node_id",
-                            format!("NODE_NOT_FOUND: node {nid} not found (safe_to_retry: true)"),
-                        ));
+                        return Err(ToolError::new(ErrorCode::NodeNotFound, "/node_id", format!("NODE_NOT_FOUND: node {nid} not found (safe_to_retry: true)")));
                     }
                     vec![NodeId(nid)]
                 } else if let Some(ids) = &a.node_ids {
                     if ids.is_empty() || ids.len() > 500 {
-                        return Err(ToolError::new(
-                            ErrorCode::ValueOutOfRange,
-                            "/node_ids",
-                            "node_ids must contain 1..=500 IDs (safe_to_retry: true)",
-                        ));
+                        return Err(ToolError::new(ErrorCode::ValueOutOfRange, "/node_ids", "node_ids must contain 1..=500 IDs (safe_to_retry: true)"));
                     }
                     let mut out = Vec::with_capacity(ids.len());
                     for (idx, &nid) in ids.iter().enumerate() {
@@ -703,7 +746,7 @@ impl Engine {
             self.relayout(page_id);
         }
         let mut out = json!({"node":self.doc.get(id),"parent_id":parent_id.0,"changed":true});
-        crate::tools::issues::attach_issues_block(&self.doc, &[id], &self.session_options.issues, a.lint, &baseline, self.lint_env(), &mut out);
+        crate::tools::issues::finish_mutating_call(self, &[id], a.lint, &baseline, Some(id), &mut out);
         Ok(out)
     }
 
@@ -724,7 +767,11 @@ impl Engine {
             }
         }
         let mut out = json!({"node":self.doc.get(NodeId(a.node_id)),"changed":changed});
-        crate::tools::issues::attach_issues_block(&self.doc, &[id], &self.session_options.issues, a.lint, &baseline, self.lint_env(), &mut out);
+        if changed {
+            crate::tools::issues::finish_mutating_call(self, &[id], a.lint, &baseline, Some(id), &mut out);
+        } else {
+            crate::tools::issues::finish_dry_run_call(self, &self.doc, &[id], a.lint, &baseline, &mut out);
+        }
         Ok(out)
     }
 }

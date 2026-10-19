@@ -52,17 +52,23 @@ impl Default for IssuesOptions {
     }
 }
 
-/// Reserved per-session configuration for automatic safe mechanical fixes (`E15-13`).
+/// Per-session configuration for automatic safe mechanical fixes (`E15-13` §4).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AutoFixOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<String>,
+    pub mode: Option<designos_doc::AutoFixMode>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rules: BTreeMap<String, bool>,
 }
 
-/// Full per-session options (`E15-12` §4).
+impl AutoFixOptions {
+    pub fn to_settings(&self) -> designos_doc::AutoFixSettings {
+        designos_doc::AutoFixSettings { mode: self.mode, rules: self.rules.clone() }
+    }
+}
+
+/// Full per-session options (`E15-12` §4, `E15-13` §4).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionOptions {
@@ -83,7 +89,7 @@ struct IssuesOptionsPatch {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AutoFixOptionsPatch {
-    mode: Option<String>,
+    mode: Option<designos_doc::AutoFixMode>,
     rules: Option<BTreeMap<String, bool>>,
 }
 
@@ -117,6 +123,24 @@ impl PerCallLintOverride {
     }
 }
 
+/// Optional per-call `auto_fix` override accepted on mutating tools (`true`, `false`, `"on"`, `"report_only"`, `"off"`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum PerCallAutoFixOverride {
+    Bool(bool),
+    Mode(designos_doc::AutoFixMode),
+}
+
+impl PerCallAutoFixOverride {
+    pub fn into_mode(self) -> designos_doc::AutoFixMode {
+        match self {
+            Self::Bool(true) => designos_doc::AutoFixMode::On,
+            Self::Bool(false) => designos_doc::AutoFixMode::Off,
+            Self::Mode(m) => m,
+        }
+    }
+}
+
 impl SessionOptions {
     /// Path to `session-options.json` inside `session_dir`.
     pub fn file_path(session_dir: &Path) -> PathBuf {
@@ -133,7 +157,10 @@ impl SessionOptions {
         let Ok(opts) = serde_json::from_str::<Self>(&raw) else {
             return Self::default();
         };
-        if !(1..=100).contains(&opts.issues.max_items) || LintConfig::from_preset_str(&opts.issues.preset).is_err() {
+        if !(1..=100).contains(&opts.issues.max_items)
+            || LintConfig::from_preset_str(&opts.issues.preset).is_err()
+            || !opts.auto_fix.rules.keys().all(|k| designos_doc::SAFE_AUTO_FIX_RULES.contains(&k.as_str()))
+        {
             return Self::default();
         }
         opts
@@ -153,8 +180,7 @@ impl SessionOptions {
 
     /// Validates and applies a `designos_configure_session` payload, returning the full effective options JSON.
     pub fn apply_patch(&mut self, args: Value) -> Result<Value, ToolError> {
-        let patch: ConfigureSessionArgs =
-            serde_json::from_value(args).map_err(|e| crate::tools::errors::from_serde_error(&e, "", false))?;
+        let patch: ConfigureSessionArgs = serde_json::from_value(args).map_err(|e| crate::tools::errors::from_serde_error(&e, "", false))?;
 
         let mut next = self.clone();
         if let Some(issues_patch) = patch.issues {
@@ -204,13 +230,19 @@ impl SessionOptions {
             }
             if let Some(rules) = af_patch.rules {
                 for (k, v) in rules {
-                    let Some(spec) = designos_doc::lint::resolve_rule(&k) else {
-                        let err = designos_doc::lint::LintConfigError::UnknownRule { received: k.clone(), valid_options: designos_doc::lint::all_rule_ids() };
-                        return Err(ToolError::new(ErrorCode::UnknownField, format!("/auto_fix/rules/{k}"), err.to_string())
-                            .with_received(json!(k))
-                            .with_valid_options(designos_doc::lint::all_rule_ids().iter().copied()));
-                    };
-                    next.auto_fix.rules.insert(spec.id.to_string(), v);
+                    if !designos_doc::SAFE_AUTO_FIX_RULES.contains(&k.as_str()) {
+                        return Err(ToolError::new(
+                            ErrorCode::UnknownField,
+                            format!("/auto_fix/rules/{k}"),
+                            format!(
+                                "UNKNOWN_FIELD: auto_fix.rules only accepts safe-tier rule IDs {:?}, got '{k}' (safe_to_retry: true)",
+                                designos_doc::SAFE_AUTO_FIX_RULES
+                            ),
+                        )
+                        .with_received(json!(k))
+                        .with_valid_options(designos_doc::SAFE_AUTO_FIX_RULES.iter().copied()));
+                    }
+                    next.auto_fix.rules.insert(k, v);
                 }
             }
         }
@@ -220,11 +252,11 @@ impl SessionOptions {
     }
 }
 
-/// JSON Schema descriptor for `designos_configure_session` (`E15-12` §5).
+/// JSON Schema descriptor for `designos_configure_session` (`E15-12` §5, `E15-13` §4).
 pub fn tool_descriptor() -> Value {
     json!({
         "name": "designos_configure_session",
-        "description": "Configure per-session MCP options for the automatic mutating-call lint issues block (issues.mode: preset | errors_only | off, issues.preset, issues.max_items: 1..=100) and auto_fix settings. Persists across reconnects in the session directory and resets on document switch.",
+        "description": "Configure per-session MCP options for the automatic mutating-call lint issues block (issues.mode: preset | errors_only | off, issues.preset, issues.max_items: 1..=100) and auto_fix settings (auto_fix.mode: on | report_only | off, auto_fix.rules: sizing-conflict, hardcoded-value). Persists across reconnects in the session directory and resets on document switch.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -248,7 +280,17 @@ pub fn tool_descriptor() -> Value {
                     }
                 },
                 "auto_fix": {
-                    "type": "object"
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "mode": {
+                            "type": "string",
+                            "enum": ["on", "report_only", "off"]
+                        },
+                        "rules": {
+                            "type": "object"
+                        }
+                    }
                 }
             }
         },

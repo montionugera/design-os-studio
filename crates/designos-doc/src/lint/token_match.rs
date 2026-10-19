@@ -157,6 +157,9 @@ impl Index {
         let mut styles: Vec<StyleEntry> = Vec::new();
 
         for v in doc.variables.values() {
+            if v.collection == crate::EASEUI_DEPRECATED_COLLECTION_ID {
+                continue;
+            }
             if let Some(lib_id) = variable_library_id(doc, v) {
                 if enabled_library_name(doc, lib_id).is_none() {
                     continue; // Disabled library: never suggest even if previously imported.

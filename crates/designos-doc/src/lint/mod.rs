@@ -10,7 +10,10 @@ pub mod traverse;
 
 pub use config::{LintConfig, LintConfigError, LintThresholds, RuleSeverityConfig, RuleSeverityLevel};
 pub use finding::{Finding, FixSuggestion, LintFinding, LintFix, LintPage, LintReport, LintSummary, SamplePoint, ScaleSource, SkippedRule};
-pub use fix::{lint_fix_commands, lint_fix_document, lint_fix_with_history};
+pub use fix::{
+    contrast_aware_text_fill_hex, lint_fix_commands, lint_fix_with_history, plan_fixes, AutoFixDiffEntry, AutoFixReport, AutoFixSuggestedEntry, PlannedFix,
+    ResolvedAutoFixConfig, AUTO_FIX_UNDO_LABEL, MAX_AUTO_FIX_PASSES,
+};
 pub use registry::{
     all_preset_names, all_rule_ids, canonical_rule_id, preset_rule_ids, resolve_rule, rule_aliases, Category, LintPreset, RuleNeeds, RuleSpec, Severity, RULES,
 };

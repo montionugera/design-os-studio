@@ -534,6 +534,11 @@ impl Ledger {
                 if !entry.dead && entry.undo_depth.is_some_and(|d| d > depth) {
                     entry.dead = true;
                     newly_stale.push(entry.key.clone());
+                } else if !entry.dead && entry.auto_fix_undo_depth.is_some_and(|af| af > depth) {
+                    if let Some(pre) = entry.pre_auto_fix_reply.take() {
+                        entry.reply = pre;
+                    }
+                    entry.auto_fix_undo_depth = None;
                 }
             }
         }

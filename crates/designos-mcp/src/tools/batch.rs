@@ -1684,7 +1684,8 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, ToolError> {
 
     // Step 4: Dry run returns the trial result without committing or publishing (§3.2.4).
     // Step 5 & Edge case 5: Empty effective change skips commit, undo entry, and patch line (§8.5).
-    if !batch_args.dry_run && !collected_cmds.is_empty() && changed.any() {
+    let committed = !batch_args.dry_run && !collected_cmds.is_empty() && changed.any();
+    if committed {
         engine
             .history
             .exec(&mut engine.doc, Command::Batch(collected_cmds))
@@ -1715,15 +1716,11 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, ToolError> {
         "touched_bounds": bounds_json(touched_bounds_rect),
         "undo_label": undo_label,
     });
-    crate::tools::issues::attach_issues_block(
-        &trial,
-        &touched_root_ids,
-        &engine.session_options.issues,
-        batch_args.lint,
-        &baseline,
-        engine.lint_env(),
-        &mut reply,
-    );
+    if committed {
+        crate::tools::issues::finish_mutating_call(engine, &touched_root_ids, batch_args.lint, &baseline, None, &mut reply);
+    } else {
+        crate::tools::issues::finish_dry_run_call(engine, &trial, &touched_root_ids, batch_args.lint, &baseline, &mut reply);
+    }
     Ok(reply)
 }
 

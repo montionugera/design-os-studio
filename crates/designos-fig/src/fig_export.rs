@@ -388,6 +388,7 @@ fn build_message(doc: &Document, schema: &crate::kiwi::Schema) -> V {
     let mut cx = ExportCtx::new(doc, schema);
     // 1. Root DOCUMENT record.
     let mut doc_fields = vec![("guid", guid(0, 0)), ("phase", en("CREATED")), ("type", en("DOCUMENT")), ("name", V::String(doc.name.clone()))];
+    let mut doc_pd = Vec::new();
     if !doc.check_designs.ignored.is_empty() {
         let ignores: Vec<serde_json::Value> = doc
             .check_designs
@@ -404,15 +405,18 @@ fn build_message(doc: &Document, schema: &crate::kiwi::Schema) -> V {
             })
             .collect();
         if let Ok(serialized) = serde_json::to_string(&ignores) {
-            doc_fields.push((
-                "pluginData",
-                V::Array(vec![msg(vec![
-                    ("pluginID", V::String("designos".into())),
-                    ("key", V::String("lint_ignores".into())),
-                    ("value", V::String(serialized)),
-                ])]),
-            ));
+            doc_pd.push(msg(vec![("pluginID", V::String("designos".into())), ("key", V::String("lint_ignores".into())), ("value", V::String(serialized))]));
         }
+    }
+    if let Some(auto_fix) = &doc.auto_fix {
+        if !auto_fix.is_empty() {
+            if let Ok(serialized) = serde_json::to_string(auto_fix) {
+                doc_pd.push(msg(vec![("pluginID", V::String("designos".into())), ("key", V::String("auto_fix".into())), ("value", V::String(serialized))]));
+            }
+        }
+    }
+    if !doc_pd.is_empty() {
+        doc_fields.push(("pluginData", V::Array(doc_pd)));
     }
     cx.changes.push(msg(doc_fields));
 

@@ -735,11 +735,6 @@ pub fn lint_document(doc: &Document, page: Option<NodeId>, preset: &str) -> Valu
     })
 }
 
-/// Compatibility wrapper delegating to [`crate::lint::lint_fix_document`].
-pub fn lint_fix_document(doc: &mut Document, page: Option<NodeId>, rules: Option<&[String]>) -> Value {
-    crate::lint::lint_fix_document(doc, page, rules)
-}
-
 fn srgb_to_lab(c: Color) -> [f32; 3] {
     let lin = |v: f32| -> f32 {
         let v = v.clamp(0.0, 1.0);
@@ -1183,7 +1178,8 @@ mod tests {
         assert!(rules_hit.contains_key("contrast"));
         assert!(rules_hit.contains_key("empty-container"));
 
-        let fix_res = lint_fix_document(&mut doc, Some(page), None);
+        let mut history = crate::History::default();
+        let fix_res = crate::lint::lint_fix_with_history(&mut doc, &mut history, Some(page), None).unwrap();
         assert!(fix_res["fixed_count"].as_u64().unwrap() >= 4);
         assert!(doc.get(empty_id).is_none(), "empty container should be removed");
         assert!(doc.get(tid).unwrap().kind.any_text().unwrap().style.font_size >= 12.0);

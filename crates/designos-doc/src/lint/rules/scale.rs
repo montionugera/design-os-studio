@@ -975,8 +975,12 @@ pub fn evaluate_hardcoded_value(
         ] {
             check_single_number_lint(doc, index, rn, src, page_bounds, xpath, severity, k, label, false, &mut emitted_props, out);
         }
-        check_single_number_lint(doc, index, rn, src, page_bounds, xpath, severity, "width", "Width", true, &mut emitted_props, out);
-        check_single_number_lint(doc, index, rn, src, page_bounds, xpath, severity, "height", "Height", true, &mut emitted_props, out);
+        if rn.layout_child.horizontal == crate::Sizing::Fixed {
+            check_single_number_lint(doc, index, rn, src, page_bounds, xpath, severity, "width", "Width", true, &mut emitted_props, out);
+        }
+        if rn.layout_child.vertical == crate::Sizing::Fixed {
+            check_single_number_lint(doc, index, rn, src, page_bounds, xpath, severity, "height", "Height", true, &mut emitted_props, out);
+        }
         check_single_number_lint(doc, index, rn, src, page_bounds, xpath, severity, "opacity", "Opacity", true, &mut emitted_props, out);
 
         if matches!(rn.kind, NodeKind::Text(_)) && !rn.style_refs.contains_key("text") && !text_style_inherited(rn, src) {

@@ -324,6 +324,22 @@ impl Session {
         append_log_line(&path, &line)
     }
 
+    /// Appends the auto-fix edits recorded during the last mutating call as a separate
+    /// [`LivePatch`] line labelled `"Auto-fix"` (`E15-13` §3.3).
+    pub fn publish_auto_fix_live_patch(&mut self) -> Result<(), String> {
+        let ops = std::mem::take(&mut self.engine.auto_fix_live_ops);
+        let Some(path) = self.bridge.live_doc_patch_path.as_ref().filter(|_| !ops.is_empty()) else {
+            return Ok(());
+        };
+        let base = self.bridge.last_canvas_mtime.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos() as u64);
+        let line = live_patch_line(
+            &LivePatch::new(ops).with_base(base).with_label(Some(designos_doc::lint::AUTO_FIX_UNDO_LABEL.to_string())),
+            self.max_live_patch_bytes,
+        )?;
+        let path = path.clone();
+        append_log_line(&path, &line)
+    }
+
     /// Reverts the tool call `name` whose edit could not be sent to the editor, without recording
     /// it: undo and redo revert each other, and any other edit restores `snapshot`.
     fn roll_back(&mut self, name: &str, snapshot: Option<EditSnapshot>) {
@@ -348,6 +364,8 @@ impl Session {
             }
         }
         self.engine.take_live_ops();
+        self.engine.auto_fix_live_ops.clear();
+        self.engine.last_auto_fix_checkpoint = None;
         self.engine.live_patch_label = None;
     }
 
@@ -823,10 +841,26 @@ impl Session {
                         _ => true,
                     };
                 if mutating && changed {
+                    let was_unannounced = self.bridge.doc_unannounced;
                     if let Err(e) = self.publish_live_patch() {
                         self.roll_back(name, snapshot);
                         let code = if e.contains("over the") && e.contains("MiB") { ErrorCode::PatchTooLarge } else { ErrorCode::EditorPublishFailed };
                         return Err(ToolError::new(code, "", format!("The open editor could not receive this edit, so it was undone: {e}")));
+                    }
+                    if was_unannounced {
+                        self.engine.auto_fix_live_ops.clear();
+                    } else if !self.engine.auto_fix_live_ops.is_empty() {
+                        if let Err(e) = self.publish_auto_fix_live_patch() {
+                            if let Some(cp) = self.engine.last_auto_fix_checkpoint.take() {
+                                self.engine.doc = cp.pre_doc;
+                                self.engine.history.drop_undo_steps_after(cp.pre_undo_depth);
+                                self.engine.revision = cp.pre_revision;
+                                result = cp.pre_reply;
+                                if let Some(af_obj) = result.get_mut("auto_fix").and_then(Value::as_object_mut) {
+                                    af_obj.insert("error".into(), json!(e));
+                                }
+                            }
+                        }
                     }
                     self.dirty = true;
                     self.history_dropped = false;
@@ -854,18 +888,21 @@ impl Session {
                     if !is_dry_run {
                         let hash = payload_hash(name, &args);
                         let (live_nodes, gone_nodes) = extract_live_and_gone(name, &args, &result, &pre_node_ids, &self.engine.doc);
-                        let undo_depth = if changed { Some(self.engine.history.undo_depth()) } else { Some(pre_write_undo_depth) };
+                        let (undo_depth, auto_fix_undo_depth, pre_auto_fix_reply) = match &self.engine.last_auto_fix_checkpoint {
+                            Some(cp) => (Some(cp.pre_undo_depth), Some(cp.post_undo_depth), Some(cp.pre_reply.clone())),
+                            None => (if changed { Some(self.engine.history.undo_depth()) } else { Some(pre_write_undo_depth) }, None, None),
+                        };
                         self.ledger.store(LedgerEntry {
                             key,
                             tool: name.to_string(),
                             hash,
                             undo_depth,
-                            auto_fix_undo_depth: None,
+                            auto_fix_undo_depth,
                             dead: false,
                             live: live_nodes,
                             gone: gone_nodes,
                             reply: result.clone(),
-                            pre_auto_fix_reply: None,
+                            pre_auto_fix_reply,
                             created_ms: now_ms(),
                         });
                     }

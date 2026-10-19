@@ -301,7 +301,34 @@ fn rule_order_index(rule_id: &str) -> usize {
 }
 
 fn is_safe_tier_auto_fixable(f: &Finding) -> bool {
-    f.fixable && matches!(f.rule, "sizing-conflict" | "hardcoded-value")
+    f.safe && matches!(f.rule, "sizing-conflict" | "hardcoded-value")
+}
+
+fn compact_fix_for_finding(doc: &Document, f: &Finding) -> Option<CompactFix> {
+    if let Some(s) = &f.suggested_fix {
+        return Some(CompactFix { kind: s.kind.clone(), property: s.property.clone(), to: s.to.clone() });
+    }
+    match f.rule {
+        "text-missing-fill" => {
+            Some(CompactFix { kind: "set".into(), property: "fills".into(), to: json!(designos_doc::lint::contrast_aware_text_fill_hex(doc, f.node)) })
+        }
+        "absolute-in-auto-layout" => Some(CompactFix { kind: "set".into(), property: "layout_child.absolute".into(), to: json!(false) }),
+        _ => None,
+    }
+}
+
+/// Runs the scoped lint pass on `doc` for `touched_roots` and returns the raw findings (`E15-13` §3.3).
+pub fn lint_findings_for_scope(doc: &Document, touched_roots: &[NodeId], options: &IssuesOptions, env: &dyn LintEnv) -> Vec<Finding> {
+    let scope = compute_lint_scope(doc, touched_roots);
+    if scope.roots.is_empty() {
+        return Vec::new();
+    }
+    let cfg = LintConfig::from_preset_str(&options.preset).unwrap_or_default();
+    let mut budget = Budget::with_limits(PER_CALL_MAX_NODES, Some(PER_CALL_MAX_DURATION));
+    budget.shallow_nodes = scope.shallow_nodes;
+    let mut findings = lint_subtree(doc, &scope.roots, &cfg, env, &mut budget).findings;
+    findings.sort_by_key(|f| (severity_rank(f.severity), rule_order_index(f.rule)));
+    findings
 }
 
 /// Evaluates the per-call lint `issues` block on `doc` for `touched_roots` and inserts the
@@ -380,7 +407,7 @@ pub fn attach_issues_block(
         .map(|f| {
             let preexisting = baseline.contains(f.rule, f.node);
             let auto_fixable = is_safe_tier_auto_fixable(&f);
-            let fix = f.suggested_fix.map(|s| CompactFix { kind: s.kind, property: s.property, to: s.to });
+            let fix = compact_fix_for_finding(doc, &f);
             IssueItem {
                 rule: f.rule.to_string(),
                 severity: f.severity,
@@ -412,6 +439,264 @@ pub fn attach_issues_block(
         }
         if !report.skipped_rules.is_empty() {
             obj.insert("issues_skipped_rules".into(), serde_json::to_value(&report.skipped_rules).unwrap_or_else(|_| json!([])));
+        }
+    }
+}
+
+/// Runs `E15-13` auto-fix planning in `report_only` mode against `trial_doc` (for dry runs or
+/// no-op calls) and attaches both `auto_fix` and `issues*` blocks to `reply`.
+pub fn finish_dry_run_call(
+    engine: &crate::engine::Engine,
+    trial_doc: &Document,
+    touched_roots: &[NodeId],
+    per_call_lint_override: Option<PerCallLintOverride>,
+    baseline: &PreCallBaseline,
+    reply: &mut Value,
+) {
+    if matches!(per_call_lint_override, Some(PerCallLintOverride::Bool(false)) | Some(PerCallLintOverride::Mode(IssuesMode::Off))) {
+        attach_issues_block(trial_doc, touched_roots, &engine.session_options.issues, per_call_lint_override, baseline, engine.lint_env(), reply);
+        return;
+    }
+
+    let resolved_af = engine.resolved_auto_fix_config(trial_doc);
+    if resolved_af.mode == designos_doc::AutoFixMode::Off {
+        attach_issues_block(trial_doc, touched_roots, &engine.session_options.issues, per_call_lint_override, baseline, engine.lint_env(), reply);
+        return;
+    }
+
+    let mut findings = lint_findings_for_scope(trial_doc, touched_roots, &engine.session_options.issues, engine.lint_env());
+    if let Some(hook) = &engine.test_lint_hook {
+        findings.extend(hook(trial_doc, touched_roots, 0));
+    }
+    let owned = engine.resolved_owned_frames();
+    let (planned, suggested) = designos_doc::lint::plan_fixes(trial_doc, &findings, &resolved_af, owned.as_deref());
+    let report = designos_doc::lint::AutoFixReport {
+        mode: resolved_af.mode,
+        undo_label: designos_doc::lint::AUTO_FIX_UNDO_LABEL.to_string(),
+        passes: usize::from(!planned.is_empty()),
+        applied: Vec::new(),
+        would_apply: planned.iter().map(designos_doc::lint::AutoFixDiffEntry::from).collect(),
+        suggested,
+        error: None,
+    };
+
+    attach_issues_block(trial_doc, touched_roots, &engine.session_options.issues, per_call_lint_override, baseline, engine.lint_env(), reply);
+    if let Some(obj) = reply.as_object_mut() {
+        if let Ok(v) = serde_json::to_value(report) {
+            obj.insert("auto_fix".into(), v);
+        }
+    }
+}
+
+/// Runs `E15-13` safe-tier auto-fix planning and execution (up to 2 passes into a single
+/// `"Auto-fix"` undo entry) after a mutating call commits, then attaches `auto_fix` and
+/// post-fix `issues*` blocks to `reply`.
+pub fn finish_mutating_call(
+    engine: &mut crate::engine::Engine,
+    touched_roots: &[NodeId],
+    per_call_lint_override: Option<PerCallLintOverride>,
+    baseline: &PreCallBaseline,
+    refresh_node_id: Option<NodeId>,
+    reply: &mut Value,
+) {
+    if matches!(per_call_lint_override, Some(PerCallLintOverride::Bool(false)) | Some(PerCallLintOverride::Mode(IssuesMode::Off))) {
+        attach_issues_block(&engine.doc, touched_roots, &engine.session_options.issues, per_call_lint_override, baseline, engine.lint_env(), reply);
+        return;
+    }
+
+    let resolved_af = engine.resolved_auto_fix_config(&engine.doc);
+    match resolved_af.mode {
+        designos_doc::AutoFixMode::Off => {
+            attach_issues_block(&engine.doc, touched_roots, &engine.session_options.issues, per_call_lint_override, baseline, engine.lint_env(), reply);
+        }
+        designos_doc::AutoFixMode::ReportOnly => {
+            finish_dry_run_call(engine, &engine.doc, touched_roots, per_call_lint_override, baseline, reply);
+        }
+        designos_doc::AutoFixMode::On => {
+            let mut findings_p1 = lint_findings_for_scope(&engine.doc, touched_roots, &engine.session_options.issues, engine.lint_env());
+            if let Some(hook) = &engine.test_lint_hook {
+                findings_p1.extend(hook(&engine.doc, touched_roots, 0));
+            }
+            let owned = engine.resolved_owned_frames();
+            let (planned_p1, suggested_p1) = designos_doc::lint::plan_fixes(&engine.doc, &findings_p1, &resolved_af, owned.as_deref());
+
+            if planned_p1.is_empty() {
+                let report = designos_doc::lint::AutoFixReport {
+                    mode: designos_doc::AutoFixMode::On,
+                    undo_label: designos_doc::lint::AUTO_FIX_UNDO_LABEL.to_string(),
+                    passes: 0,
+                    applied: Vec::new(),
+                    would_apply: Vec::new(),
+                    suggested: suggested_p1,
+                    error: None,
+                };
+                attach_issues_block(&engine.doc, touched_roots, &engine.session_options.issues, per_call_lint_override, baseline, engine.lint_env(), reply);
+                if let Some(obj) = reply.as_object_mut() {
+                    if let Ok(v) = serde_json::to_value(report) {
+                        obj.insert("auto_fix".into(), v);
+                    }
+                }
+                return;
+            }
+
+            let pre_doc = engine.doc.clone();
+            let pre_undo_depth = engine.history.undo_depth();
+            let pre_revision = engine.revision;
+            let raw_reply_template = reply.clone();
+
+            let cmds_p1: Vec<designos_doc::Command> = planned_p1.iter().flat_map(|p| p.commands.clone()).collect();
+            let batch_p1 = designos_doc::Command::Batch(cmds_p1);
+            let apply_p1 = engine
+                .live_ops_for(&batch_p1)
+                .map_err(|e| e.message)
+                .and_then(|ops| engine.history.exec(&mut engine.doc, batch_p1).map(|()| ops).map_err(|e| e.to_string()));
+
+            let ops_p1 = match apply_p1 {
+                Ok(ops) => ops,
+                Err(err_msg) => {
+                    engine.doc = pre_doc;
+                    engine.history.drop_undo_steps_after(pre_undo_depth);
+                    engine.revision = pre_revision;
+                    engine.auto_fix_live_ops.clear();
+                    let report = designos_doc::lint::AutoFixReport {
+                        mode: designos_doc::AutoFixMode::On,
+                        undo_label: designos_doc::lint::AUTO_FIX_UNDO_LABEL.to_string(),
+                        passes: 0,
+                        applied: Vec::new(),
+                        would_apply: Vec::new(),
+                        suggested: suggested_p1,
+                        error: Some(err_msg),
+                    };
+                    attach_issues_block(&engine.doc, touched_roots, &engine.session_options.issues, per_call_lint_override, baseline, engine.lint_env(), reply);
+                    if let Some(obj) = reply.as_object_mut() {
+                        if let Ok(v) = serde_json::to_value(report) {
+                            obj.insert("auto_fix".into(), v);
+                        }
+                    }
+                    return;
+                }
+            };
+
+            engine.revision = engine.revision.wrapping_add(1);
+            engine.auto_fix_live_ops.extend(ops_p1);
+            for p in &planned_p1 {
+                crate::tools::batch::relayout_for_node(&mut engine.doc, p.node);
+            }
+            for &r in touched_roots {
+                crate::tools::batch::relayout_for_node(&mut engine.doc, r);
+            }
+            engine.settle_layout();
+
+            let mut applied: Vec<designos_doc::lint::AutoFixDiffEntry> = planned_p1.iter().map(designos_doc::lint::AutoFixDiffEntry::from).collect();
+            let mut passes = 1usize;
+
+            // Re-lint the scope once; if new safe findings appear, run one more pass (max 2 passes)
+            // folded into the same `"Auto-fix"` undo entry (`E15-13` §3.3).
+            let mut findings_p2 = lint_findings_for_scope(&engine.doc, touched_roots, &engine.session_options.issues, engine.lint_env());
+            if let Some(hook) = &engine.test_lint_hook {
+                findings_p2.extend(hook(&engine.doc, touched_roots, 1));
+            }
+            let (planned_p2, mut final_suggested) = designos_doc::lint::plan_fixes(&engine.doc, &findings_p2, &resolved_af, owned.as_deref());
+
+            if !planned_p2.is_empty() && passes < designos_doc::lint::MAX_AUTO_FIX_PASSES {
+                let cmds_p2: Vec<designos_doc::Command> = planned_p2.iter().flat_map(|p| p.commands.clone()).collect();
+                let batch_p2 = designos_doc::Command::Batch(cmds_p2);
+                let apply_p2 = engine
+                    .live_ops_for(&batch_p2)
+                    .map_err(|e| e.message)
+                    .and_then(|ops| engine.history.fold_into_last(&mut engine.doc, batch_p2).map(|()| ops).map_err(|e| e.to_string()));
+
+                match apply_p2 {
+                    Err(err_msg) => {
+                        engine.doc = pre_doc;
+                        engine.history.drop_undo_steps_after(pre_undo_depth);
+                        engine.revision = pre_revision;
+                        engine.auto_fix_live_ops.clear();
+                        let report = designos_doc::lint::AutoFixReport {
+                            mode: designos_doc::AutoFixMode::On,
+                            undo_label: designos_doc::lint::AUTO_FIX_UNDO_LABEL.to_string(),
+                            passes: 0,
+                            applied: Vec::new(),
+                            would_apply: Vec::new(),
+                            suggested: suggested_p1,
+                            error: Some(err_msg),
+                        };
+                        attach_issues_block(
+                            &engine.doc,
+                            touched_roots,
+                            &engine.session_options.issues,
+                            per_call_lint_override,
+                            baseline,
+                            engine.lint_env(),
+                            reply,
+                        );
+                        if let Some(obj) = reply.as_object_mut() {
+                            if let Ok(v) = serde_json::to_value(report) {
+                                obj.insert("auto_fix".into(), v);
+                            }
+                        }
+                        return;
+                    }
+                    Ok(ops_p2) => {
+                        engine.auto_fix_live_ops.extend(ops_p2);
+                        for p in &planned_p2 {
+                            crate::tools::batch::relayout_for_node(&mut engine.doc, p.node);
+                        }
+                        for &r in touched_roots {
+                            crate::tools::batch::relayout_for_node(&mut engine.doc, r);
+                        }
+                        engine.settle_layout();
+                        applied.extend(planned_p2.iter().map(designos_doc::lint::AutoFixDiffEntry::from));
+                        passes = 2;
+                        let findings_post = lint_findings_for_scope(&engine.doc, touched_roots, &engine.session_options.issues, engine.lint_env());
+                        let (_, sugg_post) = designos_doc::lint::plan_fixes(&engine.doc, &findings_post, &resolved_af, owned.as_deref());
+                        final_suggested = sugg_post;
+                    }
+                }
+            }
+
+            if let Some(nid) = refresh_node_id {
+                if let Some(obj) = reply.as_object_mut() {
+                    if obj.contains_key("node") {
+                        obj.insert("node".into(), json!(engine.doc.get(nid)));
+                    }
+                }
+            }
+
+            let report = designos_doc::lint::AutoFixReport {
+                mode: designos_doc::AutoFixMode::On,
+                undo_label: designos_doc::lint::AUTO_FIX_UNDO_LABEL.to_string(),
+                passes,
+                applied,
+                would_apply: Vec::new(),
+                suggested: final_suggested,
+                error: None,
+            };
+            attach_issues_block(&engine.doc, touched_roots, &engine.session_options.issues, per_call_lint_override, baseline, engine.lint_env(), reply);
+            if let Some(obj) = reply.as_object_mut() {
+                if let Ok(v) = serde_json::to_value(&report) {
+                    obj.insert("auto_fix".into(), v);
+                }
+            }
+
+            let mut pre_reply = raw_reply_template;
+            let pre_report = designos_doc::lint::AutoFixReport {
+                mode: designos_doc::AutoFixMode::On,
+                undo_label: designos_doc::lint::AUTO_FIX_UNDO_LABEL.to_string(),
+                passes: 0,
+                applied: Vec::new(),
+                would_apply: Vec::new(),
+                suggested: suggested_p1,
+                error: None,
+            };
+            attach_issues_block(&pre_doc, touched_roots, &engine.session_options.issues, per_call_lint_override, baseline, engine.lint_env(), &mut pre_reply);
+            if let Some(obj) = pre_reply.as_object_mut() {
+                if let Ok(v) = serde_json::to_value(pre_report) {
+                    obj.insert("auto_fix".into(), v);
+                }
+            }
+            let post_undo_depth = engine.history.undo_depth();
+            engine.last_auto_fix_checkpoint = Some(crate::engine::AutoFixCheckpoint { pre_doc, pre_undo_depth, post_undo_depth, pre_revision, pre_reply });
         }
     }
 }
@@ -1031,5 +1316,791 @@ mod tests {
             skipped.iter().any(|s| s["rule"] == "text-truncated" && s["reason"] == "no_text_engine"),
             "expected text-truncated in issues_skipped_rules: {skipped:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // E15-13 (#598): Engine auto-fix tests (§10 + §8 edge cases)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn fill_child_without_layout_parent_fixed() {
+        let mut engine = Engine::default();
+        let reply = engine
+            .call(
+                "designos_apply_spec",
+                json!({
+                    "parent_id": 1,
+                    "spec": {
+                        "name": "StaticCard",
+                        "kind": "frame",
+                        "width": 320.0,
+                        "height": 120.0,
+                        "fill": "#18181B",
+                        "children": [
+                            {
+                                "name": "FillChild",
+                                "kind": "rectangle",
+                                "width": 120.0,
+                                "height": 40.0,
+                                "width_sizing": "fill",
+                                "fill": "#3B82F6"
+                            }
+                        ]
+                    }
+                }),
+            )
+            .expect("apply_spec");
+
+        let applied = reply["auto_fix"]["applied"].as_array().expect("auto_fix.applied");
+        assert_eq!(applied.len(), 1, "expected 1 applied fix: {reply}");
+        assert_eq!(applied[0]["rule"], "sizing-conflict");
+        assert_eq!(applied[0]["property"], "layoutSizingHorizontal");
+        assert_eq!(applied[0]["before"], "FILL");
+        assert_eq!(applied[0]["after"], "FIXED");
+        assert_eq!(reply["auto_fix"]["passes"], 1);
+        assert_eq!(reply["auto_fix"]["undo_label"], "Auto-fix");
+        assert_eq!(reply["issues"], json!([]));
+
+        let child_id = applied[0]["node_id"].as_u64().unwrap();
+        assert_eq!(engine.doc.get(NodeId(child_id)).unwrap().layout_child.horizontal, designos_doc::Sizing::Fixed);
+    }
+
+    #[test]
+    fn report_only_lists_and_changes_nothing() {
+        let mut engine = Engine::default();
+        engine
+            .call(
+                "designos_configure_session",
+                json!({
+                    "auto_fix": { "mode": "report_only" }
+                }),
+            )
+            .expect("configure report_only");
+
+        let reply = engine
+            .call(
+                "designos_apply_spec",
+                json!({
+                    "parent_id": 1,
+                    "spec": {
+                        "name": "StaticCard",
+                        "kind": "frame",
+                        "width": 320.0,
+                        "height": 120.0,
+                        "fill": "#18181B",
+                        "children": [
+                            {
+                                "name": "FillChild",
+                                "kind": "rectangle",
+                                "width": 120.0,
+                                "height": 40.0,
+                                "width_sizing": "fill",
+                                "fill": "#3B82F6"
+                            }
+                        ]
+                    }
+                }),
+            )
+            .expect("apply_spec in report_only");
+
+        assert_eq!(reply["auto_fix"]["mode"], "report_only");
+        assert_eq!(reply["auto_fix"]["passes"], 1);
+        assert_eq!(reply["auto_fix"]["applied"], json!([]));
+        let would_apply = reply["auto_fix"]["would_apply"].as_array().expect("would_apply");
+        assert_eq!(would_apply.len(), 1);
+        assert_eq!(would_apply[0]["rule"], "sizing-conflict");
+        assert_eq!(would_apply[0]["property"], "layoutSizingHorizontal");
+        assert_eq!(would_apply[0]["before"], "FILL");
+        assert_eq!(would_apply[0]["after"], "FIXED");
+
+        let child_id = would_apply[0]["node_id"].as_u64().unwrap();
+        assert_eq!(engine.doc.get(NodeId(child_id)).unwrap().layout_child.horizontal, designos_doc::Sizing::Fill, "report_only must not mutate the document");
+        let issues = reply["issues"].as_array().unwrap();
+        assert!(issues.iter().any(|i| i["rule"] == "sizing-conflict" && i["node_id"] == child_id));
+    }
+
+    #[test]
+    fn undo_once_removes_only_fixes() {
+        let mut engine = Engine::default();
+        let reply = engine
+            .call(
+                "designos_apply_spec",
+                json!({
+                    "parent_id": 1,
+                    "spec": {
+                        "name": "StaticCard",
+                        "kind": "frame",
+                        "width": 320.0,
+                        "height": 120.0,
+                        "fill": "#18181B",
+                        "children": [
+                            {
+                                "name": "DualFillChild",
+                                "kind": "rectangle",
+                                "width": 120.0,
+                                "height": 40.0,
+                                "width_sizing": "fill",
+                                "height_sizing": "fill",
+                                "fill": "#3B82F6"
+                            }
+                        ]
+                    }
+                }),
+            )
+            .expect("apply_spec with 2 auto-fixes");
+
+        let card_id = reply["root_node_id"].as_u64().unwrap();
+        let applied = reply["auto_fix"]["applied"].as_array().unwrap();
+        assert_eq!(applied.len(), 2, "expected 2 applied fixes (horizontal + vertical): {applied:?}");
+        let child_id = applied[0]["node_id"].as_u64().unwrap();
+        assert_eq!(engine.doc.get(NodeId(child_id)).unwrap().layout_child.horizontal, designos_doc::Sizing::Fixed);
+        assert_eq!(engine.doc.get(NodeId(child_id)).unwrap().layout_child.vertical, designos_doc::Sizing::Fixed);
+
+        // First undo reverts ONLY the `"Auto-fix"` entry (both fixes at once), leaving the write intact.
+        engine.call("designos_undo", json!({})).expect("first undo");
+        let child = engine.doc.get(NodeId(child_id)).expect("child must still exist after undoing only Auto-fix");
+        assert_eq!(child.layout_child.horizontal, designos_doc::Sizing::Fill);
+        assert_eq!(child.layout_child.vertical, designos_doc::Sizing::Fill);
+        assert!(engine.doc.get(NodeId(card_id)).is_some());
+
+        // Second undo reverts the original write itself.
+        engine.call("designos_undo", json!({})).expect("second undo");
+        assert!(engine.doc.get(NodeId(card_id)).is_none());
+        assert!(engine.doc.get(NodeId(child_id)).is_none());
+    }
+
+    #[test]
+    fn contrast_never_auto_applied() {
+        let mut engine = Engine::default();
+        let reply = engine
+            .call(
+                "designos_apply_spec",
+                json!({
+                    "parent_id": 1,
+                    "spec": {
+                        "name": "LowContrastCard",
+                        "kind": "frame",
+                        "width": 240.0,
+                        "height": 80.0,
+                        "fill": "#888888",
+                        "children": [
+                            {
+                                "name": "LowContrastLabel",
+                                "kind": "text",
+                                "text": "Hard to read",
+                                "font_size": 14.0,
+                                "text_color": "#777777",
+                                "width": 160.0,
+                                "height": 24.0
+                            }
+                        ]
+                    }
+                }),
+            )
+            .expect("apply_spec low contrast");
+
+        let applied = reply["auto_fix"]["applied"].as_array().unwrap();
+        assert!(applied.is_empty(), "contrast must never be auto-applied: {applied:?}");
+        let suggested = reply["auto_fix"]["suggested"].as_array().unwrap();
+        let c_sugg = suggested.iter().find(|s| s["rule"] == "contrast").expect("contrast in auto_fix.suggested");
+        assert!(c_sugg["fix"].is_null());
+        assert!(c_sugg["reason"].as_str().unwrap_or("").contains("contrast"));
+
+        let issues = reply["issues"].as_array().unwrap();
+        assert!(issues.iter().any(|i| i["rule"] == "contrast"));
+    }
+
+    #[test]
+    fn text_missing_fill_is_suggestion_only() {
+        let mut engine = Engine::default();
+        // 1. Light background (#FFFFFF) -> suggests "#111111"
+        let light_reply = engine
+            .call(
+                "designos_apply_spec",
+                json!({
+                    "parent_id": 1,
+                    "spec": {
+                        "name": "LightFrame",
+                        "kind": "frame",
+                        "width": 240.0,
+                        "height": 80.0,
+                        "fill": "#FFFFFF",
+                        "children": [
+                            {
+                                "name": "UnfilledOnLight",
+                                "kind": "text",
+                                "text": "Invisible on white",
+                                "font_size": 16.0,
+                                "text_color": "none",
+                                "width": 160.0,
+                                "height": 24.0
+                            }
+                        ]
+                    }
+                }),
+            )
+            .expect("apply_spec light");
+        assert_eq!(light_reply["auto_fix"]["applied"], json!([]));
+        let light_sugg = light_reply["auto_fix"]["suggested"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["rule"] == "text-missing-fill")
+            .expect("text-missing-fill suggested on light");
+        assert_eq!(light_sugg["property"], "fills");
+        assert_eq!(light_sugg["current"], json!([]));
+        assert_eq!(light_sugg["suggested"], "#111111");
+        assert_eq!(
+            light_sugg["fix"],
+            json!({
+                "kind": "set",
+                "property": "fills",
+                "from": [],
+                "to": "#111111"
+            })
+        );
+
+        // 2. Dark background (#111111) -> suggests "#FFFFFF"
+        let dark_reply = engine
+            .call(
+                "designos_apply_spec",
+                json!({
+                    "parent_id": 1,
+                    "spec": {
+                        "name": "DarkFrame",
+                        "kind": "frame",
+                        "width": 240.0,
+                        "height": 80.0,
+                        "fill": "#111111",
+                        "children": [
+                            {
+                                "name": "UnfilledOnDark",
+                                "kind": "text",
+                                "text": "Invisible on dark",
+                                "font_size": 16.0,
+                                "text_color": "none",
+                                "width": 160.0,
+                                "height": 24.0
+                            }
+                        ]
+                    }
+                }),
+            )
+            .expect("apply_spec dark");
+        let dark_sugg = dark_reply["auto_fix"]["suggested"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["rule"] == "text-missing-fill")
+            .expect("text-missing-fill suggested on dark");
+        assert_eq!(dark_sugg["property"], "fills");
+        assert_eq!(dark_sugg["current"], json!([]));
+        assert_eq!(dark_sugg["suggested"], "#FFFFFF");
+        assert_eq!(
+            dark_sugg["fix"],
+            json!({
+                "kind": "set",
+                "property": "fills",
+                "from": [],
+                "to": "#FFFFFF"
+            })
+        );
+    }
+
+    #[test]
+    fn absolute_in_auto_layout_is_suggestion_only() {
+        let mut engine = Engine::default();
+        let frame_reply = engine
+            .call(
+                "designos_apply_spec",
+                json!({
+                    "parent_id": 1,
+                    "spec": {
+                        "name": "AutoStack",
+                        "kind": "frame",
+                        "layout": {
+                            "direction": "vertical",
+                            "padding": [16.0, 16.0, 16.0, 16.0],
+                            "gap": 8.0
+                        },
+                        "width": 240.0,
+                        "height": 120.0,
+                        "fill": "#18181B",
+                        "children": [
+                            {
+                                "name": "Floater",
+                                "kind": "rectangle",
+                                "width": 40.0,
+                                "height": 40.0,
+                                "fill": "#3B82F6"
+                            }
+                        ]
+                    }
+                }),
+            )
+            .expect("create AutoStack");
+        let floater_id = frame_reply["node"]["children"][0].as_u64().unwrap();
+        engine.doc.get_mut(NodeId(floater_id)).unwrap().layout_child.absolute = true;
+
+        let update_reply = engine
+            .call(
+                "designos_update_node",
+                json!({
+                    "node_id": floater_id,
+                    "name": "FloaterAbs"
+                }),
+            )
+            .expect("update absolute child");
+
+        assert_eq!(update_reply["auto_fix"]["applied"], json!([]));
+        let abs_sugg = update_reply["auto_fix"]["suggested"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["rule"] == "absolute-in-auto-layout")
+            .expect("absolute-in-auto-layout in suggested");
+        assert_eq!(abs_sugg["property"], "layout_child.absolute");
+        assert_eq!(abs_sugg["current"], true);
+        assert_eq!(abs_sugg["suggested"], false);
+        assert_eq!(
+            abs_sugg["fix"],
+            json!({
+                "kind": "set",
+                "property": "layout_child.absolute",
+                "from": true,
+                "to": false
+            })
+        );
+        assert!(engine.doc.get(NodeId(floater_id)).unwrap().layout_child.absolute);
+    }
+
+    #[test]
+    fn off_scale_is_suggestion_only() {
+        let mut engine = Engine::default();
+        let reply = engine
+            .call(
+                "designos_apply_spec",
+                json!({
+                    "parent_id": 1,
+                    "spec": {
+                        "name": "OffScaleCard",
+                        "kind": "frame",
+                        "layout": {
+                            "direction": "vertical",
+                            "padding": [13.0, 13.0, 13.0, 13.0],
+                            "gap": 8.0
+                        },
+                        "width": 240.0,
+                        "height": 120.0,
+                        "fill": "#18181B",
+                        "children": [
+                            {
+                                "name": "Item",
+                                "kind": "rectangle",
+                                "width": 80.0,
+                                "height": 32.0,
+                                "fill": "#3B82F6"
+                            }
+                        ]
+                    }
+                }),
+            )
+            .expect("apply_spec off_scale");
+
+        assert_eq!(reply["auto_fix"]["applied"], json!([]));
+        let suggested = reply["auto_fix"]["suggested"].as_array().unwrap();
+        let off = suggested.iter().find(|s| s["rule"] == "off-scale").expect("off-scale in suggested");
+        assert!(off["reason"].as_str().unwrap_or("").contains("off the spacing scale"));
+        assert_eq!(off["fix"]["to"], 12.0);
+
+        let card_id = reply["root_node_id"].as_u64().unwrap();
+        let al = engine.doc.get(NodeId(card_id)).unwrap().kind.frame_props().unwrap().auto_layout.as_ref().unwrap();
+        assert_eq!(al.padding, [13.0, 13.0, 13.0, 13.0]);
+    }
+
+    fn seed_single_color_variable(doc: &mut designos_doc::Document, var_id: &str, name: &str, color: designos_doc::Color) {
+        use designos_doc::{Variable, VariableCollection, VariableKind, VariableMode, VariableValue};
+        use std::collections::BTreeMap;
+
+        let coll_id = "coll_tokens".to_string();
+        let mode_id = "mode_default".to_string();
+        doc.variable_collections.entry(coll_id.clone()).or_insert_with(|| VariableCollection {
+            id: coll_id.clone(),
+            name: "Color".to_string(),
+            modes: vec![VariableMode { id: mode_id.clone(), name: "Default".to_string() }],
+            default_mode: mode_id.clone(),
+            variables: Vec::new(),
+            key: None,
+            source_library_key: None,
+        });
+        doc.variable_collections.get_mut(&coll_id).unwrap().variables.push(var_id.to_string());
+        let mut values = BTreeMap::new();
+        values.insert(mode_id, VariableValue::Color(color));
+        doc.variables.insert(
+            var_id.to_string(),
+            Variable {
+                id: var_id.to_string(),
+                name: name.to_string(),
+                collection: coll_id,
+                kind: VariableKind::Color,
+                values,
+                description: String::new(),
+                scopes: Vec::new(),
+                hidden_from_publishing: false,
+                key: None,
+                code_syntax: BTreeMap::new(),
+            },
+        );
+    }
+
+    #[test]
+    fn bind_unchanged_value_applied() {
+        let mut engine = Engine::default();
+        seed_single_color_variable(&mut engine.doc, "var_primary", "Primary", designos_doc::Color::rgb(0x25, 0x63, 0xEB));
+
+        let reply = engine
+            .call(
+                "designos_apply_spec",
+                json!({
+                    "parent_id": 1,
+                    "spec": {
+                        "name": "PrimarySwatch",
+                        "kind": "rectangle",
+                        "width": 120.0,
+                        "height": 40.0,
+                        "fill": "#2563EB"
+                    }
+                }),
+            )
+            .expect("apply_spec with literal #2563EB");
+
+        let rect_id = reply["root_node_id"].as_u64().unwrap();
+        let applied = reply["auto_fix"]["applied"].as_array().unwrap();
+        assert_eq!(applied.len(), 1, "expected 1 applied binding fix: {reply}");
+        assert_eq!(applied[0]["rule"], "hardcoded-value");
+        assert_eq!(applied[0]["property"], "fills/0");
+        assert_eq!(applied[0]["before"], "#2563EB");
+        assert_eq!(applied[0]["after"], "var:Color/Primary");
+        assert_eq!(reply["issues"], json!([]));
+
+        let node = engine.doc.get(NodeId(rect_id)).unwrap();
+        assert_eq!(node.variables.bindings.get("fills/0").map(String::as_str), Some("var_primary"));
+        assert_eq!(node.fills[0].kind, designos_doc::PaintKind::Solid(designos_doc::Color::rgb(0x25, 0x63, 0xEB)));
+    }
+
+    #[test]
+    fn binding_never_overwritten() {
+        let mut engine = Engine::default();
+        seed_single_color_variable(&mut engine.doc, "var_primary", "Primary", designos_doc::Color::rgb(0x25, 0x63, 0xEB));
+        seed_single_color_variable(&mut engine.doc, "var_secondary", "Secondary", designos_doc::Color::rgb(0x25, 0x63, 0xEB));
+
+        let created = engine
+            .call(
+                "designos_apply_spec",
+                json!({
+                    "parent_id": 1,
+                    "spec": {
+                        "name": "BoundRect",
+                        "kind": "rectangle",
+                        "width": 120.0,
+                        "height": 40.0,
+                        "fill": "var:Color/Secondary"
+                    }
+                }),
+            )
+            .expect("create bound rect");
+        let rect_id = created["root_node_id"].as_u64().unwrap();
+        assert_eq!(engine.doc.get(NodeId(rect_id)).unwrap().variables.bindings.get("fills/0").map(String::as_str), Some("var_secondary"));
+
+        let updated = engine
+            .call(
+                "designos_update_node",
+                json!({
+                    "node_id": rect_id,
+                    "name": "BoundRectRenamed"
+                }),
+            )
+            .expect("update bound rect");
+
+        assert_eq!(updated["auto_fix"]["applied"], json!([]));
+        assert_eq!(engine.doc.get(NodeId(rect_id)).unwrap().variables.bindings.get("fills/0").map(String::as_str), Some("var_secondary"));
+    }
+
+    #[test]
+    fn instance_mirror_skipped() {
+        let mut engine = Engine::default();
+        // Create a component directly in the document whose child has a safe-fixable finding (`sizing-conflict`),
+        // then instantiate that component via `designos_apply_spec` and verify the instance mirror is never mutated.
+        let page = engine.resolve_default_page().unwrap();
+        let comp_id = engine.doc.alloc_id();
+        let mut comp = Node::frame(comp_id, Rect::new(0.0, 0.0, 200.0, 80.0));
+        comp.name = "MasterBadge".to_string();
+        comp.kind = designos_doc::NodeKind::Component(designos_doc::FrameProps::default());
+        engine.doc.insert(page, comp).unwrap();
+
+        let comp_child_id = engine.doc.alloc_id();
+        let mut comp_child = Node::rectangle(comp_child_id, Rect::new(0.0, 0.0, 80.0, 32.0));
+        comp_child.name = "MasterInner".to_string();
+        comp_child.layout_child.horizontal = designos_doc::Sizing::Fill;
+        engine.doc.insert(comp_id, comp_child).unwrap();
+
+        let inst_reply = engine
+            .call(
+                "designos_apply_spec",
+                json!({
+                    "parent_id": 1,
+                    "spec": {
+                        "name": "BadgeInstance",
+                        "kind": "instance",
+                        "component": "MasterBadge"
+                    }
+                }),
+            )
+            .expect("instantiate MasterBadge");
+
+        let inst_id = inst_reply["root_node_id"].as_u64().unwrap();
+        let applied = inst_reply["auto_fix"]["applied"].as_array().unwrap();
+        assert!(applied.is_empty(), "instance mirrors must never be mutated by auto-fix: {applied:?}");
+
+        let inst_children = &engine.doc.get(NodeId(inst_id)).unwrap().children;
+        assert_eq!(inst_children.len(), 1);
+        let mirror = engine.doc.get(inst_children[0]).unwrap();
+        assert!(mirror.component.source.is_some());
+        assert_eq!(mirror.layout_child.horizontal, designos_doc::Sizing::Fill);
+    }
+
+    #[test]
+    fn undo_of_auto_fix_keeps_write_key_valid() {
+        let tmp = std::env::temp_dir().join(format!(
+            "designos-mcp-autofix-ledger-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let ws = tmp.join("ws");
+        let sess_dir = tmp.join("session");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&sess_dir).unwrap();
+
+        let mut session = Session::with_session_dir(&ws, &sess_dir).expect("session");
+        let spec_args = json!({
+            "idempotency_key": "k1",
+            "parent_id": 1,
+            "spec": {
+                "name": "StaticCard",
+                "kind": "frame",
+                "width": 320.0,
+                "height": 120.0,
+                "fill": "#18181B",
+                "children": [
+                    {
+                        "name": "FillChild",
+                        "kind": "rectangle",
+                        "width": 120.0,
+                        "height": 40.0,
+                        "width_sizing": "fill",
+                        "fill": "#3B82F6"
+                    }
+                ]
+            }
+        });
+
+        let first = session.call("designos_apply_spec", spec_args.clone()).expect("first call with k1");
+        assert_eq!(first["auto_fix"]["applied"].as_array().unwrap().len(), 1);
+
+        // Undo once: reverts ONLY the `"Auto-fix"` entry; the write itself is still present.
+        session.call("designos_undo", json!({})).expect("undo Auto-fix");
+
+        // Retrying with `"k1"` MUST replay as a no-op (not IDEMPOTENCY_KEY_STALE) and return the pre-auto-fix reply.
+        let (replayed, meta) = session.call_with_meta("designos_apply_spec", spec_args.clone()).expect("replay k1 after undoing only Auto-fix");
+        assert_eq!(meta.and_then(|m| m.get("designos/idempotent_replay").cloned()), Some(json!(true)));
+        assert_eq!(replayed["auto_fix"]["passes"], 0);
+        assert_eq!(replayed["auto_fix"]["applied"], json!([]));
+
+        // Undoing a second time undoes the write itself -> `"k1"` becomes stale.
+        session.call("designos_undo", json!({})).expect("undo the write itself");
+        let stale_err = session.call("designos_apply_spec", spec_args).unwrap_err();
+        assert_eq!(stale_err.code, crate::tools::errors::ErrorCode::IdempotencyKeyStale);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn two_pass_limit() {
+        use designos_doc::lint::{Category, Finding, FixSuggestion, Severity};
+        use std::sync::Arc;
+
+        let mut engine2 = Engine::default();
+        seed_single_color_variable(&mut engine2.doc, "var_p2", "Pass2Blue", designos_doc::Color::rgb(0x25, 0x63, 0xEB));
+        let p_id = engine2.resolve_default_page().unwrap();
+        let target_rect = engine2.doc.alloc_id();
+        let mut rnode = Node::rectangle(target_rect, Rect::new(0.0, 0.0, 100.0, 40.0));
+        rnode.name = "Pass2Target".to_string();
+        rnode.fills = vec![designos_doc::Paint::solid(designos_doc::Color::rgb(0x25, 0x63, 0xEB))];
+        engine2.doc.insert(p_id, rnode).unwrap();
+
+        engine2.test_lint_hook = Some(Arc::new(move |_doc, _roots, pass_idx| {
+            if pass_idx == 1 {
+                vec![Finding {
+                    rule: "hardcoded-value",
+                    category: Category::Tokens,
+                    severity: Severity::Warning,
+                    node: target_rect,
+                    node_name: "Pass2Target".into(),
+                    xpath: String::new(),
+                    bounds: Rect::new(0.0, 0.0, 100.0, 40.0),
+                    message: "Pass 2 safe finding".into(),
+                    measured_ratio: None,
+                    required_ratio: None,
+                    level: None,
+                    large: None,
+                    method: None,
+                    worst_sample: None,
+                    foreground_hex: None,
+                    backdrop_hex: None,
+                    suggested_fix: Some(FixSuggestion {
+                        kind: "bind".into(),
+                        property: "fills/0".into(),
+                        from: json!("#2563EB"),
+                        to: json!("var:Color/Pass2Blue"),
+                    }),
+                    fixable: true,
+                    safe: true,
+                    property: Some("fills/0".into()),
+                    value: None,
+                    nearest: None,
+                    scale_source: None,
+                    candidates: None,
+                    ignored: false,
+                }]
+            } else {
+                Vec::new()
+            }
+        }));
+
+        let reply2 = engine2
+            .call(
+                "designos_apply_spec",
+                json!({
+                    "parent_id": 1,
+                    "spec": {
+                        "name": "Pass1Frame",
+                        "kind": "frame",
+                        "width": 320.0,
+                        "height": 120.0,
+                        "fill": "#18181B",
+                        "children": [
+                            {
+                                "name": "Pass1Child",
+                                "kind": "rectangle",
+                                "width": 120.0,
+                                "height": 40.0,
+                                "width_sizing": "fill",
+                                "fill": "#112233"
+                            }
+                        ]
+                    }
+                }),
+            )
+            .expect("apply_spec 2 passes");
+
+        assert_eq!(reply2["auto_fix"]["passes"], 2);
+        assert_eq!(reply2["auto_fix"]["applied"].as_array().unwrap().len(), 2);
+        // Both passes are folded into a single `"Auto-fix"` undo entry!
+        assert_eq!(engine2.history.undo_depth(), 2); // 1 for apply_spec + 1 for folded Auto-fix
+    }
+
+    #[test]
+    fn auto_fix_edge_cases_disabled_by_precedence_fig_roundtrip_and_patch_rollback() {
+        // 1. Rule disabled per file (`Document.auto_fix`) -> `disabled_by: "file"` in `auto_fix.suggested` (§8.1).
+        let mut engine = Engine::default();
+        let mut file_af = designos_doc::AutoFixSettings::default();
+        file_af.rules.insert("sizing-conflict".into(), false);
+        engine.doc.auto_fix = Some(file_af);
+
+        let reply = engine
+            .call(
+                "designos_apply_spec",
+                json!({
+                    "parent_id": 1,
+                    "spec": {
+                        "name": "FileDisabledCard",
+                        "kind": "frame",
+                        "width": 320.0,
+                        "height": 120.0,
+                        "fill": "#18181B",
+                        "children": [
+                            {
+                                "name": "FillChild",
+                                "kind": "rectangle",
+                                "width": 120.0,
+                                "height": 40.0,
+                                "width_sizing": "fill",
+                                "fill": "#3B82F6"
+                            }
+                        ]
+                    }
+                }),
+            )
+            .expect("apply_spec with file rule disabled");
+        assert_eq!(reply["auto_fix"]["applied"], json!([]));
+        let sugg = reply["auto_fix"]["suggested"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["rule"] == "sizing-conflict")
+            .expect("sizing-conflict in suggested when disabled by file");
+        assert_eq!(sugg["disabled_by"], "file");
+
+        // 2. Session overrides user `off` (§8.1).
+        let mut engine2 = Engine {
+            user_auto_fix: Some(designos_doc::AutoFixSettings { mode: Some(designos_doc::AutoFixMode::Off), rules: std::collections::BTreeMap::new() }),
+            ..Default::default()
+        };
+        engine2.call("designos_configure_session", json!({ "auto_fix": { "mode": "on" } })).expect("session override on");
+        let reply2 = engine2
+            .call(
+                "designos_apply_spec",
+                json!({
+                    "parent_id": 1,
+                    "spec": {
+                        "name": "SessionOverrideCard",
+                        "kind": "frame",
+                        "width": 320.0,
+                        "height": 120.0,
+                        "fill": "#18181B",
+                        "children": [
+                            {
+                                "name": "FillChild",
+                                "kind": "rectangle",
+                                "width": 120.0,
+                                "height": 40.0,
+                                "width_sizing": "fill",
+                                "fill": "#3B82F6"
+                            }
+                        ]
+                    }
+                }),
+            )
+            .expect("apply_spec with session override");
+        assert_eq!(reply2["auto_fix"]["applied"].as_array().unwrap().len(), 1);
+
+        // 3. Suggest-tier rule (`"off-scale"`) in `auto_fix.rules` is rejected with `UNKNOWN_FIELD` naming the safe rules (§8.1).
+        let err = engine2
+            .call(
+                "designos_configure_session",
+                json!({
+                    "auto_fix": {
+                        "rules": { "off-scale": true }
+                    }
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, crate::tools::errors::ErrorCode::UnknownField);
+        assert_eq!(err.valid_options, vec!["sizing-conflict".to_string(), "hardcoded-value".to_string()]);
+
+        // 4. `.fig` roundtrip preserves `Document.auto_fix` (`designos:auto_fix` pluginData on DOCUMENT).
+        let fig_bytes = designos_fig::export_fig(&engine.doc).expect("export_fig");
+        let reimported = designos_fig::import_fig(&fig_bytes).expect("import_fig");
+        assert_eq!(reimported.auto_fix, engine.doc.auto_fix);
     }
 }

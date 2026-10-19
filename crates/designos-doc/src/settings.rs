@@ -3,7 +3,49 @@
 
 use crate::NodeId;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Safe-tier rule IDs accepted in [`AutoFixSettings::rules`] (`E15-13` §3.1, §4.1).
+pub const SAFE_AUTO_FIX_RULES: &[&str] = &["sizing-conflict", "hardcoded-value"];
+
+/// Controls whether the engine automatically applies safe-tier mechanical fixes after mutating calls (`E15-13` §4.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoFixMode {
+    #[default]
+    On,
+    ReportOnly,
+    Off,
+}
+
+impl AutoFixMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::ReportOnly => "report_only",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// Per-document or per-user auto-fix configuration (`E15-13` §4.1).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoFixSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<AutoFixMode>,
+    /// Safe-tier rule ID -> enabled. E.g. `{"sizing-conflict": true, "hardcoded-value": false}`.
+    /// Only safe-tier rule IDs (`sizing-conflict`, `hardcoded-value`) are accepted;
+    /// suggest-tier IDs (`text-missing-fill`, `absolute-in-auto-layout`, `off-scale`, `contrast`, etc.)
+    /// are never auto-applied and cannot be enabled here.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rules: BTreeMap<String, bool>,
+}
+
+impl AutoFixSettings {
+    pub fn is_empty(&self) -> bool {
+        self.mode.is_none() && self.rules.is_empty()
+    }
+}
 
 /// WCAG contrast threshold level for Check designs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
