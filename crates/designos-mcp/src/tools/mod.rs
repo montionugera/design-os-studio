@@ -2,3 +2,4 @@
 
 pub mod libraries;
 pub mod library_source;
+pub mod search_design_system;
