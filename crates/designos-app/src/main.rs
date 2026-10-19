@@ -1,5 +1,7 @@
 mod agent_start_failure;
 mod app;
+#[cfg(test)]
+mod apply_node_spec_variable_tests;
 mod board;
 mod canvas;
 mod check_designs;
