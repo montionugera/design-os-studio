@@ -373,6 +373,49 @@ impl Engine {
                 let count = findings.len();
                 Ok(json!({"page_id": root.map(|r| r.0), "findings": findings, "total": count, "passed": count == 0}))
             }
+            "designos_import_web_capture" | "import_web_capture" => {
+                let a: ImportWebCaptureArgs = parse(args)?;
+                let page = a
+                    .page_id
+                    .filter(|&id| id != 0)
+                    .map(NodeId)
+                    .or_else(|| self.resolve_default_page().ok())
+                    .ok_or_else(|| "Document has no pages".to_string())?;
+                if !matches!(self.node(page.0)?.kind, NodeKind::Page { .. }) {
+                    return Err("page_id must identify a page".into());
+                }
+                if let Some(x) = a.x {
+                    if !x.is_finite() {
+                        return Err("x must be finite".into());
+                    }
+                }
+                if let Some(y) = a.y {
+                    if !y.is_finite() {
+                        return Err("y must be finite".into());
+                    }
+                }
+                let raw_json = match (&a.capture, &a.path) {
+                    (Some(Value::String(s)), _) => s.clone(),
+                    (Some(v), _) => serde_json::to_string(v).map_err(|e| format!("Invalid capture payload: {e}"))?,
+                    (None, Some(path)) => std::fs::read_to_string(path).map_err(|e| format!("Cannot read web capture '{path}': {e}"))?,
+                    (None, None) => return Err("Provide either 'path' or 'capture'".into()),
+                };
+                let opts =
+                    designos_webcapture::ImportOptions { origin: a.x.zip(a.y), infer_block_auto_layout: a.infer_block_auto_layout, ..Default::default() };
+                let (cmd, report) =
+                    designos_webcapture::import_capture_json(&self.doc, page, &raw_json, &opts).map_err(|e| format!("Failed to import web capture: {e}"))?;
+                self.exec(cmd)?;
+                self.relayout(page);
+                Ok(json!({
+                    "root_node_id": report.root_node_id.0,
+                    "page_id": page.0,
+                    "root_name": report.root_name,
+                    "summary_toast": report.summary_toast(),
+                    "report": report,
+                    "node": self.doc.get(report.root_node_id),
+                    "changed": true
+                }))
+            }
             "designos_undo" | "designos_redo" => {
                 let _: Empty = parse(args)?;
                 let undo = name == "designos_undo";
@@ -702,6 +745,22 @@ struct LintArgs {
     #[serde(default)]
     page_id: Option<u64>,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ImportWebCaptureArgs {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub capture: Option<Value>,
+    #[serde(default)]
+    pub page_id: Option<u64>,
+    #[serde(default)]
+    pub x: Option<f32>,
+    #[serde(default)]
+    pub y: Option<f32>,
+    #[serde(default = "default_true")]
+    pub infer_block_auto_layout: bool,
+}
 
 /// JSON tool descriptors kept beside the argument validators.
 pub fn tools() -> Vec<Value> {
@@ -824,6 +883,21 @@ pub fn tools() -> Vec<Value> {
         vec!["output_path"],
         false,
         true,
+    );
+    add(
+        "import_web_capture",
+        "Import a .webcapture.json / .capture.json bundle (or inline capture JSON) into a page as an editable auto-layout frame tree in one undoable step, returning the ImportReport.",
+        json!({
+            "path":{"type":"string","description":"Path to a .webcapture.json or .capture.json file inside the workspace."},
+            "capture":{"description":"Inline web capture JSON object or JSON string (alternative to path)."},
+            "page_id":id,
+            "x":coordinate,
+            "y":coordinate,
+            "infer_block_auto_layout":{"type":"boolean","default":true}
+        }),
+        vec![],
+        false,
+        false,
     );
     add("undo", "Undo the latest successful edit in this session; returns changed=false if the stack is empty.", json!({}), vec![], false, false);
     add("redo", "Redo the most recently undone edit in this session; returns changed=false if the stack is empty.", json!({}), vec![], false, false);

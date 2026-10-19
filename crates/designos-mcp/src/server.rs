@@ -505,12 +505,26 @@ impl Session {
                 Ok(json!({"output_path": path, "path": path, "bytes": bytes.len(), "saved": true}))
             }
             _ => {
+                let mut args = args;
+                if matches!(name, "designos_import_web_capture" | "import_web_capture") {
+                    if let Some(obj) = args.as_object_mut() {
+                        if let Some(rel_path) = obj.get("path").and_then(Value::as_str).map(str::to_string) {
+                            let resolved = self.input_path(&rel_path)?;
+                            if fs::metadata(&resolved).map_err(|e| e.to_string())?.len() > 64 * 1024 * 1024 {
+                                return Err("Input file exceeds the 64 MiB import limit".into());
+                            }
+                            obj.insert("path".into(), json!(resolved.to_string_lossy().to_string()));
+                        }
+                    }
+                }
                 let mutating = matches!(
                     name,
                     "designos_create_node"
                         | "designos_update_node"
                         | "designos_delete_node"
                         | "designos_apply_spec"
+                        | "designos_import_web_capture"
+                        | "import_web_capture"
                         | "designos_add_comment"
                         | "designos_reply_comment"
                         | "designos_resolve_comment"

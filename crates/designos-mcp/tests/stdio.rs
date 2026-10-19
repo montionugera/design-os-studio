@@ -10,7 +10,7 @@ async fn stdio_handshake_discovery_edit_and_error_recovery() {
         let client = ().serve(TokioChildProcess::new(command).unwrap()).await.unwrap();
         assert_eq!(client.peer_info().unwrap().server_info.as_ref().unwrap().name, "designos-mcp");
         let tools = client.list_all_tools().await.unwrap();
-        assert_eq!(tools.len(), 22);
+        assert_eq!(tools.len(), 23);
         assert!(tools.iter().all(|t| t.annotations.is_some()));
         let call = |name: &'static str, args: Value| CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone());
         let doc = client.call_tool(call("designos_get_document", json!({}))).await.unwrap();
@@ -36,6 +36,30 @@ async fn stdio_handshake_discovery_edit_and_error_recovery() {
             .await
             .unwrap();
         assert_eq!(applied.is_error, Some(false));
+        let imported = client
+            .call_tool(call(
+                "designos_import_web_capture",
+                json!({
+                    "capture": {
+                        "schema": "designos-webcapture",
+                        "version": 1,
+                        "url": "https://designos.dev/mcp",
+                        "title": "MCP Capture",
+                        "viewport": { "width": 320.0, "height": 180.0, "dpr": 1.0 },
+                        "scroll": { "width": 320.0, "height": 180.0 },
+                        "root": {
+                            "tag": "div",
+                            "id": "card",
+                            "box": { "x": 0.0, "y": 0.0, "width": 320.0, "height": 180.0 },
+                            "styles": { "display": "flex", "flex-direction": "column", "row-gap": "12px" },
+                            "children": []
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(imported.is_error, Some(false));
         let comments = client.call_tool(call("designos_list_comments", json!({}))).await.unwrap();
         assert_eq!(comments.is_error, Some(false));
         client.cancel().await.unwrap();

@@ -110,6 +110,19 @@ pub fn load_path(path: &Path) -> Result<Document, String> {
     Ok(doc)
 }
 
+/// Opens any supported document format (`.designos`, `.fig`, `.pen`, `.svg`, Figma REST `.json`,
+/// or `.webcapture.json` / `.capture.json`) into a [`Document`].
+#[allow(dead_code)]
+pub fn open_any(path: &Path) -> Result<Document, String> {
+    load_path(path)
+}
+
+/// Returns `true` if `path` has a `.capture.json` or `.webcapture.json` filename or `.webcapture` extension.
+pub fn is_web_capture_path(path: &Path) -> bool {
+    let lower = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+    lower.ends_with(".capture.json") || lower.ends_with(".webcapture.json") || lower.ends_with(".webcapture")
+}
+
 /// Like [`load_path`], but also returns the non-fatal import or repair warning, if any: a `.pen`
 /// file whose `ref` expansion hit the clone budget or a native `.designos` file whose node graph
 /// needed structural repair on load still opens, and reports what changed.
@@ -149,31 +162,39 @@ fn load_path_importing_pen_with_mode(
             }
             d
         }
+        "webcapture" => {
+            let text = std::fs::read_to_string(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+            designos_fig::import_web_capture_json(&text).map_err(|e| format!("Cannot import web capture: {e}"))?
+        }
         "json" => {
             let text = std::fs::read_to_string(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
-            match designos_fig::import_rest_json(&text) {
-                Ok(mut d) => {
-                    // A number that overflowed `f32` on import is infinity here. Neutralize only the
-                    // affected entries in place without re-parsing the whole document or running
-                    // `migrate_text`.
-                    let replaced = d.neutralize_non_finite();
-                    if replaced > 0 {
-                        warning = if record_once { non_finite_notice_once(path, replaced) } else { non_finite_notice(replaced) };
+            if is_web_capture_path(path) || designos_fig::looks_like_web_capture_json(&text) {
+                designos_fig::import_web_capture_json(&text).map_err(|e| format!("Cannot import web capture: {e}"))?
+            } else {
+                match designos_fig::import_rest_json(&text) {
+                    Ok(mut d) => {
+                        // A number that overflowed `f32` on import is infinity here. Neutralize only the
+                        // affected entries in place without re-parsing the whole document or running
+                        // `migrate_text`.
+                        let replaced = d.neutralize_non_finite();
+                        if replaced > 0 {
+                            warning = if record_once { non_finite_notice_once(path, replaced) } else { non_finite_notice(replaced) };
+                        }
+                        d
                     }
-                    d
+                    Err(fig_err) => match import_pen(&text) {
+                        Ok((d, w)) => {
+                            warning = w;
+                            d
+                        }
+                        Err(_) => {
+                            let (d, w) = parse_native_with_warning(path, &text, record_once)
+                                .map_err(|e| format!("Not a Figma REST file ({fig_err}) nor a designos file ({e})"))?;
+                            warning = w;
+                            d
+                        }
+                    },
                 }
-                Err(fig_err) => match import_pen(&text) {
-                    Ok((d, w)) => {
-                        warning = w;
-                        d
-                    }
-                    Err(_) => {
-                        let (d, w) = parse_native_with_warning(path, &text, record_once)
-                            .map_err(|e| format!("Not a Figma REST file ({fig_err}) nor a designos file ({e})"))?;
-                        warning = w;
-                        d
-                    }
-                },
             }
         }
         "svg" => {
@@ -303,13 +324,18 @@ pub fn save_path_counted(doc: &Document, path: &Path) -> Result<(PathBuf, usize)
 
 pub fn pick_open() -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .add_filter("Design files", &[NATIVE_EXT, LEGACY_EXT, "fig", "pen", "json", "svg"])
+        .add_filter("Design files", &[NATIVE_EXT, LEGACY_EXT, "fig", "pen", "json", "webcapture", "svg"])
         .add_filter("design:os studio", &[NATIVE_EXT, LEGACY_EXT])
         .add_filter("Figma file", &["fig"])
         .add_filter("Pencil file", &["pen"])
+        .add_filter("Web capture", &["json", "webcapture"])
         .add_filter("SVG", &["svg"])
         .add_filter("JSON", &["json"])
         .pick_file()
+}
+
+pub fn pick_web_capture() -> Option<PathBuf> {
+    rfd::FileDialog::new().add_filter("Web capture (.capture.json, .webcapture.json)", &["json", "webcapture"]).pick_file()
 }
 
 pub fn pick_save(default_name: &str) -> Option<PathBuf> {
@@ -960,5 +986,53 @@ mod tests {
             .unwrap();
         assert_eq!(text_overflow.content, text_clean.content, "overflow neutralization must not strip literal bullets via migrate_text");
         assert_eq!(text_overflow.lists, text_clean.lists);
+    }
+
+    #[test]
+    fn web_capture_json_opens_via_open_any_and_load_path() {
+        let raw = r#"{
+            "schema": "designos-webcapture",
+            "version": 1,
+            "url": "https://designos.dev/pricing",
+            "title": "Pricing Capture",
+            "viewport": { "width": 800.0, "height": 400.0, "dpr": 1.0 },
+            "scroll": { "width": 800.0, "height": 400.0 },
+            "root": {
+                "tag": "div",
+                "id": "pricing-card",
+                "box": { "x": 0.0, "y": 0.0, "width": 360.0, "height": 220.0 },
+                "styles": {
+                    "display": "flex",
+                    "flex-direction": "column",
+                    "row-gap": "16px",
+                    "padding-top": "24px",
+                    "padding-left": "24px",
+                    "padding-right": "24px",
+                    "padding-bottom": "24px",
+                    "background-color": "rgb(255, 255, 255)"
+                },
+                "children": [
+                    {
+                        "tag": "h2",
+                        "id": "title",
+                        "box": { "x": 24.0, "y": 24.0, "width": 200.0, "height": 28.0 },
+                        "styles": { "display": "block", "font-family": "Inter", "font-size": "20px", "font-weight": "700", "color": "rgb(15, 23, 42)" },
+                        "textRuns": [{ "text": "Pro Workspace", "styles": { "font-family": "Inter", "font-size": "20px", "font-weight": "700", "color": "rgb(15, 23, 42)" }, "lines": [{ "x": 24.0, "y": 24.0, "width": 200.0, "height": 28.0 }] }],
+                        "children": []
+                    }
+                ]
+            }
+        }"#;
+        let p = tmp("sample.capture.json");
+        std::fs::write(&p, raw).unwrap();
+        assert!(is_web_capture_path(&p));
+        let doc = open_any(&p).unwrap();
+        std::fs::remove_file(&p).ok();
+        assert_eq!(doc.name, "Pricing Capture");
+        assert_eq!(doc.pages.len(), 1);
+        let card = doc.nodes.values().find(|n| n.name == "Pricing Capture — designos.dev").expect("imported flex root frame");
+        let al = card.kind.frame_props().unwrap().auto_layout.as_ref().expect("auto-layout");
+        assert_eq!(al.direction, designos_doc::LayoutDirection::Vertical);
+        assert_eq!(al.item_spacing, 16.0);
     }
 }

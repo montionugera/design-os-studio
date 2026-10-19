@@ -29,6 +29,7 @@ pub mod testkit;
 mod textfmt;
 mod variables;
 mod vecnet;
+pub mod web_capture;
 
 pub use clipboard::{import_figma_clipboard, looks_like_figma_clipboard, parse_figma_clipboard_html, FigClipboard};
 pub use designos_doc::Document;
@@ -41,6 +42,7 @@ pub use pen::{export_pen_json, import_pen_json, import_pen_json_with_warnings};
 pub use proto::{gamepad_button_code, gamepad_button_name, key_code, key_name};
 pub use rest_import::{image_refs, import_rest_json};
 pub use variables::{export_variables_json, export_variables_meta, import_variables_json, import_variables_value};
+pub use web_capture::{import_web_capture_into_page, import_web_capture_json, import_web_capture_json_with_report, looks_like_web_capture_json};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FigError {

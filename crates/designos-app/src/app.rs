@@ -204,6 +204,9 @@ pub struct App {
     /// Non-finite or save warning produced by `save_library_file` / `flush_autosave` during a document
     /// switch, carried into an immediate follow-up `show_toast` so `"Opened X"` does not overwrite it.
     pub(crate) pending_flush_notice: Option<(f64, String)>,
+    /// Last web capture import report (`T8.27`) and whether its `Details` sheet is open.
+    pub web_capture_report: Option<designos_webcapture::ImportReport>,
+    pub web_capture_report_open: bool,
 }
 
 impl App {
@@ -260,6 +263,8 @@ impl App {
             tabs: Default::default(),
             opacity_buffer: None,
             pending_flush_notice: None,
+            web_capture_report: None,
+            web_capture_report_open: false,
         }
     }
 

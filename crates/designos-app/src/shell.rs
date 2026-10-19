@@ -92,7 +92,7 @@ impl Shell {
         opts.home = opts.wants_home();
         let screenshot = opts.screenshot.is_some();
         let panel_was_none = opts.panel.is_none();
-        let has_file = opts.file.is_some() || opts.open_id.is_some();
+        let has_file = opts.file.is_some() || opts.import_capture.is_some() || opts.open_id.is_some();
         let (gpu_flag, library) = (opts.gpu, opts.library.clone());
         let mut shell = Self::build(&cc.egui_ctx, opts);
         if !screenshot && panel_was_none && !has_file {
@@ -131,7 +131,7 @@ impl Shell {
             Some("board") => crate::board::demo::document(),
             Some("board-empty") => crate::board::create::new_document("Untitled"),
             Some(f) if crate::vecfixture::FIXTURES.contains(&f) => crate::vecfixture::document(),
-            None if opts.file.is_some() || opts.open_id.is_some() || opts.home => designos_doc::Document::new("Untitled"),
+            None if opts.file.is_some() || opts.import_capture.is_some() || opts.open_id.is_some() || opts.home => designos_doc::Document::new("Untitled"),
             _ => demo::demo_document(),
         });
         // A shell started during build (`--panel agents`, `terminal`, `agents-chat`) captures its
@@ -160,6 +160,9 @@ impl Shell {
         }
         if let Some(f) = &opts.file {
             app.open_path(f.clone());
+        }
+        if let Some(cap) = &opts.import_capture {
+            app.import_web_capture_path(cap.clone());
         }
         if let Some(id) = &opts.open_id {
             app.open_library_file(id);
@@ -335,6 +338,9 @@ impl Shell {
                     // the capture of a library collection: start on it rather than on the file's own
                     app.vars.collection = app.doc.variable_collections.values().find(|c| c.is_library()).map(|c| c.id.clone());
                 }
+            }
+            Some("web-capture-report") => {
+                app.web_capture_report_open = true;
             }
             Some(p) if p.starts_with("micro-") => {
                 if !p.contains(":seq:") {
@@ -939,7 +945,93 @@ impl Shell {
         p.rect_filled(r, theme::cr(theme::RADIUS_FRAME), theme::BG_MENU);
         p.circle_filled(Pos2::new(r.left() + 16.0, r.center().y), 4.0, if t.error { theme::DANGER } else { theme::BG_BRAND });
         p.text(Pos2::new(r.left() + 28.0, r.center().y), Align2::LEFT_CENTER, &t.text, font, theme::TEXT);
+        if self.app.web_capture_report.is_some() && t.text.ends_with("Details") {
+            let resp = ui.interact(r, egui::Id::new("web-capture-toast-details"), egui::Sense::click());
+            if resp.clicked() {
+                self.app.web_capture_report_open = !self.app.web_capture_report_open;
+            }
+        }
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+    }
+
+    fn show_web_capture_report(&mut self, ctx: &Context) {
+        if !self.app.web_capture_report_open {
+            return;
+        }
+        let Some(rep) = self.app.web_capture_report.clone() else {
+            self.app.web_capture_report_open = false;
+            return;
+        };
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.app.web_capture_report_open = false;
+            return;
+        }
+        let screen = ctx.content_rect();
+        let w = 440.0_f32.min((screen.width() - 48.0).max(320.0));
+        let row_h = 28.0;
+        let header_h = 36.0;
+        let summary_rows = 4usize;
+        let font_rows = rep.font_substitutions.len().min(3);
+        let style_rows = rep.unsupported_css.len().min(3);
+        let img_rows = rep.images_not_captured.len().min(2);
+        let total_rows = summary_rows + font_rows.max(1) + style_rows.max(1) + img_rows;
+        let h = header_h + 12.0 + (total_rows as f32 * row_h);
+        let rect = Rect::from_min_size(
+            Pos2::new((screen.right() - theme::RIGHT_PANEL_WIDTH - w - 20.0).max(screen.left() + 24.0), screen.top() + 56.0),
+            Vec2::new(w, h),
+        );
+        let mut close_clicked = false;
+        egui::Area::new(egui::Id::new("web-capture-report-sheet")).order(egui::Order::Foreground).fixed_pos(rect.min).interactable(true).show(ctx, |ui| {
+            ui.allocate_exact_size(rect.size(), egui::Sense::hover());
+            let p = ui.painter().clone();
+            widgets::elevation_400(&p, rect, theme::RADIUS_FRAME);
+            p.rect_filled(rect, theme::cr(theme::RADIUS_FRAME), theme::BG_MENU);
+            p.rect_stroke(rect, theme::cr(theme::RADIUS_FRAME), egui::Stroke::new(1.0, theme::BORDER_MENU), egui::StrokeKind::Inside);
+
+            let hdr = Rect::from_min_size(rect.min, Vec2::new(rect.width(), header_h));
+            p.text(Pos2::new(hdr.left() + 14.0, hdr.center().y), Align2::LEFT_CENTER, "Web Capture Import Report", theme::font_body_strong(), theme::TEXT);
+            let close_r = Rect::from_min_size(Pos2::new(hdr.right() - 30.0, hdr.center().y - 12.0), Vec2::splat(24.0));
+            if widgets::icon_button(ui, close_r, "close-web-capture-report", Icon::Close, false, "Close").clicked() {
+                close_clicked = true;
+            }
+            widgets::hline(&p, rect.left(), rect.right(), hdr.bottom(), theme::BORDER_SUBTLE);
+
+            let mut y = hdr.bottom() + 6.0;
+            let mut draw_kv = |label: &str, value: &str, mono_val: bool| {
+                let r = Rect::from_min_size(Pos2::new(rect.left() + 14.0, y), Vec2::new(rect.width() - 28.0, row_h));
+                p.text(Pos2::new(r.left(), r.center().y), Align2::LEFT_CENTER, label, theme::font_body(), theme::TEXT_SECONDARY);
+                let f = if mono_val { theme::font_mono() } else { theme::font_body() };
+                let elided = widgets::elide(&p, value, &f, (r.width() * 0.62).max(120.0));
+                p.text(Pos2::new(r.right(), r.center().y), Align2::RIGHT_CENTER, elided, f, theme::TEXT);
+                y += row_h;
+            };
+
+            draw_kv("Imported frame", &rep.root_name, false);
+            draw_kv("Layers created", &format!("{} layers ({} DOM elements)", rep.nodes_created, rep.elements), true);
+            draw_kv("Layout mapping", &format!("{} flattened · {} abs fallbacks", rep.flattened_wrappers, rep.absolute_fallbacks.len()), true);
+            draw_kv("Capture status", if rep.truncated { "truncated (budget reached)" } else { "complete" }, true);
+
+            if rep.font_substitutions.is_empty() {
+                draw_kv("Substituted fonts", "0 (all matched)", true);
+            } else {
+                for sf in rep.font_substitutions.iter().take(3) {
+                    draw_kv("Font fallback", &format!("{} -> {}", sf.requested, sf.substituted), true);
+                }
+            }
+            if rep.unsupported_css.is_empty() {
+                draw_kv("Unsupported CSS", "0 declarations skipped", true);
+            } else {
+                for us in rep.unsupported_css.iter().take(3) {
+                    draw_kv(&format!("{} ({})", us.property, us.element_id), &us.value, true);
+                }
+            }
+            for bi in rep.images_not_captured.iter().take(2) {
+                draw_kv(&format!("Placeholder ({})", bi.reason), &bi.src, true);
+            }
+        });
+        if close_clicked {
+            self.app.web_capture_report_open = false;
+        }
     }
 }
 
@@ -981,6 +1073,7 @@ impl eframe::App for Shell {
 
 impl Shell {
     /// Files dropped on the window: `.svg` files are placed at the drop point,
+    /// `.webcapture` / `.capture.json` files are imported at the drop point,
     /// anything else (the first file) is opened as a document.
     fn handle_drops(&mut self, ctx: &Context) {
         let (files, pos) = ctx.input(|i| (i.raw.dropped_files.clone(), i.pointer.hover_pos().or(i.pointer.latest_pos())));
@@ -989,7 +1082,12 @@ impl Shell {
             name.rsplit('.').next().is_some_and(|e| e.eq_ignore_ascii_case("svg"))
         };
         if let Some(path) = files.iter().filter(|f| !is_svg(f)).find_map(|f| f.path.clone()) {
-            self.app.open_path(path);
+            if crate::io::is_web_capture_path(&path) {
+                let page_pos = pos.map(|s| self.app.view.to_page(self.app.canvas_rect.min, s));
+                self.app.import_web_capture_path_at(path, page_pos);
+            } else {
+                self.app.open_path(path);
+            }
             return;
         }
         for (nth, f) in files.iter().filter(|f| is_svg(f)).enumerate() {
@@ -1280,6 +1378,7 @@ impl Shell {
         crate::dev::compare::show(&mut self.app, &ctx);
         crate::libraries::show(&mut self.app, &ctx);
         crate::plugins::ui::show(&mut self.app, &ctx);
+        self.show_web_capture_report(&ctx);
         self.toast(ui, full);
 
         self.sync_title(&ctx);
