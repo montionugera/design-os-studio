@@ -106,6 +106,17 @@ impl AgentCliPreset {
         self.binary_name()
     }
 
+    pub fn display_name(self) -> &'static str {
+        match self {
+            AgentCliPreset::Shell => "Shell",
+            AgentCliPreset::Claude => "Claude Code",
+            AgentCliPreset::Codex => "Codex",
+            AgentCliPreset::Antigravity => "Antigravity",
+            AgentCliPreset::Grok => "Grok",
+            AgentCliPreset::DesignOsHelp => "Agent Guide",
+        }
+    }
+
     pub fn tab_title(self) -> &'static str {
         match self {
             AgentCliPreset::Shell => "Shell ($SHELL)",
@@ -353,7 +364,7 @@ pub enum TerminalAction {
     ExportSelectionToTerminal,
 }
 
-/// Orca 3-tier live agent execution status (`Working` / `WaitingForInput` / `Done` / `Idle`).
+/// Orca live agent execution status (`Working` / `WaitingForInput` / `Done` / `Error` / `Stopped` / `Idle`).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum AgentTabStatus {
     #[default]
@@ -361,6 +372,8 @@ pub enum AgentTabStatus {
     Working(Option<String>),
     WaitingForInput(Option<String>),
     Done,
+    Error(Option<String>),
+    Stopped,
 }
 
 /// One live interactive PTY tab backed by `portable-pty` and a `vt100::Parser`.
@@ -382,6 +395,8 @@ pub struct TerminalTab {
     pub raw_log: Arc<Mutex<String>>,
     pub selection: Option<((u16, u16), (u16, u16))>,
     pub agent_status: Arc<Mutex<AgentTabStatus>>,
+    /// Last status observed by `TerminalState::drain_status_changes` (`#687`).
+    pub reported_status: AgentTabStatus,
     pub last_output_at: Arc<Mutex<Option<std::time::Instant>>>,
     /// Set after the agent-exit notice is written into the vt100 parser. Never respawn a shell.
     pub exited_notice_shown: bool,
@@ -532,6 +547,7 @@ impl TerminalTab {
             raw_log,
             selection: None,
             agent_status,
+            reported_status: AgentTabStatus::Idle,
             last_output_at,
             exited_notice_shown: false,
             spawned_at: std::time::Instant::now(),
@@ -1363,6 +1379,19 @@ impl TerminalState {
         actions
     }
 
+    /// Drains any tab status transitions since the last drain (`#687`).
+    pub fn drain_status_changes(&mut self) -> Vec<crate::agent_a11y::StatusChange> {
+        let mut out = Vec::new();
+        for tab in &mut self.tabs {
+            let current = tab.agent_status.lock().ok().map(|g| g.clone()).unwrap_or_default();
+            if current != tab.reported_status {
+                let prev = std::mem::replace(&mut tab.reported_status, current.clone());
+                out.push(crate::agent_a11y::StatusChange { tab_id: tab.id, preset: tab.preset, prev, next: current });
+            }
+        }
+        out
+    }
+
     /// Dispatches a Figma AI task prompt into the active PTY session (spawning the first installed
     /// AI CLI preset if no PTY tab is open yet) and records a structured chat turn.
     pub fn dispatch_figma_ai_prompt(&mut self, task_title: &str, cli_prompt: &str, file_path: Option<&Path>) {
@@ -1589,6 +1618,7 @@ fn parse_agent_status_payload(payload: &str) -> Option<AgentTabStatus> {
             "working" | "running" | "busy" => Some(AgentTabStatus::Working(detail)),
             "waiting" | "permission" | "input" | "waiting_for_input" => Some(AgentTabStatus::WaitingForInput(detail)),
             "done" | "completed" | "idle" | "stopped" => Some(AgentTabStatus::Done),
+            "error" | "failed" => Some(AgentTabStatus::Error(detail)),
             _ => None,
         };
     }
@@ -1601,6 +1631,7 @@ fn parse_agent_status_payload(payload: &str) -> Option<AgentTabStatus> {
         "working" | "running" | "busy" => Some(AgentTabStatus::Working(detail)),
         "waiting" | "permission" | "input" => Some(AgentTabStatus::WaitingForInput(detail)),
         "done" | "completed" | "idle" => Some(AgentTabStatus::Done),
+        "error" | "failed" => Some(AgentTabStatus::Error(detail)),
         _ => None,
     }
 }
@@ -2019,7 +2050,7 @@ fn paint_orca_tab_status_and_provider(ui: &Ui, p: &Painter, tab: &TerminalTab, t
             p.circle_stroke(status_center, 3.1, Stroke::new(1.3, wait_col));
             p.circle_filled(status_center, 1.2, wait_col);
         }
-        AgentTabStatus::Done | AgentTabStatus::Idle => {
+        AgentTabStatus::Done | AgentTabStatus::Idle | AgentTabStatus::Error(_) | AgentTabStatus::Stopped => {
             p.circle_filled(status_center, 2.7, Color32::from_rgb(0x10, 0xB9, 0x81));
         }
     }
@@ -2472,6 +2503,7 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
     state.ensure_default_tab(file_path);
     state.sync_chat_from_pty();
     let mut actions = state.poll_live_agent_bridge();
+    crate::agent_a11y::label_agents_panel(state, ui);
     let p = ui.painter().clone();
 
     if state.side_panel_pty_open {
@@ -3407,6 +3439,7 @@ fn resolve_apply_spec_action(state: &mut TerminalState) -> Option<TerminalAction
 fn render_terminal_surface(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: Option<&Path>, surface_id: &'static str) -> Vec<TerminalAction> {
     state.ensure_default_tab(file_path);
     let mut actions = state.poll_live_agent_bridge();
+    crate::agent_a11y::label_terminal_surface(state, ui, surface_id);
     let p = ui.painter().clone();
 
     if ui.input(|i| i.pointer.any_pressed()) {
@@ -3697,7 +3730,10 @@ fn render_vt100_viewport(state: &mut TerminalState, ui: &mut Ui, viewport_rect: 
         }
 
         // Direct raw keystroke, Agent CLI shortcuts & bracketed paste capture when the terminal viewport is focused
-        if viewport_focused && !ui.ctx().egui_wants_keyboard_input() {
+        if viewport_focused
+            && (!crate::agent_a11y::non_canvas_has_focus(ui.ctx())
+                || ui.ctx().memory(|m| m.has_focus(vp_resp.id) || m.has_focus(crate::agent_a11y::composer_id())))
+        {
             let bracketed_paste = tab.parser.lock().ok().map(|pg| pg.screen().bracketed_paste()).unwrap_or(false);
             let mut raw_bytes: Vec<u8> = Vec::new();
             let mut copy_selection = false;

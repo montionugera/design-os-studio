@@ -73,7 +73,7 @@ pub const TOP_TITLE_BAR_HEIGHT: f32 = 28.0;
 #[allow(dead_code)]
 pub fn is_typing_in_agent_panel(app: &App, ctx: &Context) -> bool {
     let agent_rail_open = !app.ui.left_collapsed && matches!(app.ui.rail, Some(crate::app::RailItem::Agents | crate::app::RailItem::Tools));
-    ctx.egui_wants_keyboard_input() || app.terminal.is_capturing_keyboard(agent_rail_open)
+    crate::agent_a11y::non_canvas_has_focus(ctx) || app.terminal.is_capturing_keyboard(agent_rail_open)
 }
 
 pub struct Shell {
@@ -484,12 +484,15 @@ impl Shell {
         if self.app.plugins.open || self.app.dialog.is_some() || self.app.history.save_modal.is_some() || self.app.dev.compare.is_some() {
             return;
         }
+        if self.app.canvas.text.is_none() && crate::agent_a11y::try_focus_shortcut(&mut self.app, ctx) {
+            return;
+        }
         let agent_rail_open = !self.app.ui.left_collapsed && matches!(self.app.ui.rail, Some(crate::app::RailItem::Agents | crate::app::RailItem::Tools));
         let capturing_terminal = self.app.terminal.is_capturing_keyboard(agent_rail_open);
         if capturing_terminal {
             return;
         }
-        let typing = ctx.egui_wants_keyboard_input();
+        let typing = crate::agent_a11y::non_canvas_has_focus(ctx);
         if self.app.vars.open {
             // The Variables view handles its own keys (and undo / redo).
             return;
@@ -954,7 +957,7 @@ impl eframe::App for Shell {
         if self.app.plugins.open {
             return;
         }
-        if ctx.memory(|m| m.focused()).is_some() {
+        if crate::agent_a11y::non_canvas_has_focus(ctx) {
             return;
         }
         if let Some(sess) = self.app.canvas.text.as_mut() {
@@ -1047,6 +1050,7 @@ impl Shell {
 
     fn draw_window(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        crate::agent_a11y::sync_frame(&ctx);
         self.app.now = ctx.input(|i| i.time);
         self.app.poll_plugins();
         self.drive_screenshot(&ctx);
@@ -1106,6 +1110,7 @@ impl Shell {
                 self.home_frame(ui, &ctx);
             }
             crate::plugins::ui::show(&mut self.app, &ctx);
+            crate::agent_a11y::poll_and_step(&mut self.app, &ctx);
             return;
         }
         self.app.autosave_tick(&ctx);
@@ -1113,6 +1118,7 @@ impl Shell {
         self.app.dev_tick(&ctx);
         if self.app.proto.present.is_some() {
             crate::present::show(&mut self.app, ui);
+            crate::agent_a11y::poll_and_step(&mut self.app, &ctx);
             return;
         }
         self.handle_keys(&ctx);
@@ -1281,6 +1287,7 @@ impl Shell {
         crate::libraries::show(&mut self.app, &ctx);
         crate::plugins::ui::show(&mut self.app, &ctx);
         self.toast(ui, full);
+        crate::agent_a11y::poll_and_step(&mut self.app, &ctx);
 
         self.sync_title(&ctx);
         if self.app.ui.menu == Some(MenuKind::Main) && self.app.ui.menu_anchor.is_none() {
