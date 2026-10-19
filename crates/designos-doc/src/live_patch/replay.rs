@@ -1,5 +1,6 @@
 //! Editor side: replay a [`LivePatch`] on the full document as ordinary [`Command`]s.
 
+use super::lease::{stamp_command_authorship, AffectedSet, LeaseTable, PLUGIN_DATA_RUN_KEY};
 use super::replay_comments::{resolve_comments, CommentRemap};
 use super::validate::insert_problem;
 use super::{LiveOp, LivePatch, SiblingHint, LIVE_PATCH_VERSION, STRUCTURAL_FIELDS};
@@ -23,9 +24,16 @@ pub struct LivePatchState {
     /// shape builder's remainder of a layer). Used only while the old id is gone, so undoing the
     /// replacement sends edits back to the restored layer.
     replaced: BTreeMap<NodeId, NodeId>,
+    /// Active frame-ownership leases checked by the Studio replay guard (`RD-3 §3.2`).
+    pub leases: LeaseTable,
 }
 
 impl LivePatchState {
+    pub fn with_leases(mut self, leases: LeaseTable) -> Self {
+        self.leases = leases;
+        self
+    }
+
     /// The editor removed layer `old` and put `new` in its place; agent edits to `old` that have
     /// not been replayed yet go to `new`.
     pub fn record_replacement(&mut self, old: NodeId, new: NodeId) {
@@ -81,6 +89,19 @@ pub fn replay_live_patch(
     state: &mut LivePatchState,
     exec: &mut dyn FnMut(&mut Document, Command) -> Result<(), DocError>,
 ) -> Result<LivePatchReport, DocError> {
+    let leases = state.leases.clone();
+    replay_live_patch_with_leases(doc, patch, state, &leases, exec)
+}
+
+/// Replays `patch` on `doc` while enforcing `leases` (`RD-3 §3.2`) and stamping
+/// `plugin_data["designos:run"]` on every inserted or updated node (`RD-3 §3.4`).
+pub fn replay_live_patch_with_leases(
+    doc: &mut Document,
+    patch: &LivePatch,
+    state: &mut LivePatchState,
+    leases: &LeaseTable,
+    exec: &mut dyn FnMut(&mut Document, Command) -> Result<(), DocError>,
+) -> Result<LivePatchReport, DocError> {
     let mut report = LivePatchReport::default();
     if patch.v != LIVE_PATCH_VERSION {
         report.skipped.push(format!("unsupported live patch version {}", patch.v));
@@ -100,8 +121,19 @@ pub fn replay_live_patch(
         }
         state.base = patch.base;
     }
+    let run_id = patch.run_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
     for op in &patch.ops {
-        if let Some(cmd) = resolve(doc, op, state, &mut report) {
+        if !leases.is_empty() || run_id.is_some() {
+            let affected = AffectedSet::for_live_op(doc, op, |id| state.target(doc, id));
+            if let Err(violation) = leases.allows(run_id.unwrap_or(""), doc, &affected) {
+                report.skipped.push(violation.to_string());
+                continue;
+            }
+        }
+        if let Some(mut cmd) = resolve(doc, op, run_id, state, &mut report) {
+            if let Some(rid) = run_id {
+                stamp_command_authorship(&mut cmd, rid);
+            }
             if let Err(e) = exec(doc, cmd) {
                 *state = saved;
                 return Err(e);
@@ -112,7 +144,7 @@ pub fn replay_live_patch(
     Ok(report)
 }
 
-fn resolve(doc: &mut Document, op: &LiveOp, state: &mut LivePatchState, report: &mut LivePatchReport) -> Option<Command> {
+fn resolve(doc: &mut Document, op: &LiveOp, run_id: Option<&str>, state: &mut LivePatchState, report: &mut LivePatchReport) -> Option<Command> {
     match op {
         LiveOp::Insert { parent: agent_parent, at, nodes } => {
             let (parent, redirected) = resolve_id(&state.remap, &state.replaced, doc, *agent_parent);
@@ -123,7 +155,7 @@ fn resolve(doc: &mut Document, op: &LiveOp, state: &mut LivePatchState, report: 
                 ));
                 return None;
             }
-            resolve_insert(doc, parent, at, nodes, state, report)
+            resolve_insert(doc, parent, at, nodes, run_id, state, report)
         }
         LiveOp::Update { id: agent_id, set, unset } => {
             let (id, redirected) = resolve_id(&state.remap, &state.replaced, doc, *agent_id);
@@ -141,13 +173,16 @@ fn resolve(doc: &mut Document, op: &LiveOp, state: &mut LivePatchState, report: 
                 report.skipped.push(format!("update of missing node {}", id.0));
                 return None;
             };
-            let merged = match merge_fields(cur, set, unset) {
+            let mut merged = match merge_fields(cur, set, unset) {
                 Ok(n) => n,
                 Err(e) => {
                     report.skipped.push(format!("update of node {}: {e}", id.0));
                     return None;
                 }
             };
+            if let Some(rid) = run_id {
+                merged.plugin_data.insert(PLUGIN_DATA_RUN_KEY.to_string(), rid.to_string());
+            }
             if merged == *cur {
                 report.duplicates += 1;
                 return None;
@@ -252,6 +287,7 @@ fn resolve_insert(
     parent: NodeId,
     at: &SiblingHint,
     nodes: &[Node],
+    run_id: Option<&str>,
     state: &mut LivePatchState,
     report: &mut LivePatchReport,
 ) -> Option<Command> {
@@ -261,6 +297,11 @@ fn resolve_insert(
         return None;
     }
     let mut nodes: Vec<Node> = nodes.to_vec();
+    if let Some(rid) = run_id {
+        for n in &mut nodes {
+            n.plugin_data.insert(PLUGIN_DATA_RUN_KEY.to_string(), rid.to_string());
+        }
+    }
     remap_subtree(&mut nodes, &state.remap);
     // Before anything below reserves ids for it.
     if let Some(why) = insert_problem(doc, parent, &nodes) {

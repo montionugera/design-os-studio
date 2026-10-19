@@ -7,13 +7,17 @@
 //! them on its full document. Layout passes the agent runs on its partial copy are not commands,
 //! so they never reach the editor; the editor lays out the touched containers itself.
 
+pub mod lease;
 mod record;
 mod replay;
 mod replay_comments;
 mod validate;
 
+pub use lease::{
+    is_root_frame, is_within_frames, root_frame_of, stamp_command_authorship, AffectedSet, Lease, LeasePurpose, LeaseTable, LeaseViolation, PLUGIN_DATA_RUN_KEY,
+};
 pub use record::live_ops_for_command;
-pub use replay::{replay_live_patch, LivePatchReport, LivePatchState};
+pub use replay::{replay_live_patch, replay_live_patch_with_leases, LivePatchReport, LivePatchState};
 
 use crate::{Comment, CommentAnchor, CommentThread, Node, NodeId};
 use serde::{Deserialize, Serialize};
@@ -34,12 +38,15 @@ pub struct LivePatch {
     /// Optional undo-group label shown in Studio's History panel (e.g. `Agent: <run>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Identifier of the agent run (`$DESIGNOS_AGENT_RUN_ID`) that produced this patch (`RD-3` / `#572`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub ops: Vec<LiveOp>,
 }
 
 impl LivePatch {
     pub fn new(ops: Vec<LiveOp>) -> Self {
-        Self { v: LIVE_PATCH_VERSION, base: None, label: None, ops }
+        Self { v: LIVE_PATCH_VERSION, base: None, label: None, run_id: None, ops }
     }
 
     pub fn with_base(mut self, base: Option<u64>) -> Self {
@@ -49,6 +56,11 @@ impl LivePatch {
 
     pub fn with_label(mut self, label: Option<String>) -> Self {
         self.label = label;
+        self
+    }
+
+    pub fn with_run_id(mut self, run_id: Option<String>) -> Self {
+        self.run_id = run_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         self
     }
 }

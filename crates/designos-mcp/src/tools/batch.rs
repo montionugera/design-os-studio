@@ -612,26 +612,19 @@ fn resolve_node_ref(doc: &Document, alias_roots: &BTreeMap<String, NodeId>, r: &
     }
 }
 
-/// Checks RD-3 frame ownership lock when `engine.owned_frames` or `DESIGNOS_OWNED_FRAMES` is active (§13).
-fn check_lease_guard(doc: &Document, owned_frames: Option<&[NodeId]>, target: NodeId, op_idx: usize, op_name: &str) -> Result<(), String> {
-    let env_owned: Option<Vec<NodeId>> = std::env::var("DESIGNOS_OWNED_FRAMES")
-        .ok()
-        .map(|s| s.split(',').filter_map(|p| p.trim().parse::<u64>().ok()).filter(|&id| id > 0).map(NodeId).collect())
-        .filter(|v: &Vec<NodeId>| !v.is_empty());
-    let Some(frames) = owned_frames.or(env_owned.as_deref()) else {
-        return Ok(());
-    };
-    let allowed = frames.iter().any(|&f| f == target || doc.is_ancestor(f, target));
-    if !allowed {
-        return Err(op_failed_error(
-            op_idx,
-            op_name,
-            "OUTSIDE_OWNED_FRAMES",
-            &format!("/ops/{op_idx}"),
-            format!("node {} is outside this agent run's owned frames", target.0),
-        ));
-    }
-    Ok(())
+/// Checks RD-3 frame ownership lock when `engine.leases`, `engine.owned_frames`, or `DESIGNOS_OWNED_FRAMES` is active (§3.2, §13).
+fn check_lease_guard(
+    doc: &Document,
+    leases: &designos_doc::live_patch::LeaseTable,
+    owned_frames: Option<&[NodeId]>,
+    caller_run_id: Option<&str>,
+    target: NodeId,
+    op_idx: usize,
+    op_name: &str,
+    field: &str,
+) -> Result<(), String> {
+    let table = crate::tools::lease::effective_lease_table(leases, owned_frames, caller_run_id);
+    crate::tools::lease::check_batch_node_lease(doc, &table, caller_run_id, target, op_idx, op_name, field)
 }
 
 /// Finds the top-most non-Page container ancestor of `id` so auto-layout re-solves the affected
@@ -1096,6 +1089,8 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
     let mut touched_records: Vec<TouchedRootRecord> = Vec::with_capacity(ops.len());
 
     let default_page = engine.resolve_default_page().ok();
+    let caller_run_id = engine.effective_run_id();
+    let eff_leases = crate::tools::lease::effective_lease_table(&engine.leases, engine.owned_frames.as_deref(), caller_run_id.as_deref());
 
     for (op_idx, op) in ops.iter().enumerate() {
         let op_name = op.op_name();
@@ -1109,7 +1104,7 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
                     }
                     Some(r) => resolve_node_ref(&trial, &alias_roots, r, op_idx, op_name, "parent")?,
                 };
-                check_lease_guard(&trial, engine.owned_frames.as_deref(), parent, op_idx, op_name)?;
+                check_lease_guard(&trial, &engine.leases, engine.owned_frames.as_deref(), caller_run_id.as_deref(), parent, op_idx, op_name, "parent")?;
                 let pnode =
                     trial.get(parent).ok_or_else(|| op_failed_error(op_idx, op_name, "NODE_NOT_FOUND", &op_path, format!("node {} not found", parent.0)))?;
                 if !pnode.kind.is_container() {
@@ -1127,10 +1122,22 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
                 relayout_for_node(&mut trial, parent);
                 relayout_for_node(&mut trial, root_id);
 
-                let mut nodes = Vec::new();
                 let mut subtree_ids = BTreeSet::new();
                 trial.walk(root_id, |n, _| {
                     subtree_ids.insert(n.id);
+                });
+                if let Some(rid) = caller_run_id.as_deref() {
+                    for &sid in &subtree_ids {
+                        if let Some(n_mut) = trial.get_mut(sid) {
+                            n_mut.plugin_data.insert(
+                                designos_doc::live_patch::PLUGIN_DATA_RUN_KEY.to_string(),
+                                rid.to_string(),
+                            );
+                        }
+                    }
+                }
+                let mut nodes = Vec::new();
+                trial.walk(root_id, |n, _| {
                     nodes.push(n.clone());
                 });
                 if created_count + nodes.len() > MAX_BATCH_CREATED_NODES {
@@ -1170,7 +1177,7 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
                     None => default_page.ok_or_else(|| op_failed_error(op_idx, op_name, "NODE_NOT_FOUND", &op_path, "Document has no pages"))?,
                     Some(r) => resolve_node_ref(&trial, &alias_roots, r, op_idx, op_name, "parent")?,
                 };
-                check_lease_guard(&trial, engine.owned_frames.as_deref(), parent, op_idx, op_name)?;
+                check_lease_guard(&trial, &engine.leases, engine.owned_frames.as_deref(), caller_run_id.as_deref(), parent, op_idx, op_name, "parent")?;
                 if created_count + 1 > MAX_BATCH_CREATED_NODES {
                     return Err(batch_error(
                         "BATCH_TOO_LARGE",
@@ -1180,9 +1187,15 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
                         format!("batch creates over {MAX_BATCH_CREATED_NODES} nodes"),
                     ));
                 }
-                let (id, target_idx, node) =
+                let (id, target_idx, mut node) =
                     build_created_node(&mut trial, parent, a.index, &a.kind, a.name.clone(), a.text.clone(), a.x, a.y, a.width, a.height)
                         .map_err(|e| op_failed_error(op_idx, op_name, "INVALID_ARGUMENTS", &op_path, e))?;
+                if let Some(rid) = caller_run_id.as_deref() {
+                    node.plugin_data.insert(
+                        designos_doc::live_patch::PLUGIN_DATA_RUN_KEY.to_string(),
+                        rid.to_string(),
+                    );
+                }
 
                 let cmd = Command::Insert { parent, index: target_idx, nodes: vec![node] };
                 if recording_live {
@@ -1209,8 +1222,8 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
             }
             ParsedOp::Update(a) => {
                 let id = resolve_node_ref(&trial, &alias_roots, &a.node, op_idx, op_name, "node")?;
-                check_lease_guard(&trial, engine.owned_frames.as_deref(), id, op_idx, op_name)?;
-                let (updated_node, node_changed) = build_updated_node(
+                check_lease_guard(&trial, &engine.leases, engine.owned_frames.as_deref(), caller_run_id.as_deref(), id, op_idx, op_name, "node")?;
+                let (mut updated_node, node_changed) = build_updated_node(
                     &trial,
                     id,
                     UpdateFields {
@@ -1230,6 +1243,12 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
                     alias_roots.insert(alias.clone(), id);
                 }
                 if node_changed {
+                    if let Some(rid) = caller_run_id.as_deref() {
+                        updated_node.plugin_data.insert(
+                            designos_doc::live_patch::PLUGIN_DATA_RUN_KEY.to_string(),
+                            rid.to_string(),
+                        );
+                    }
                     let cmd = Command::Update { node: Box::new(updated_node) };
                     if recording_live {
                         let ops = live_ops_for_command(&trial, &cmd).map_err(|e| op_failed_error(op_idx, op_name, "INTERNAL_ERROR", &op_path, e))?;
@@ -1247,8 +1266,8 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
             ParsedOp::Move(a) => {
                 let id = resolve_node_ref(&trial, &alias_roots, &a.node, op_idx, op_name, "node")?;
                 let new_parent = resolve_node_ref(&trial, &alias_roots, &a.parent, op_idx, op_name, "parent")?;
-                check_lease_guard(&trial, engine.owned_frames.as_deref(), id, op_idx, op_name)?;
-                check_lease_guard(&trial, engine.owned_frames.as_deref(), new_parent, op_idx, op_name)?;
+                check_lease_guard(&trial, &engine.leases, engine.owned_frames.as_deref(), caller_run_id.as_deref(), id, op_idx, op_name, "node")?;
+                check_lease_guard(&trial, &engine.leases, engine.owned_frames.as_deref(), caller_run_id.as_deref(), new_parent, op_idx, op_name, "parent")?;
 
                 let cur_node = trial.get(id).ok_or_else(|| op_failed_error(op_idx, op_name, "NODE_NOT_FOUND", &op_path, format!("node {} not found", id.0)))?;
                 let Some(old_parent) = cur_node.parent else {
@@ -1259,7 +1278,7 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
                     .ok_or_else(|| op_failed_error(op_idx, op_name, "NODE_NOT_FOUND", &op_path, format!("node {} not found", new_parent.0)))?;
                 if !pnode.kind.is_container() {
                     return Err(op_failed_error(op_idx, op_name, "NOT_A_CONTAINER", &op_path, "parent must identify a container"));
-                }
+                };
                 if id == new_parent || trial.is_ancestor(id, new_parent) {
                     return Err(batch_error(
                         "MOVE_CYCLE",
@@ -1296,7 +1315,7 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
             }
             ParsedOp::Delete(a) => {
                 let id = resolve_node_ref(&trial, &alias_roots, &a.node, op_idx, op_name, "node")?;
-                check_lease_guard(&trial, engine.owned_frames.as_deref(), id, op_idx, op_name)?;
+                check_lease_guard(&trial, &engine.leases, engine.owned_frames.as_deref(), caller_run_id.as_deref(), id, op_idx, op_name, "node")?;
                 let cur_node = trial.get(id).ok_or_else(|| op_failed_error(op_idx, op_name, "NODE_NOT_FOUND", &op_path, format!("node {} not found", id.0)))?;
                 let Some(former_parent) = cur_node.parent else {
                     return Err(op_failed_error(op_idx, op_name, "PAGE_ROOT_PROTECTED", &op_path, "page roots cannot be deleted by this tool"));
@@ -1323,6 +1342,15 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
                 touched_records.push(TouchedRootRecord { op: op_idx, node_id: former_parent, before_bounds: parent_bounds_before });
             }
             ParsedOp::SetVariables(a) => {
+                if !eff_leases.leases.is_empty() {
+                    if let Some(caller) = caller_run_id.as_deref() {
+                        let mut affected = designos_doc::live_patch::AffectedSet::new();
+                        affected.add_shared_path(op_path.clone());
+                        if let Err(v) = eff_leases.allows(caller, &trial, &affected) {
+                            return Err(crate::tools::lease::format_lease_violation(&trial, &v, &op_path));
+                        }
+                    }
+                }
                 let (cmd_opt, count) = apply_set_variables_op(&trial, a, op_idx)?;
                 if let Some(cmd) = cmd_opt {
                     if recording_live {
@@ -1347,8 +1375,24 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
                 touched_records.push(TouchedRootRecord { op: op_idx, node_id: root_node, before_bounds });
             }
             ParsedOp::SetStyle(a) => {
+                if !eff_leases.leases.is_empty() && (!a.upsert.is_empty() || !a.delete.is_empty()) {
+                    if let Some(caller) = caller_run_id.as_deref() {
+                        let mut affected = designos_doc::live_patch::AffectedSet::new();
+                        affected.add_shared_path(op_path.clone());
+                        if let Err(v) = eff_leases.allows(caller, &trial, &affected) {
+                            return Err(crate::tools::lease::format_lease_violation(&trial, &v, &op_path));
+                        }
+                    }
+                }
+                for link in &a.apply {
+                    let nid = resolve_node_ref(&trial, &alias_roots, &link.node, op_idx, op_name, "apply")?;
+                    check_lease_guard(&trial, &engine.leases, engine.owned_frames.as_deref(), caller_run_id.as_deref(), nid, op_idx, op_name, "apply")?;
+                }
                 let (cmds, count, first_node) = apply_set_style_op(&trial, &alias_roots, a, op_idx)?;
-                for cmd in cmds {
+                for mut cmd in cmds {
+                    if let Some(rid) = caller_run_id.as_deref() {
+                        designos_doc::live_patch::stamp_command_authorship(&mut cmd, rid);
+                    }
                     if recording_live {
                         let ops = live_ops_for_command(&trial, &cmd).map_err(|e| op_failed_error(op_idx, op_name, "INTERNAL_ERROR", &op_path, e))?;
                         recorded_live_ops.extend(ops);
@@ -1405,7 +1449,10 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
     // Step 4: Dry run returns the trial result without committing or publishing (§3.2.4).
     // Step 5 & Edge case 5: Empty effective change skips commit, undo entry, and patch line (§8.5).
     if !batch_args.dry_run && !collected_cmds.is_empty() && changed.any() {
-        engine.history.exec(&mut engine.doc, Command::Batch(collected_cmds)).map_err(|e| batch_error("INTERNAL_ERROR", None, None, "", e.to_string()))?;
+        engine
+            .history
+            .exec_for_run(&mut engine.doc, Command::Batch(collected_cmds), caller_run_id, Some(undo_label.clone()))
+            .map_err(|e| batch_error("INTERNAL_ERROR", None, None, "", e.to_string()))?;
         for target in &relayout_targets {
             relayout_for_node(&mut engine.doc, *target);
         }
@@ -2147,7 +2194,7 @@ mod tests {
             let (doc, page, target_board) = build_synthetic_document(target_nodes);
             let approx_doc_bytes = doc.nodes.len() * std::mem::size_of::<Node>();
             let mut engine =
-                Engine { doc, history: Default::default(), active_page_id: Some(page), live_ops: None, live_patch_label: None, owned_frames: None };
+                Engine { doc, history: Default::default(), active_page_id: Some(page), live_ops: None, live_patch_label: None, owned_frames: None, run_id: None, leases: Default::default() };
 
             let pre_hash = batch_state_hash(&engine.doc, &[page, target_board]);
             let pre_len = engine.doc.nodes.len();

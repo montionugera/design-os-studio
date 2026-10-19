@@ -25,6 +25,10 @@ pub struct LiveSessionBridge {
     /// Append-only log of [`LivePatch`] lines the editor replays (`doc-patch.jsonl`).
     pub live_doc_patch_path: Option<PathBuf>,
     pub last_canvas_mtime: Option<std::time::SystemTime>,
+    /// Agent run identifier (`DESIGNOS_AGENT_RUN_ID`) when running inside a Studio agent PTY.
+    pub run_id: Option<String>,
+    /// Lead agent run identifier (`DESIGNOS_LEAD_RUN_ID`) for the Studio session.
+    pub lead_run_id: Option<String>,
     /// Document switches announced in the log so far.
     doc_epoch: u64,
     /// The editor was not told about the current document: edits must not reach its log until it is.
@@ -42,10 +46,16 @@ impl LiveSessionBridge {
         let env_spec = std::env::var_os("DESIGNOS_LIVE_SPEC").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty());
         let env_ctx = std::env::var_os("DESIGNOS_CONTEXT_JSON").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty());
         let env_patch = std::env::var_os("DESIGNOS_LIVE_DOC_PATCH").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty());
+        let run_id = std::env::var("DESIGNOS_AGENT_RUN_ID").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let lead_run_id = std::env::var("DESIGNOS_LEAD_RUN_ID").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
 
         let any_env = session_dir.is_some() || env_canvas.is_some() || env_doc_sync.is_some() || env_spec.is_some() || env_ctx.is_some() || env_patch.is_some();
         if !any_env {
-            return Self::default();
+            return Self {
+                run_id,
+                lead_run_id,
+                ..Self::default()
+            };
         }
 
         let live_canvas_path = env_canvas
@@ -71,6 +81,8 @@ impl LiveSessionBridge {
             context_json_path,
             live_doc_patch_path,
             last_canvas_mtime: None,
+            run_id,
+            lead_run_id,
             doc_epoch: 0,
             doc_unannounced: false,
         }
@@ -79,6 +91,8 @@ impl LiveSessionBridge {
     /// Creates a `LiveSessionBridge` bound to a specific per-file `session_dir` (`/tmp/designos-sessions/<session_id>`).
     pub fn for_session_dir(session_dir: &Path) -> Self {
         let dir = session_dir.to_path_buf();
+        let run_id = std::env::var("DESIGNOS_AGENT_RUN_ID").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let lead_run_id = std::env::var("DESIGNOS_LEAD_RUN_ID").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         Self {
             live_canvas_path: Some(dir.join("canvas.designos")),
             live_doc_sync_path: Some(dir.join("doc-sync.designos")),
@@ -87,6 +101,8 @@ impl LiveSessionBridge {
             live_doc_patch_path: Some(dir.join("doc-patch.jsonl")),
             session_dir: Some(dir),
             last_canvas_mtime: None,
+            run_id,
+            lead_run_id,
             doc_epoch: 0,
             doc_unannounced: false,
         }
@@ -117,6 +133,7 @@ pub struct Session {
     root: PathBuf,
     dirty: bool,
     pub bridge: LiveSessionBridge,
+    pub lease_guard: crate::tools::lease::LeaseGuard,
     /// Undo history was dropped because the editor's canvas replaced the document.
     history_dropped: bool,
 }
@@ -171,7 +188,17 @@ impl Session {
         if !root.is_dir() {
             return Err("Workspace must be a directory".into());
         }
-        let mut s = Self { engine: Engine::default(), root, dirty: false, history_dropped: false, bridge: LiveSessionBridge::from_env() };
+        let bridge = LiveSessionBridge::from_env();
+        let lease_guard = crate::tools::lease::LeaseGuard::new(bridge.session_dir.clone());
+        let mut s = Self {
+            engine: Engine::default(),
+            root,
+            dirty: false,
+            history_dropped: false,
+            bridge,
+            lease_guard,
+        };
+        s.engine.leases = s.lease_guard.table.clone();
         s.record_live_ops();
         s.sync_from_live_canvas_if_newer();
         Ok(s)
@@ -183,10 +210,36 @@ impl Session {
         if !root.is_dir() {
             return Err("Workspace must be a directory".into());
         }
-        let mut s = Self { engine: Engine::default(), root, dirty: false, history_dropped: false, bridge: LiveSessionBridge::for_session_dir(session_dir) };
+        let bridge = LiveSessionBridge::for_session_dir(session_dir);
+        let lease_guard = crate::tools::lease::LeaseGuard::new(bridge.session_dir.clone());
+        let mut s = Self {
+            engine: Engine::default(),
+            root,
+            dirty: false,
+            history_dropped: false,
+            bridge,
+            lease_guard,
+        };
+        s.engine.leases = s.lease_guard.table.clone();
         s.record_live_ops();
         s.sync_from_live_canvas_if_newer();
         Ok(s)
+    }
+
+    pub fn effective_run_id(&self) -> Option<String> {
+        self.bridge
+            .run_id
+            .clone()
+            .or_else(|| self.engine.effective_run_id())
+    }
+
+    pub fn effective_lead_run_id(&self) -> Option<String> {
+        self.bridge.lead_run_id.clone().or_else(|| {
+            std::env::var("DESIGNOS_LEAD_RUN_ID")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
     }
 
     /// Reloads `self.engine.doc` from `live_canvas_path` if `design:os studio` wrote a newer canvas
@@ -263,7 +316,8 @@ impl Session {
             return self.publish_live_doc_sync().map_err(|e| format!("the editor still shows the previous document: {e}"));
         }
         let base = self.bridge.last_canvas_mtime.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos() as u64);
-        let line = live_patch_line(&LivePatch::new(ops).with_base(base).with_label(label), MAX_LIVE_PATCH_LINE_BYTES)?;
+        let run_id = self.effective_run_id();
+        let line = live_patch_line(&LivePatch::new(ops).with_base(base).with_label(label).with_run_id(run_id), MAX_LIVE_PATCH_LINE_BYTES)?;
         let path = path.clone();
         append_log_line(&path, &line)
     }
@@ -388,7 +442,93 @@ impl Session {
 
     pub fn call(&mut self, name: &str, args: Value) -> Result<Value, String> {
         self.sync_from_live_canvas_if_newer();
+        self.lease_guard.session_dir = self.bridge.session_dir.clone();
+        self.lease_guard.reload_if_needed();
+        self.engine.leases = self.lease_guard.table.clone();
+        self.engine.run_id = self.effective_run_id();
+
+        let is_mutating_tool = matches!(
+            name,
+            "designos_open_file"
+                | "designos_new_document"
+                | "designos_create_node"
+                | "designos_update_node"
+                | "designos_delete_node"
+                | "designos_apply_spec"
+                | "designos_apply_batch"
+                | "designos_add_comment"
+                | "designos_reply_comment"
+                | "designos_resolve_comment"
+                | "designos_set_dev_status"
+                | "designos_undo"
+                | "designos_redo"
+        );
+        if is_mutating_tool {
+            let caller = self.effective_run_id();
+            let eff_table = crate::tools::lease::effective_lease_table(
+                &self.lease_guard.table,
+                self.engine.owned_frames.as_deref(),
+                caller.as_deref(),
+            );
+            crate::tools::lease::check_tool_write_guard(
+                &self.engine.doc,
+                &self.engine.history,
+                self.engine.resolve_default_page().ok(),
+                &eff_table,
+                caller.as_deref(),
+                name,
+                &args,
+            )?;
+        }
+
         match name {
+            "designos_spawn_agents" => {
+                let caller = self.effective_run_id();
+                let lead = self.effective_lead_run_id();
+                let res = crate::tools::agents::spawn_agents(
+                    &mut self.engine,
+                    &mut self.lease_guard,
+                    caller.as_deref(),
+                    lead.as_deref(),
+                    args,
+                )?;
+                if res.get("changed").and_then(Value::as_bool) == Some(true) {
+                    self.publish_live_patch()?;
+                    self.dirty = true;
+                }
+                Ok(res)
+            }
+            "designos_assign_frames" => {
+                let caller = self.effective_run_id();
+                let lead = self.effective_lead_run_id();
+                crate::tools::agents::assign_frames(
+                    &mut self.engine,
+                    &mut self.lease_guard,
+                    caller.as_deref(),
+                    lead.as_deref(),
+                    args,
+                )
+            }
+            "designos_list_agents" => {
+                let _: serde_json::Map<String, Value> = parse(args)?;
+                crate::tools::agents::list_agents(&self.engine, &mut self.lease_guard)
+            }
+            "designos_stop_agents" => {
+                let caller = self.effective_run_id();
+                let lead = self.effective_lead_run_id();
+                let res = crate::tools::agents::stop_agents(
+                    &mut self.engine,
+                    &mut self.lease_guard,
+                    caller.as_deref(),
+                    lead.as_deref(),
+                    args,
+                )?;
+                if res.get("changed").and_then(Value::as_bool) == Some(true) {
+                    self.publish_live_patch()?;
+                    self.dirty = true;
+                }
+                Ok(res)
+            }
             "designos_open_file" => {
                 let a: OpenArgs = parse(args)?;
                 if self.dirty && !a.discard_changes {
@@ -415,6 +555,8 @@ impl Session {
                 self.engine = Engine::default();
                 self.engine.active_page_id = doc.pages.first().copied();
                 self.engine.doc = doc;
+                self.engine.leases = self.lease_guard.table.clone();
+                self.engine.run_id = self.effective_run_id();
                 self.record_live_ops();
                 self.dirty = false;
                 self.publish_live_doc_sync()
@@ -439,6 +581,8 @@ impl Session {
                 }
                 self.engine = Engine::default();
                 self.engine.doc.name = a.name;
+                self.engine.leases = self.lease_guard.table.clone();
+                self.engine.run_id = self.effective_run_id();
                 self.record_live_ops();
                 self.dirty = true;
                 self.publish_live_doc_sync()

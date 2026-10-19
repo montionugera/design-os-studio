@@ -1,6 +1,9 @@
-//! Shared tool validation helpers and batched transaction dispatcher (`tools::batch`).
+//! Shared tool validation helpers, batched transaction dispatcher (`tools::batch`),
+//! frame lease write guard (`tools::lease`), and multi-agent orchestration (`tools::agents`).
 
+pub mod agents;
 pub mod batch;
+pub mod lease;
 
 use designos_doc::{Document, Node, NodeId, NodeKind, Rect, TextStyle};
 

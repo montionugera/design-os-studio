@@ -15,17 +15,44 @@ pub struct Engine {
     pub live_patch_label: Option<String>,
     /// Optional RD-3 frame ownership lock: when `Some`, writes outside these root frames are refused.
     pub owned_frames: Option<Vec<NodeId>>,
+    /// Active RD-3 agent `run_id` (`DESIGNOS_AGENT_RUN_ID`) when running as a Studio agent.
+    pub run_id: Option<String>,
+    /// Active RD-3 frame lease table (`leases.json`).
+    pub leases: designos_doc::live_patch::LeaseTable,
 }
 
 impl Default for Engine {
     fn default() -> Self {
         let mut doc = Document::new("Untitled");
         let page = doc.add_page("Page 1");
-        Self { doc, history: History::default(), active_page_id: Some(page), live_ops: None, live_patch_label: None, owned_frames: None }
+        let run_id = std::env::var("DESIGNOS_AGENT_RUN_ID")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        Self {
+            doc,
+            history: History::default(),
+            active_page_id: Some(page),
+            live_ops: None,
+            live_patch_label: None,
+            owned_frames: None,
+            run_id,
+            leases: designos_doc::live_patch::LeaseTable::default(),
+        }
     }
 }
 
 impl Engine {
+    /// Returns the active agent `run_id` (`self.run_id` or `DESIGNOS_AGENT_RUN_ID`).
+    pub fn effective_run_id(&self) -> Option<String> {
+        self.run_id.clone().or_else(|| {
+            std::env::var("DESIGNOS_AGENT_RUN_ID")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+    }
+
     /// Resolves the target page when a tool call omits `parent_id` / `page_id`:
     /// prefers `self.active_page_id` (the user's currently selected page in `design:os studio`)
     /// if valid in `self.doc.pages`, falling back to `self.doc.pages.first()`.
@@ -40,6 +67,35 @@ impl Engine {
         // Nothing here drains the lazy layout queue between calls, so no tool may start from, read,
         // or serialize a document with deferred layout still in it.
         self.settle_layout();
+        if matches!(
+            name,
+            "designos_create_node"
+                | "designos_update_node"
+                | "designos_delete_node"
+                | "designos_apply_spec"
+                | "designos_add_comment"
+                | "designos_reply_comment"
+                | "designos_resolve_comment"
+                | "designos_set_dev_status"
+                | "designos_undo"
+                | "designos_redo"
+        ) {
+            let caller = self.effective_run_id();
+            let eff_table = crate::tools::lease::effective_lease_table(
+                &self.leases,
+                self.owned_frames.as_deref(),
+                caller.as_deref(),
+            );
+            crate::tools::lease::check_tool_write_guard(
+                &self.doc,
+                &self.history,
+                self.resolve_default_page().ok(),
+                &eff_table,
+                caller.as_deref(),
+                name,
+                &args,
+            )?;
+        }
         match name {
             "designos_get_document" => {
                 let _: Empty = parse(args)?;
@@ -415,11 +471,38 @@ impl Engine {
         self.doc.get(NodeId(id)).ok_or_else(|| format!("node {id} not found"))
     }
 
-    pub(crate) fn exec(&mut self, command: Command) -> Result<(), String> {
+    pub(crate) fn exec(&mut self, mut command: Command) -> Result<(), String> {
+        let rid = self.effective_run_id();
+        if let Some(r) = rid.as_deref() {
+            designos_doc::live_patch::stamp_command_authorship(&mut command, r);
+        }
         let ops = self.live_ops_for(&command)?;
-        self.history.exec(&mut self.doc, command).map_err(|e| e.to_string())?;
+        self.history
+            .exec_for_run(&mut self.doc, command, rid, self.live_patch_label.clone())
+            .map_err(|e| e.to_string())?;
         self.record(ops);
         Ok(())
+    }
+
+    /// Reverts all undo steps belonging to `run_id` in reverse order and records the live ops.
+    pub fn undo_run_and_record(&mut self, run_id: &str) -> Result<usize, String> {
+        let mut cmds_in_rev_order = Vec::new();
+        let steps = self.history.undo_steps();
+        let metas = self.history.undo_metas();
+        for idx in (0..steps.len()).rev() {
+            if metas.get(idx).and_then(|m| m.run_id.as_deref()) == Some(run_id) {
+                cmds_in_rev_order.push(steps[idx].clone());
+            }
+        }
+        if cmds_in_rev_order.is_empty() {
+            return Ok(0);
+        }
+        let batch_cmd = Command::Batch(cmds_in_rev_order);
+        let ops = self.live_ops_for(&batch_cmd)?;
+        let count = self.history.undo_run(&mut self.doc, run_id).map_err(|e| e.to_string())?;
+        self.settle_layout();
+        self.record(ops);
+        Ok(count)
     }
 
     /// The ops `command` will perform, when recording; refuses edits the editor cannot replay.
@@ -746,6 +829,7 @@ pub fn tools() -> Vec<Value> {
     add("undo", "Undo the latest successful edit in this session; returns changed=false if the stack is empty.", json!({}), vec![], false, false);
     add("redo", "Redo the most recently undone edit in this session; returns changed=false if the stack is empty.", json!({}), vec![], false, false);
     out.push(crate::tools::batch::tool_descriptor());
+    out.extend(crate::tools::agents::tool_descriptors());
     out
 }
 

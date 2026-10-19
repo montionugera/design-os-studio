@@ -67,7 +67,7 @@ macro_rules! codex_mcp_overrides {
             " -c 'mcp_servers.designos.args=[\"--workspace\",\"'\"$DESIGNOS_WORKSPACE\"'\"]'",
             " -c 'mcp_servers.designos.env_vars=[\"DESIGNOS_SESSION_DIR\",\"DESIGNOS_LIVE_CANVAS\",\"DESIGNOS_LIVE_DOC_SYNC\",",
             "\"DESIGNOS_LIVE_DOC_PATCH\",\"DESIGNOS_LIVE_SPEC\",\"DESIGNOS_CONTEXT_JSON\",\"DESIGNOS_TARGET_PAGE_ID\",",
-            "\"DESIGNOS_TARGET_PAGE_NAME\",\"DESIGNOS_DOC_NAME\",\"DESIGNOS_FILE\"]'"
+            "\"DESIGNOS_TARGET_PAGE_NAME\",\"DESIGNOS_DOC_NAME\",\"DESIGNOS_FILE\",\"DESIGNOS_AGENT_RUN_ID\",\"DESIGNOS_LEAD_RUN_ID\"]'"
         )
     };
 }
@@ -256,6 +256,8 @@ pub struct SessionEnv {
     pub current_page_id: u64,
     pub current_page_name: String,
     pub doc_name: String,
+    pub agent_run_id: String,
+    pub lead_run_id: String,
 }
 
 impl SessionEnv {
@@ -277,6 +279,8 @@ impl SessionEnv {
             current_page_id: 1,
             current_page_name: "Page 1".to_string(),
             doc_name: "Untitled".to_string(),
+            agent_run_id: "r-lead".to_string(),
+            lead_run_id: "r-lead".to_string(),
         }
     }
 }
@@ -292,7 +296,7 @@ pub fn build_real_cli_command(preset: AgentCliPreset, prompt: &str, live_spec: &
     let live_canvas = session_dir.join("canvas.designos");
     let context_json = session_dir.join("context.json");
     let env_prefix = format!(
-        "DESIGNOS_AGENT_RUNTIME='{}' DESIGNOS_SESSION_DIR='{}' DESIGNOS_MCP_CONFIG='{}' DESIGNOS_LIVE_SPEC='{}' DESIGNOS_LIVE_DOC_SYNC='{}' DESIGNOS_LIVE_CANVAS='{}' DESIGNOS_CONTEXT_JSON='{}' DESIGNOS_SELECTION_JSON='{}'",
+        "DESIGNOS_AGENT_RUNTIME='{}' DESIGNOS_AGENT_RUN_ID='r-lead' DESIGNOS_LEAD_RUN_ID='r-lead' DESIGNOS_SESSION_DIR='{}' DESIGNOS_MCP_CONFIG='{}' DESIGNOS_LIVE_SPEC='{}' DESIGNOS_LIVE_DOC_SYNC='{}' DESIGNOS_LIVE_CANVAS='{}' DESIGNOS_CONTEXT_JSON='{}' DESIGNOS_SELECTION_JSON='{}'",
         preset.binary_name(),
         session_dir.display(),
         mcp_config.display(),
@@ -351,6 +355,62 @@ pub enum TerminalAction {
     /// `selection.spec.json` and pipes its path + node summary +
     /// unresolved Canvas Pin-Comments directly into the active PTY stdin.
     ExportSelectionToTerminal,
+    /// Rolls back all undo steps recorded by `run_id` and releases its frame leases (`RD-3 §3.4`).
+    RollbackAgentRun {
+        run_id: String,
+        reason: String,
+    },
+}
+
+/// Status and ownership entry for a parallel designer agent run (`RD-3 §6.2`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentRunEntry {
+    pub run_id: String,
+    pub label: String,
+    pub runtime: String,
+    pub frames: Vec<u64>,
+    pub purpose: designos_doc::live_patch::LeasePurpose,
+    pub status: String,
+    #[serde(default)]
+    pub edits: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Request written by `designos-mcp` to `<session_dir>/spawn-requests.jsonl` (`RD-3 §4.1`).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum SpawnControlRequest {
+    Spawn {
+        request_id: String,
+        run_id: String,
+        name: String,
+        runtime: String,
+        frames: Vec<NodeId>,
+        purpose: designos_doc::live_patch::LeasePurpose,
+        prompt: String,
+        bootstrap_path: String,
+        #[serde(default)]
+        critic_runtime: Option<String>,
+    },
+    Stop {
+        request_id: String,
+        run_ids: Vec<String>,
+        #[serde(default)]
+        rollback: bool,
+    },
+}
+
+/// Confirmation written by Studio to `<session_dir>/spawn-results.jsonl` (`RD-3 §4.1`).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct SpawnControlResult {
+    request_id: String,
+    run_id: String,
+    status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 /// Orca 3-tier live agent execution status (`Working` / `WaitingForInput` / `Done` / `Idle`).
@@ -372,6 +432,8 @@ pub struct TerminalTab {
     /// Process kind at spawn. Never mutated afterwards: `preset` is relabelled by
     /// `set_active_runtime` / `submit_chat_prompt` and does not reflect the real process.
     pub spawn_preset: AgentCliPreset,
+    /// Agent run identifier (`r-lead`, `r-1`, `r-2`, ...) bound to this PTY tab (`RD-3 §3.1`).
+    pub run_id: Option<String>,
     pub parser: Arc<Mutex<vt100::Parser>>,
     pub writer: Box<dyn Write + Send>,
     pub master: Box<dyn MasterPty + Send>,
@@ -522,6 +584,7 @@ impl TerminalTab {
             title: format!("{} #{}", preset.button_label(), id),
             preset,
             spawn_preset: preset,
+            run_id: session.map(|s| s.agent_run_id.clone()),
             parser,
             writer,
             master: pair.master,
@@ -679,6 +742,18 @@ pub struct TerminalState {
     pub search_query: String,
     /// Whether `Cmd+F` terminal search is case-sensitive (`Aa`).
     pub search_case_sensitive: bool,
+    /// Run identifier of the lead agent tab (`"r-lead"` by default, `RD-3 §3.1`).
+    pub lead_run_id: String,
+    /// Active frame lease table mirrored from `<session_dir>/leases.json` (`RD-3 §3.2`).
+    pub leases: designos_doc::live_patch::LeaseTable,
+    /// Monotonically increasing lease epoch (`RD-3 §3.2`).
+    pub lease_epoch: u64,
+    /// Parallel designer agent runs tracked in the Agents panel (`RD-3 §6.2`).
+    pub agent_runs: Vec<AgentRunEntry>,
+    /// Byte offset read from `<session_dir>/spawn-requests.jsonl`.
+    pub spawn_requests_offset: u64,
+    /// Last observed mtime of `<session_dir>/leases.json`.
+    pub last_leases_mtime: Option<std::time::SystemTime>,
 }
 
 impl Default for TerminalState {
@@ -752,6 +827,12 @@ impl TerminalState {
             search_open: false,
             search_query: String::new(),
             search_case_sensitive: false,
+            lead_run_id: "r-lead".to_string(),
+            leases: designos_doc::live_patch::LeaseTable::default(),
+            lease_epoch: 0,
+            agent_runs: Vec::new(),
+            spawn_requests_offset: 0,
+            last_leases_mtime: None,
         }
     }
 
@@ -772,10 +853,25 @@ impl TerminalState {
         self.last_watched_mtime = std::fs::metadata(&self.live_spec_path).and_then(|m| m.modified()).ok();
         self.live_patch = crate::live_patch_log::LivePatchLog::bind(self.session_dir.join("doc-patch.jsonl"));
         self.last_synced_key = None;
+        self.leases = designos_doc::live_patch::LeaseTable::default();
+        self.lease_epoch = 0;
+        self.agent_runs.clear();
+        self.spawn_requests_offset = 0;
+        self.last_leases_mtime = None;
     }
 
     /// Builds a [`SessionEnv`] snapshot for this terminal state's per-file session.
     pub fn session_env(&self) -> SessionEnv {
+        self.session_env_for_run(&self.lead_run_id)
+    }
+
+    /// Builds a [`SessionEnv`] snapshot bound to a specific `agent_run_id` (`RD-3 §3.1`).
+    pub fn session_env_for_run(&self, agent_run_id: &str) -> SessionEnv {
+        let mcp_config_path = if agent_run_id == self.lead_run_id || agent_run_id.trim().is_empty() {
+            self.session_dir.join("mcp-config.json")
+        } else {
+            self.session_dir.join(format!("mcp-config-{agent_run_id}.json"))
+        };
         SessionEnv {
             session_id: self.session_id.clone(),
             session_dir: self.session_dir.clone(),
@@ -784,12 +880,14 @@ impl TerminalState {
             live_canvas_path: self.live_canvas_path.clone(),
             context_json_path: self.context_json_path.clone(),
             selection_spec_path: self.selection_spec_path.clone(),
-            mcp_config_path: self.session_dir.join("mcp-config.json"),
+            mcp_config_path,
             hooks_json_path: self.session_dir.join("hooks.json"),
             skill_md_path: self.session_dir.join("SKILL.md"),
             current_page_id: self.current_page_id,
             current_page_name: self.current_page_name.clone(),
             doc_name: self.doc_name.clone(),
+            agent_run_id: if agent_run_id.trim().is_empty() { self.lead_run_id.clone() } else { agent_run_id.to_string() },
+            lead_run_id: self.lead_run_id.clone(),
         }
     }
 
@@ -854,11 +952,10 @@ impl TerminalState {
         }
     }
 
-    fn provision_session_agent_files(&self, file_path: Option<&Path>) {
+    fn build_mcp_config_json(&self, file_path: Option<&Path>, run_id: &str) -> serde_json::Value {
         let mcp_bin = designos_mcp_binary();
         let workspace_dir = session_workspace_dir(file_path);
-
-        let mcp_config = serde_json::json!({
+        serde_json::json!({
             "mcpServers": {
                 "designos": {
                     "command": mcp_bin.display().to_string(),
@@ -873,11 +970,17 @@ impl TerminalState {
                         "DESIGNOS_TARGET_PAGE_ID": self.current_page_id.to_string(),
                         "DESIGNOS_TARGET_PAGE_NAME": self.current_page_name,
                         "DESIGNOS_DOC_NAME": self.doc_name,
-                        "DESIGNOS_FILE": file_path.map(|p| p.display().to_string()).unwrap_or_default()
+                        "DESIGNOS_FILE": file_path.map(|p| p.display().to_string()).unwrap_or_default(),
+                        "DESIGNOS_AGENT_RUN_ID": run_id,
+                        "DESIGNOS_LEAD_RUN_ID": self.lead_run_id,
                     }
                 }
             }
-        });
+        })
+    }
+
+    fn provision_session_agent_files(&self, file_path: Option<&Path>) {
+        let mcp_config = self.build_mcp_config_json(file_path, &self.lead_run_id);
         let mcp_config_path = self.session_dir.join("mcp-config.json");
         if let Ok(bytes) = serde_json::to_vec_pretty(&mcp_config) {
             let _ = atomic_write_session_file(&mcp_config_path, &bytes);
@@ -1274,11 +1377,374 @@ impl TerminalState {
         self.tabs.get(idx)
     }
 
+    /// Returns `(run_id, display_label, status)` for the sub-agent currently owning `frame_id` (`RD-3 §7`).
+    /// Hidden (`None`) when no parallel runs exist, so single-agent work looks unchanged.
+    pub fn active_owner_pill_info(&self, frame_id: NodeId) -> Option<(String, String, String)> {
+        let lease = self.leases.owner_of_frame(frame_id)?;
+        let has_parallel = !self.agent_runs.is_empty() || self.leases.leases.len() > 1 || lease.run_id != self.lead_run_id;
+        if !has_parallel {
+            return None;
+        }
+        let run_entry = self.agent_runs.iter().find(|r| r.run_id == lease.run_id);
+        let raw_label = if let Some(entry) = run_entry {
+            if !entry.label.trim().is_empty() {
+                entry.label.trim().to_string()
+            } else {
+                lease.run_id.clone()
+            }
+        } else {
+            lease.run_id.clone()
+        };
+        let display_label = raw_label.trim_start_matches('@').to_string();
+        let status = run_entry.map(|r| r.status.clone()).unwrap_or_else(|| "running".to_string());
+        Some((lease.run_id.clone(), display_label, status))
+    }
+
+    /// Increments the edit counter for `run_id` when a `LivePatch` with that `run_id` is applied (`RD-3 §6.2`).
+    pub fn note_run_edit(&mut self, run_id: &str) {
+        if run_id.trim().is_empty() {
+            return;
+        }
+        if let Some(entry) = self.agent_runs.iter_mut().find(|r| r.run_id == run_id) {
+            entry.edits += 1;
+        } else if let Some(lease) = self.leases.get(run_id) {
+            self.agent_runs.push(AgentRunEntry {
+                run_id: run_id.to_string(),
+                label: run_id.to_string(),
+                runtime: self.active_runtime.binary_name().to_string(),
+                frames: lease.frames.iter().map(|f| f.0).collect(),
+                purpose: lease.purpose.clone(),
+                status: "running".to_string(),
+                edits: 1,
+                tab_id: None,
+                error: None,
+            });
+        }
+    }
+
+    /// Updates the status of `run_id` in `self.agent_runs` and persists `<session_dir>/agents.json`.
+    pub fn mark_run_status(&mut self, run_id: &str, status: &str) {
+        if let Some(entry) = self.agent_runs.iter_mut().find(|r| r.run_id == run_id) {
+            entry.status = status.to_string();
+        }
+        self.update_agents_json_status(run_id, status);
+    }
+
+    /// Releases the lease for `run_id`, kills any sub-agent PTY tab bound to `run_id`, and marks the run
+    /// as `failed · rolled back` (`RD-3 §3.4`).
+    pub fn finish_run_rollback(&mut self, run_id: &str, reverted_steps: usize) {
+        for tab in &mut self.tabs {
+            if tab.run_id.as_deref() == Some(run_id) {
+                let _ = tab.child.kill();
+                tab.exited_notice_shown = true;
+            }
+        }
+        if self.leases.release(run_id).is_some() {
+            self.lease_epoch += 1;
+            self.live_patch.state.leases = self.leases.clone();
+            self.persist_leases_to_disk();
+        }
+        let reason_str = format!("reverted {reverted_steps} steps");
+        if let Some(entry) = self.agent_runs.iter_mut().find(|r| r.run_id == run_id) {
+            entry.status = "failed \u{00b7} rolled back".to_string();
+            entry.error = Some(reason_str);
+        } else {
+            self.agent_runs.push(AgentRunEntry {
+                run_id: run_id.to_string(),
+                label: run_id.to_string(),
+                runtime: self.active_runtime.binary_name().to_string(),
+                frames: Vec::new(),
+                purpose: designos_doc::live_patch::LeasePurpose::Split,
+                status: "failed \u{00b7} rolled back".to_string(),
+                edits: 0,
+                tab_id: None,
+                error: Some(reason_str),
+            });
+        }
+        self.update_agents_json_status(run_id, "rolled_back");
+    }
+
+    /// Stops a running sub-agent (`run_id`), kills its PTY tab, and releases its frame lease (`RD-3 §4.4`).
+    pub fn stop_agent_run(&mut self, run_id: &str) {
+        for tab in &mut self.tabs {
+            if tab.run_id.as_deref() == Some(run_id) {
+                let _ = tab.child.kill();
+                tab.exited_notice_shown = true;
+            }
+        }
+        if self.leases.release(run_id).is_some() {
+            self.lease_epoch += 1;
+            self.live_patch.state.leases = self.leases.clone();
+            self.persist_leases_to_disk();
+        }
+        self.mark_run_status(run_id, "stopped");
+    }
+
+    /// Reloads `<session_dir>/leases.json` into `self.leases` whenever its mtime advances (`RD-3 §3.2`).
+    pub fn reload_leases_from_disk(&mut self) {
+        let path = self.session_dir.join("leases.json");
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return;
+        };
+        let Ok(mtime) = meta.modified() else {
+            return;
+        };
+        let should_reload = match self.last_leases_mtime {
+            Some(prev) => mtime > prev,
+            None => true,
+        };
+        if should_reload {
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                if let Ok(table) = serde_json::from_str::<designos_doc::live_patch::LeaseTable>(&raw) {
+                    self.leases = table;
+                    self.lease_epoch += 1;
+                    self.live_patch.state.leases = self.leases.clone();
+                    self.last_leases_mtime = Some(mtime);
+                }
+            }
+        }
+    }
+
+    fn persist_leases_to_disk(&mut self) {
+        let path = self.session_dir.join("leases.json");
+        if let Ok(bytes) = serde_json::to_vec_pretty(&self.leases) {
+            let _ = atomic_write_session_file(&path, &bytes);
+            self.last_leases_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        }
+    }
+
+    fn update_agents_json_status(&self, run_id: &str, new_status: &str) {
+        let path = self.session_dir.join("agents.json");
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return;
+        };
+        if let Some(arr) = val.get_mut("agents").and_then(|v| v.as_array_mut()) {
+            for item in arr {
+                if item.get("run_id").and_then(|v| v.as_str()) == Some(run_id) {
+                    if let Some(obj) = item.as_object_mut() {
+                        obj.insert("status".to_string(), serde_json::Value::String(new_status.to_string()));
+                    }
+                }
+            }
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(&val) {
+            let _ = atomic_write_session_file(&path, &bytes);
+        }
+    }
+
+    fn sync_agents_from_disk(&mut self) {
+        let path = self.session_dir.join("agents.json");
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return;
+        };
+        let Some(arr) = val.get("agents").and_then(|v| v.as_array()) else {
+            return;
+        };
+        for item in arr {
+            let Some(run_id) = item.get("run_id").and_then(|v| v.as_str()) else { continue };
+            if run_id == self.lead_run_id || item.get("lead").and_then(|v| v.as_bool()).unwrap_or(false) {
+                continue;
+            }
+            let label = item.get("name").and_then(|v| v.as_str()).unwrap_or(run_id).to_string();
+            let runtime = item.get("runtime").and_then(|v| v.as_str()).unwrap_or("claude").to_string();
+            let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("running").to_string();
+            let frames: Vec<u64> = item
+                .get("frames")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_u64()).collect())
+                .unwrap_or_default();
+            let purpose = item
+                .get("purpose")
+                .and_then(|v| serde_json::from_value::<designos_doc::live_patch::LeasePurpose>(v.clone()).ok())
+                .unwrap_or(designos_doc::live_patch::LeasePurpose::Split);
+
+            if let Some(existing) = self.agent_runs.iter_mut().find(|r| r.run_id == run_id) {
+                existing.label = label;
+                existing.runtime = runtime;
+                existing.frames = frames;
+                existing.purpose = purpose;
+                if !existing.status.contains("rolled back") {
+                    existing.status = status;
+                }
+            } else {
+                self.agent_runs.push(AgentRunEntry {
+                    run_id: run_id.to_string(),
+                    label,
+                    runtime,
+                    frames,
+                    purpose,
+                    status,
+                    edits: 0,
+                    tab_id: None,
+                    error: None,
+                });
+            }
+        }
+    }
+
+    fn append_spawn_result(&self, result: &SpawnControlResult) {
+        let path = self.session_dir.join("spawn-results.jsonl");
+        if let Ok(line) = serde_json::to_string(result) {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                let _ = writeln!(f, "{line}");
+                let _ = f.flush();
+            }
+        }
+    }
+
+    fn process_spawn_requests(&mut self, actions: &mut Vec<TerminalAction>) {
+        let req_path = self.session_dir.join("spawn-requests.jsonl");
+        let Ok(bytes) = std::fs::read(&req_path) else {
+            return;
+        };
+        let start = (self.spawn_requests_offset as usize).min(bytes.len());
+        if start >= bytes.len() {
+            return;
+        }
+        let slice = &bytes[start..];
+        let Some(last_nl) = slice.iter().rposition(|&b| b == b'\n') else {
+            return;
+        };
+        let complete = &slice[..=last_nl];
+        self.spawn_requests_offset = (start + complete.len()) as u64;
+
+        let text = String::from_utf8_lossy(complete);
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(req) = serde_json::from_str::<SpawnControlRequest>(trimmed) else {
+                continue;
+            };
+            match req {
+                SpawnControlRequest::Spawn {
+                    request_id,
+                    run_id,
+                    name,
+                    runtime,
+                    frames,
+                    purpose,
+                    prompt,
+                    bootstrap_path,
+                    ..
+                } => {
+                    let lease = designos_doc::live_patch::Lease::new(
+                        run_id.clone(),
+                        frames.clone(),
+                        purpose.clone(),
+                    );
+                    let _ = self.leases.grant(lease);
+                    self.live_patch.state.leases = self.leases.clone();
+                    self.persist_leases_to_disk();
+
+                    let mut spawned_tab_id = None;
+                    let spawn_pty = !cfg!(test) && std::env::var_os("DESIGNOS_SKIP_SUBAGENT_PTY").is_none();
+                    if spawn_pty {
+                        let preset = match runtime.as_str() {
+                            "codex" => AgentCliPreset::Codex,
+                            "claude" => AgentCliPreset::Claude,
+                            _ => AgentCliPreset::Shell,
+                        };
+                        let mcp_cfg = self.build_mcp_config_json(None, &run_id);
+                        let run_mcp_path = self.session_dir.join(format!("mcp-config-{run_id}.json"));
+                        if let Ok(cfg_bytes) = serde_json::to_vec_pretty(&mcp_cfg) {
+                            let _ = atomic_write_session_file(&run_mcp_path, &cfg_bytes);
+                        }
+                        let env = self.session_env_for_run(&run_id);
+                        let tab_id = self.next_tab_id.max(1);
+                        self.next_tab_id = tab_id + 1;
+                        let bootstrap_arg = if !bootstrap_path.is_empty() { bootstrap_path } else { prompt };
+                        let _ = bootstrap_arg;
+                        if let Ok(mut tab) = TerminalTab::spawn_with_session(tab_id, preset, 28, 100, None, Some(&env)) {
+                            tab.title = format!("@{name} ({run_id})");
+                            tab.run_id = Some(run_id.clone());
+                            spawned_tab_id = Some(tab.id);
+                            self.tabs.push(tab);
+                        }
+                    }
+
+                    let frame_u64s: Vec<u64> = frames.iter().map(|f| f.0).collect();
+                    if let Some(existing) = self.agent_runs.iter_mut().find(|r| r.run_id == run_id) {
+                        existing.label = name;
+                        existing.runtime = runtime;
+                        existing.frames = frame_u64s;
+                        existing.purpose = purpose;
+                        existing.status = "running".to_string();
+                        if spawned_tab_id.is_some() {
+                            existing.tab_id = spawned_tab_id;
+                        }
+                    } else {
+                        self.agent_runs.push(AgentRunEntry {
+                            run_id: run_id.clone(),
+                            label: name,
+                            runtime,
+                            frames: frame_u64s,
+                            purpose,
+                            status: "running".to_string(),
+                            edits: 0,
+                            tab_id: spawned_tab_id,
+                            error: None,
+                        });
+                    }
+
+                    self.append_spawn_result(&SpawnControlResult {
+                        request_id,
+                        run_id,
+                        status: "running".to_string(),
+                        error: None,
+                    });
+                }
+                SpawnControlRequest::Stop {
+                    request_id,
+                    run_ids,
+                    rollback,
+                } => {
+                    for rid in run_ids {
+                        if rollback {
+                            self.finish_run_rollback(&rid, 0);
+                            actions.push(TerminalAction::RollbackAgentRun {
+                                run_id: rid.clone(),
+                                reason: "stopped with rollback".to_string(),
+                            });
+                            self.append_spawn_result(&SpawnControlResult {
+                                request_id: request_id.clone(),
+                                run_id: rid,
+                                status: "rolled_back".to_string(),
+                                error: None,
+                            });
+                        } else {
+                            self.stop_agent_run(&rid);
+                            self.append_spawn_result(&SpawnControlResult {
+                                request_id: request_id.clone(),
+                                run_id: rid,
+                                status: "stopped".to_string(),
+                                error: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Live bridge polling (`<50ms` hot-apply):
     /// 1. Polls `self.live_spec_path` (`live-spec.json`) and `/tmp/designos-live-agent-out.spec.json` -> `TerminalAction::ApplySpecFile(...)`
-    /// 2. Polls `doc-patch.jsonl` (agent edits and document switches written by `designos-mcp`) -> `TerminalAction::ApplyLiveLog(...)`
+    /// 2. Syncs `leases.json`, `agents.json`, and `spawn-requests.jsonl` (`RD-3`)
+    /// 3. Polls `doc-patch.jsonl` (agent edits and document switches written by `designos-mcp`) -> `TerminalAction::ApplyLiveLog(...)`
     pub fn poll_live_agent_bridge(&mut self) -> Vec<TerminalAction> {
         let mut actions = Vec::new();
+
+        // Channel 0 (RD-3): Reload frame leases, agent run state, and process any spawn/stop requests
+        self.reload_leases_from_disk();
+        self.sync_agents_from_disk();
+        self.process_spawn_requests(&mut actions);
 
         // Channel 1: Scoped live-spec.json
         let live_spec = self.live_spec_path.clone();
@@ -1316,6 +1782,7 @@ impl TerminalState {
 
         // Channel 2: doc-patch.jsonl (written by designos-mcp tools). Edits and document switches
         // share this one log, so their order is the log's order.
+        self.live_patch.state.leases = self.leases.clone();
         let (lines, errors) = self.live_patch.poll();
         for err in errors {
             self.status_msg = Some(err.clone());
@@ -1338,6 +1805,8 @@ impl TerminalState {
         }
 
         let mut agent_exited = false;
+        let mut exited_subagents: Vec<(String, Option<u32>)> = Vec::new();
+        let lead_id = self.lead_run_id.clone();
         for tab in &mut self.tabs {
             if tab.is_shell_process() || tab.exited_notice_shown {
                 continue;
@@ -1354,6 +1823,26 @@ impl TerminalState {
                 tab.title.push_str(" (exited)");
                 tab.exited_notice_shown = true;
                 agent_exited = true;
+                if let Some(rid) = &tab.run_id {
+                    if rid != &lead_id {
+                        exited_subagents.push((rid.clone(), exit_code));
+                    }
+                }
+            }
+        }
+        for (rid, exit_code) in exited_subagents {
+            if exit_code.unwrap_or(0) != 0 {
+                actions.push(TerminalAction::RollbackAgentRun {
+                    run_id: rid,
+                    reason: format!("sub-agent exited with code {}", exit_code.unwrap_or(1)),
+                });
+            } else {
+                if self.leases.release(&rid).is_some() {
+                    self.lease_epoch += 1;
+                    self.live_patch.state.leases = self.leases.clone();
+                    self.persist_leases_to_disk();
+                }
+                self.mark_run_status(&rid, "done");
             }
         }
         if agent_exited {
@@ -2298,9 +2787,13 @@ pub fn configure_pty_env_with_session(cmd: &mut CommandBuilder, preset: AgentCli
         cmd.env("DESIGNOS_TARGET_PAGE_ID", sess.current_page_id.to_string());
         cmd.env("DESIGNOS_TARGET_PAGE_NAME", &sess.current_page_name);
         cmd.env("DESIGNOS_DOC_NAME", &sess.doc_name);
+        cmd.env("DESIGNOS_AGENT_RUN_ID", &sess.agent_run_id);
+        cmd.env("DESIGNOS_LEAD_RUN_ID", &sess.lead_run_id);
     } else {
         cmd.env("DESIGNOS_LIVE_SPEC", "/tmp/designos-live-agent-out.spec.json");
         cmd.env("DESIGNOS_SELECTION_JSON", "/tmp/designos-live-selection.spec.json");
+        cmd.env("DESIGNOS_AGENT_RUN_ID", "r-lead");
+        cmd.env("DESIGNOS_LEAD_RUN_ID", "r-lead");
     }
 
     if let Ok(exe) = std::env::current_exe() {
@@ -2464,6 +2957,114 @@ pub fn export_selection_and_comments_to_pty(
     Ok(state.selection_spec_path.clone())
 }
 
+/// Renders the compact `Runs` list (`28px` rows, `theme::INSET_FRAME = 8px` horizontal padding,
+/// `1px` `theme::BORDER` separator) above the terminal viewport in the Agents panel (`RD-3 §6.2`).
+fn render_agent_runs_list(
+    state: &mut TerminalState,
+    ui: &mut Ui,
+    p: &Painter,
+    rect: Rect,
+    start_y: f32,
+    actions: &mut Vec<TerminalAction>,
+) -> f32 {
+    if state.agent_runs.is_empty() {
+        return start_y;
+    }
+    let mut cur_y = start_y;
+    let runs_snapshot = state.agent_runs.clone();
+    let mut stop_run: Option<String> = None;
+    let mut undo_run: Option<String> = None;
+    let mut focus_tab_id: Option<usize> = None;
+
+    for run in &runs_snapshot {
+        let row_r = Rect::from_min_size(
+            Pos2::new(rect.left(), cur_y),
+            Vec2::new(rect.width(), theme::AGENT_RUN_ROW_H),
+        );
+        cur_y += theme::AGENT_RUN_ROW_H;
+        p.rect_filled(row_r, 0.0, TERM_BG_ELEVATED);
+        widgets::hline(p, row_r.left(), row_r.right(), row_r.bottom() - theme::BORDER_WIDTH, theme::BORDER);
+
+        let dot_col = theme::owner_color_for_run(&run.run_id);
+        let dot_x = row_r.left() + theme::INSET_FRAME + theme::AGENT_RUN_DOT_RADIUS;
+        p.circle_filled(Pos2::new(dot_x, row_r.center().y), theme::AGENT_RUN_DOT_RADIUS, dot_col);
+
+        let mut right_edge = row_r.right() - theme::INSET_FRAME;
+        let can_undo = run.edits > 0 && !run.status.contains("rolled back");
+        if can_undo {
+            let undo_x = right_edge - theme::AGENT_RUN_UNDO_W;
+            let undo_y = row_r.top() + theme::AGENT_RUN_BTN_INSET_Y;
+            let undo_r = Rect::from_min_size(
+                Pos2::new(undo_x, undo_y),
+                Vec2::new(theme::AGENT_RUN_UNDO_W, theme::AGENT_RUN_TARGET_SIZE),
+            );
+            let undo_resp = ui.interact(undo_r, Id::new(("agent-run-undo", &run.run_id)), Sense::click());
+            let bg = if undo_resp.hovered() { TERM_BG_HOVER } else { TERM_BG_BAR };
+            p.rect_filled(undo_r, theme::cr(theme::RADIUS_CONTROL), bg);
+            p.rect_stroke(undo_r, theme::cr(theme::RADIUS_CONTROL), Stroke::new(theme::BORDER_WIDTH, TERM_BORDER), StrokeKind::Inside);
+            p.text(undo_r.center(), Align2::CENTER_CENTER, "Undo", theme::font_caption_medium(), theme::TEXT);
+            widgets::record(ui, &format!("agent-run-undo-{}", run.run_id), undo_r);
+            if undo_resp.clicked() {
+                undo_run = Some(run.run_id.clone());
+            }
+            right_edge = undo_r.left() - theme::SPACE_FACT;
+        }
+
+        let is_running = run.status == "running" || run.status == "working";
+        if is_running {
+            let stop_x = right_edge - theme::AGENT_RUN_TARGET_SIZE;
+            let stop_y = row_r.top() + theme::AGENT_RUN_BTN_INSET_Y;
+            let stop_r = Rect::from_min_size(
+                Pos2::new(stop_x, stop_y),
+                Vec2::splat(theme::AGENT_RUN_TARGET_SIZE),
+            );
+            let stop_resp = ui.interact(stop_r, Id::new(("agent-run-stop", &run.run_id)), Sense::click());
+            let bg = if stop_resp.hovered() { STATUS_BAD_BG } else { TERM_BG_BAR };
+            p.rect_filled(stop_r, theme::cr(theme::RADIUS_CONTROL), bg);
+            p.rect_stroke(stop_r, theme::cr(theme::RADIUS_CONTROL), Stroke::new(theme::BORDER_WIDTH, TERM_BORDER), StrokeKind::Inside);
+            icons::paint(p, Icon::Close, stop_r.center(), theme::SPACE_INLINE, STATUS_BAD_TEXT);
+            widgets::record(ui, &format!("agent-run-stop-{}", run.run_id), stop_r);
+            if stop_resp.clicked() {
+                stop_run = Some(run.run_id.clone());
+            }
+            right_edge = stop_r.left() - theme::SPACE_FACT;
+        }
+
+        let text_x = row_r.left() + theme::INSET_FRAME + theme::SPACE_GROUP;
+        let hit_r = Rect::from_min_max(row_r.min, Pos2::new(right_edge.max(text_x), row_r.max.y));
+        let row_resp = ui.interact(hit_r, Id::new(("agent-run-row", &run.run_id)), Sense::click());
+        let frames_str = run.frames.iter().map(|f| format!("#{f}")).collect::<Vec<_>>().join(",");
+        let display_name = if run.label.starts_with('@') { run.label.clone() } else { format!("@{}", run.label) };
+        let summary = format!("{display_name} [{frames_str}] \u{00b7} {} \u{00b7} {} edits", run.status, run.edits);
+        let avail_w = (right_edge - text_x).max(theme::SPACE_BLOCK);
+        let elided = widgets::elide(p, &summary, &theme::font_caption(), avail_w);
+        p.text(Pos2::new(text_x, row_r.center().y), Align2::LEFT_CENTER, elided, theme::font_caption(), theme::TEXT);
+        widgets::record(ui, &format!("agent-run-row-{}", run.run_id), row_r);
+        if row_resp.clicked() {
+            if let Some(tid) = run.tab_id {
+                focus_tab_id = Some(tid);
+            }
+        }
+    }
+
+    if let Some(tid) = focus_tab_id {
+        if let Some(idx) = state.tabs.iter().position(|t| t.id == tid) {
+            state.active_tab = idx;
+            state.viewport_focused = true;
+        }
+    }
+    if let Some(rid) = stop_run {
+        state.stop_agent_run(&rid);
+    }
+    if let Some(rid) = undo_run {
+        actions.push(TerminalAction::RollbackAgentRun {
+            run_id: rid,
+            reason: "undone from Agents panel".to_string(),
+        });
+    }
+    cur_y
+}
+
 /// Renders the 1:1 Figma Desktop `126.9.13` `Agents` Left Side Panel (`New chat / Shared` header,
 /// dismissible AI credits banner, CLI Runtime Selector Bar (`Claude` | `Codex` | `Antigravity` | `Shell`),
 /// pure Chat UI wrapper over the live PTY shell (`DIR-21`), `What's next?` empty state, bottom
@@ -2609,8 +3210,10 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
         p.circle_filled(Pos2::new(ctx_r.left() + 10.0, ctx_r.center().y), 2.5, STATUS_INFO_TEXT);
         p.text(Pos2::new(ctx_r.left() + 17.0, ctx_r.center().y), Align2::LEFT_CENTER, ctx_elided, theme::font_caption(), STATUS_INFO_TEXT);
 
+        let vp_top = render_agent_runs_list(state, ui, &p, rect, ctx_r.bottom(), &mut actions);
+
         // Live VT100 PTY Terminal Viewport (full height)
-        let vp_r = Rect::from_min_max(Pos2::new(rect.left(), ctx_r.bottom()), rect.max);
+        let vp_r = Rect::from_min_max(Pos2::new(rect.left(), vp_top), rect.max);
 
         render_vt100_viewport(state, ui, vp_r, "agents-left-pty");
         if let Some(fix) = state.pending_start_fix.take() {
@@ -2770,7 +3373,7 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
     if pty_toggle_resp.clicked() {
         state.side_panel_pty_open = !state.side_panel_pty_open;
     }
-    top_y = rt_bar_r.bottom();
+    top_y = render_agent_runs_list(state, ui, &p, rect, rt_bar_r.bottom(), &mut actions);
 
     // ---- D. Bottom Docked `"Ask for changes"` Composer Box (`96px` height, `12px` margin)
     let comp_margin = 12.0;
