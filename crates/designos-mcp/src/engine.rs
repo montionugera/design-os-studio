@@ -472,6 +472,7 @@ impl Engine {
             }
             "designos_apply_batch" => crate::tools::batch::apply(self, args),
             "designos_configure_session" => self.session_options.apply_patch(args),
+            "designos_get_guidelines" | "get_guidelines" => crate::tools::guidelines::call_get_guidelines(&self.doc, args),
             "designos_undo" | "designos_redo" => {
                 let _: Empty = parse(args)?;
                 let undo = name == "designos_undo";
@@ -886,6 +887,18 @@ pub fn tools() -> Vec<Value> {
             "include_ignored": {"type": "boolean", "default": false},
             "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
             "cursor": {"type": "string"}
+        }),
+        vec![],
+        true,
+        true,
+    );
+    add(
+        "get_guidelines",
+        "List available design guideline topics or return the guideline document for a topic ('design-system', surface guides, 'archetypes', 'archetype:<id>', or 'rules').",
+        json!({
+            "topic":{"type":"string"},
+            "platform":{"type":"string","enum":["web","ios","android"],"default":"web"},
+            "max_tokens":{"type":"integer","minimum":500,"maximum":25000,"default":8000}
         }),
         vec![],
         true,

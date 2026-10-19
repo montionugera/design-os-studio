@@ -1,7 +1,9 @@
 //! Shared tool validation helpers, batched transaction dispatcher (`tools::batch`),
-//! per-call lint issues block (`tools::issues`), and session options (`tools::session_options`).
+//! per-call lint issues block (`tools::issues`), session options (`tools::session_options`),
+//! and guidelines (`tools::guidelines`).
 
 pub mod batch;
+pub mod guidelines;
 pub mod issues;
 pub mod session_options;
 
