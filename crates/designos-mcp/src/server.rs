@@ -1,6 +1,10 @@
 //! Workspace-scoped file session exposed over the official MCP SDK.
 use crate::engine::{parse, Engine};
 use crate::tools::errors::{tool_output_schema, ErrorCode, ToolError};
+use crate::tools::ledger::{
+    corrected_example_with_new_key, extract_and_strip_idempotency_key, extract_live_and_gone, is_idempotent_write_tool, now_ms, payload_hash,
+    CallLedgerDecision, Ledger, LedgerEntry, LEDGER_FILE_NAME,
+};
 use designos_doc::live_patch::{DocEpoch, LivePatch, MAX_LIVE_PATCH_LINE_BYTES};
 use rmcp::{model::*, service::RequestContext, ErrorData, RoleServer, ServerHandler};
 use serde::Deserialize;
@@ -127,6 +131,10 @@ pub struct Session {
     pub max_live_patch_bytes: usize,
     /// When `true`, `designos_undo` / `designos_redo` after a live canvas reload return `Err(HistoryDropped)`.
     pub strict_history_dropped: bool,
+    /// Session-scoped idempotency ledger (`E15-6`).
+    pub ledger: Ledger,
+    /// Protocol-level `_meta` produced by the most recent `call` (e.g. `{"designos/idempotent_replay": true}`).
+    pub last_call_meta: Option<serde_json::Map<String, Value>>,
 }
 
 #[derive(Deserialize)]
@@ -185,9 +193,14 @@ impl Session {
             disabled_tools: BTreeSet::new(),
             max_live_patch_bytes: MAX_LIVE_PATCH_LINE_BYTES,
             strict_history_dropped: false,
+            ledger: Ledger::new(),
+            last_call_meta: None,
         };
         s.record_live_ops();
         s.sync_from_live_canvas_if_newer();
+        if let Some(dir) = s.bridge.session_dir.as_ref() {
+            s.ledger = Ledger::load_from_path(dir.join(LEDGER_FILE_NAME));
+        }
         Ok(s)
     }
 
@@ -206,9 +219,12 @@ impl Session {
             disabled_tools: BTreeSet::new(),
             max_live_patch_bytes: MAX_LIVE_PATCH_LINE_BYTES,
             strict_history_dropped: false,
+            ledger: Ledger::new(),
+            last_call_meta: None,
         };
         s.record_live_ops();
         s.sync_from_live_canvas_if_newer();
+        s.ledger = Ledger::load_from_path(session_dir.join(LEDGER_FILE_NAME));
         Ok(s)
     }
 
@@ -245,6 +261,7 @@ impl Session {
                                     self.engine.history = designos_doc::History::default();
                                     self.history_dropped = true;
                                 }
+                                self.ledger.clear();
                                 self.bridge.last_canvas_mtime = Some(mtime);
                             }
                         }
@@ -475,6 +492,7 @@ impl Session {
     }
 
     pub fn call(&mut self, name: &str, args: Value) -> Result<Value, ToolError> {
+        self.last_call_meta = None;
         self.sync_from_live_canvas_if_newer();
         if self.disabled_tools.contains(name) {
             return Err(ToolError::new(ErrorCode::ToolDisabled, "", format!("Tool `{name}` is disabled in the active tool pack"))
@@ -499,7 +517,19 @@ impl Session {
         }
     }
 
-    fn call_inner(&mut self, name: &str, args: Value, files_created: &mut usize) -> Result<Value, ToolError> {
+    pub fn call_with_meta(&mut self, name: &str, args: Value) -> Result<(Value, Option<serde_json::Map<String, Value>>), ToolError> {
+        let val = self.call(name, args)?;
+        Ok((val, self.last_call_meta.clone()))
+    }
+
+    pub fn call_tool_result(&mut self, name: &str, args: Value) -> CallToolResult {
+        match self.call(name, args) {
+            Ok(value) => CallToolResult::structured(value).with_meta(self.last_call_meta.clone().map(MetaObject)),
+            Err(err) => CallToolResult::structured_error(err.to_json_value()),
+        }
+    }
+
+    fn call_inner(&mut self, name: &str, mut args: Value, files_created: &mut usize) -> Result<Value, ToolError> {
         match name {
             "designos_open_file" => {
                 let a: OpenArgs = parse(args)?;
@@ -543,6 +573,7 @@ impl Session {
                 self.engine = Engine { revision: next_rev, active_page_id: doc.pages.first().copied(), doc, ..Engine::default() };
                 self.record_live_ops();
                 self.dirty = false;
+                self.ledger.clear();
                 self.publish_live_doc_sync().map_err(|e| {
                     ToolError::new(
                         ErrorCode::EditorNotNotified,
@@ -583,6 +614,7 @@ impl Session {
                 self.engine.doc.name = a.name;
                 self.record_live_ops();
                 self.dirty = true;
+                self.ledger.clear();
                 self.publish_live_doc_sync().map_err(|e| {
                     ToolError::new(
                         ErrorCode::EditorNotNotified,
@@ -704,6 +736,58 @@ impl Session {
                         | "designos_redo"
                 );
                 let is_dry_run_req = name == "designos_apply_batch" && args.get("dry_run").and_then(Value::as_bool) == Some(true);
+
+                let idempotent_tool = is_idempotent_write_tool(name);
+                let raw_args = if idempotent_tool { args.clone() } else { Value::Null };
+                let idempotency_key = if idempotent_tool { extract_and_strip_idempotency_key(&mut args)? } else { None };
+
+                if let Some(ref key) = idempotency_key {
+                    let hash = payload_hash(name, &args);
+                    if is_dry_run_req {
+                        if let Some(original_tool) = self.ledger.check_mismatch(key, name, hash) {
+                            return Err(ToolError::new(
+                                ErrorCode::IdempotencyKeyReused,
+                                "/idempotency_key",
+                                format!("Key {key} was used for a different {original_tool} payload."),
+                            )
+                            .with_received(json!(key))
+                            .with_corrected_example(corrected_example_with_new_key(&raw_args, key)));
+                        }
+                    } else {
+                        match self.ledger.check_call(key, name, hash, self.engine.history.undo_depth(), &self.engine.doc) {
+                            CallLedgerDecision::Replay(reply) => {
+                                let mut meta = serde_json::Map::new();
+                                meta.insert("designos/idempotent_replay".to_string(), json!(true));
+                                self.last_call_meta = Some(meta);
+                                return Ok(reply);
+                            }
+                            CallLedgerDecision::Reused { original_tool } => {
+                                return Err(ToolError::new(
+                                    ErrorCode::IdempotencyKeyReused,
+                                    "/idempotency_key",
+                                    format!("Key {key} was used for a different {original_tool} payload."),
+                                )
+                                .with_received(json!(key))
+                                .with_corrected_example(corrected_example_with_new_key(&raw_args, key)));
+                            }
+                            CallLedgerDecision::Stale => {
+                                return Err(ToolError::new(
+                                    ErrorCode::IdempotencyKeyStale,
+                                    "/idempotency_key",
+                                    format!("Key {key} is stale because its write was undone or is no longer present in the document."),
+                                )
+                                .with_received(json!(key))
+                                .with_corrected_example(corrected_example_with_new_key(&raw_args, key)));
+                            }
+                            CallLedgerDecision::Absent => {}
+                        }
+                    }
+                }
+
+                let pre_write_undo_depth = self.engine.history.undo_depth();
+                let pre_node_ids: BTreeSet<u64> =
+                    if idempotency_key.is_some() { self.engine.doc.nodes.keys().map(|id| id.0).collect() } else { BTreeSet::new() };
+
                 let live = mutating && !is_dry_run_req && self.bridge.live_doc_patch_path.is_some();
                 // What a failed write to the editor rolls back to. Undo and redo revert each other.
                 let snapshot = (live && !matches!(name, "designos_undo" | "designos_redo")).then(|| EditSnapshot {
@@ -712,7 +796,7 @@ impl Session {
                     redo_steps: self.engine.history.redo_steps(),
                     revision: self.engine.revision,
                 });
-                let mut result = self.engine.call(name, args)?;
+                let mut result = self.engine.call(name, args.clone())?;
                 let is_dry_run = result.get("dry_run").and_then(Value::as_bool) == Some(true);
                 let changed = !is_dry_run
                     && match result.get("changed") {
@@ -728,6 +812,17 @@ impl Session {
                     }
                     self.dirty = true;
                     self.history_dropped = false;
+                    match name {
+                        "designos_undo" => {
+                            self.ledger.on_undo(self.engine.history.undo_depth());
+                        }
+                        "designos_redo" => {
+                            self.ledger.on_redo(self.engine.history.undo_depth());
+                        }
+                        _ => {
+                            self.ledger.mark_dead_above(pre_write_undo_depth);
+                        }
+                    }
                 } else if matches!(name, "designos_undo" | "designos_redo") && self.history_dropped {
                     if let Some(obj) = result.as_object_mut() {
                         obj.insert(
@@ -736,6 +831,28 @@ impl Session {
                         );
                     }
                 }
+
+                if let Some(key) = idempotency_key {
+                    if !is_dry_run {
+                        let hash = payload_hash(name, &args);
+                        let (live_nodes, gone_nodes) = extract_live_and_gone(name, &args, &result, &pre_node_ids, &self.engine.doc);
+                        let undo_depth = if changed { Some(self.engine.history.undo_depth()) } else { Some(pre_write_undo_depth) };
+                        self.ledger.store(LedgerEntry {
+                            key,
+                            tool: name.to_string(),
+                            hash,
+                            undo_depth,
+                            auto_fix_undo_depth: None,
+                            dead: false,
+                            live: live_nodes,
+                            gone: gone_nodes,
+                            reply: result.clone(),
+                            pre_auto_fix_reply: None,
+                            created_ms: now_ms(),
+                        });
+                    }
+                }
+
                 Ok(result)
             }
         }
@@ -810,6 +927,23 @@ impl DesignOSServer {
             .lock()
             .map_err(|_| ToolError::new(ErrorCode::InternalError, "", "Session unavailable; restart the MCP server").with_safe_to_retry(false))?
             .call(name, args)
+    }
+
+    pub fn call_with_meta(&self, name: &str, args: Value) -> Result<(Value, Option<serde_json::Map<String, Value>>), ToolError> {
+        self.session
+            .lock()
+            .map_err(|_| ToolError::new(ErrorCode::InternalError, "", "Session unavailable; restart the MCP server").with_safe_to_retry(false))?
+            .call_with_meta(name, args)
+    }
+
+    pub fn call_tool_result(&self, name: &str, args: Value) -> CallToolResult {
+        match self.session.lock() {
+            Ok(mut session) => session.call_tool_result(name, args),
+            Err(_) => {
+                let err = ToolError::new(ErrorCode::InternalError, "", "Session unavailable; restart the MCP server").with_safe_to_retry(false);
+                CallToolResult::structured_error(err.to_json_value())
+            }
+        }
     }
 }
 
@@ -917,16 +1051,7 @@ impl ServerHandler for DesignOSServer {
         Ok(ListToolsResult { tools: tools(), ..Default::default() })
     }
     async fn call_tool(&self, request: CallToolRequestParams, _: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
-        let result = self
-            .session
-            .lock()
-            .map_err(|_| ToolError::new(ErrorCode::InternalError, "", "Session unavailable; restart the MCP server").with_safe_to_retry(false))
-            .and_then(|mut session| session.call(&request.name, Value::Object(request.arguments.unwrap_or_default())));
-        Ok(match result {
-            Ok(value) => CallToolResult::structured(value),
-            Err(err) => CallToolResult::structured_error(err.to_json_value()),
-        }
-        .into())
+        Ok(self.call_tool_result(&request.name, Value::Object(request.arguments.unwrap_or_default())).into())
     }
 }
 
@@ -1761,6 +1886,25 @@ mod tests {
         record(s.call("designos_update_node", json!({"node_id": other_f, "name": "Blocked"})).unwrap_err(), ErrorCode::OutsideOwnedFrames, true);
         s.engine.owned_frames = None;
 
+        // 54. IdempotencyKeyReused
+        s.call("designos_create_node", json!({"parent_id": tok_page.0, "kind": "frame", "name": "IdempOrig", "idempotency_key": "fixture-key-1"})).unwrap();
+        record(
+            s.call("designos_create_node", json!({"parent_id": tok_page.0, "kind": "frame", "name": "IdempChanged", "idempotency_key": "fixture-key-1"}))
+                .unwrap_err(),
+            ErrorCode::IdempotencyKeyReused,
+            true,
+        );
+
+        // 55. IdempotencyKeyStale
+        s.call("designos_create_node", json!({"parent_id": tok_page.0, "kind": "frame", "name": "IdempToUndo", "idempotency_key": "fixture-key-2"})).unwrap();
+        s.call("designos_undo", json!({})).unwrap();
+        record(
+            s.call("designos_create_node", json!({"parent_id": tok_page.0, "kind": "frame", "name": "IdempToUndo", "idempotency_key": "fixture-key-2"}))
+                .unwrap_err(),
+            ErrorCode::IdempotencyKeyStale,
+            true,
+        );
+
         for code in ErrorCode::ALL {
             assert!(seen.contains(code.as_str()), "ErrorCode::{code:?} ({}) was not covered by every_code_has_a_fixture", code.as_str());
         }
@@ -1768,5 +1912,608 @@ mod tests {
 
         let _ = fs::remove_dir_all(&ws_dir);
         let _ = fs::remove_dir_all(&sess_dir);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // E15-6: Idempotency keys on mutating tools (§10 test plan)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    fn temp_test_dirs(tag: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "designos-e15-6-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let ws = base.join("ws");
+        let sess = base.join("sess");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&sess).unwrap();
+        (ws, sess)
+    }
+
+    #[test]
+    fn same_key_same_payload_applies_once() {
+        let (ws, sess) = temp_test_dirs("same-key");
+        let mut s = Session::with_session_dir(&ws, &sess).unwrap();
+        let page = s.engine.doc.pages[0].0;
+        let initial_count = s.engine.doc.nodes.len();
+
+        let payload = json!({
+            "idempotency_key": "k1",
+            "ops": [{"op": "create", "parent": page, "kind": "rectangle", "name": "Tag"}]
+        });
+        let r1 = s.call_tool_result("designos_apply_batch", payload.clone());
+        assert_eq!(r1.is_error, Some(false));
+        assert!(r1.meta.is_none(), "First call must not carry replay _meta");
+        assert_eq!(s.engine.doc.nodes.len(), initial_count + 1);
+        let rev_after_1 = s.engine.revision;
+        let depth_after_1 = s.engine.history.undo_depth();
+        let patch_len_1 = fs::metadata(sess.join("doc-patch.jsonl")).unwrap().len();
+
+        // Replay with identical payload (even with reordered keys and 100.0 vs 100)
+        let r2 = s.call_tool_result(
+            "designos_apply_batch",
+            json!({
+                "ops": [{"name": "Tag", "kind": "rectangle", "parent": page, "op": "create"}],
+                "idempotency_key": "k1"
+            }),
+        );
+        assert_eq!(r2.is_error, Some(false));
+        assert_eq!(r1.structured_content, r2.structured_content, "structuredContent must be byte-identical");
+        let meta = r2.meta.expect("Replay must include _meta");
+        assert_eq!(meta.0.get("designos/idempotent_replay"), Some(&json!(true)));
+        assert_eq!(s.engine.doc.nodes.len(), initial_count + 1, "Node count must not increment on replay");
+        assert_eq!(s.engine.revision, rev_after_1, "Revision must not advance on replay");
+        assert_eq!(s.engine.history.undo_depth(), depth_after_1, "Undo depth must not advance on replay");
+        assert_eq!(fs::metadata(sess.join("doc-patch.jsonl")).unwrap().len(), patch_len_1, "doc-patch.jsonl must not grow on replay");
+
+        let _ = fs::remove_dir_all(ws.parent().unwrap());
+    }
+
+    #[test]
+    fn key_reuse_with_changed_payload_refused() {
+        let (ws, _sess) = temp_test_dirs("key-reuse");
+        let mut s = Session::new(&ws).unwrap();
+        let page = s.engine.doc.pages[0].0;
+
+        s.call(
+            "designos_apply_batch",
+            json!({
+                "idempotency_key": "k1",
+                "ops": [{"op": "create", "parent": page, "kind": "rectangle", "name": "TagA"}]
+            }),
+        )
+        .unwrap();
+        let rev = s.engine.revision;
+        let depth = s.engine.history.undo_depth();
+
+        let err = s
+            .call(
+                "designos_apply_batch",
+                json!({
+                    "idempotency_key": "k1",
+                    "ops": [{"op": "create", "parent": page, "kind": "rectangle", "name": "TagB"}]
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::IdempotencyKeyReused);
+        assert_eq!(err.path, "/idempotency_key");
+        assert!(err.safe_to_retry);
+        assert_eq!(err.corrected_example.as_ref().unwrap()["idempotency_key"], "k1-2");
+        assert_eq!(s.engine.revision, rev);
+        assert_eq!(s.engine.history.undo_depth(), depth);
+
+        let _ = fs::remove_dir_all(ws.parent().unwrap());
+    }
+
+    #[test]
+    fn ledger_survives_reconnect() {
+        let (ws, sess) = temp_test_dirs("survives-reconnect");
+        let created_id: u64;
+        let first_reply: Value;
+        {
+            let mut s1 = Session::with_session_dir(&ws, &sess).unwrap();
+            let page = s1.engine.doc.pages[0].0;
+            first_reply = s1
+                .call(
+                    "designos_apply_batch",
+                    json!({
+                        "idempotency_key": "k1",
+                        "ops": [{"op": "create", "parent": page, "kind": "frame", "name": "Hero"}]
+                    }),
+                )
+                .unwrap();
+            created_id = first_reply["created"][0].as_u64().unwrap();
+            // Simulate Studio saving the updated canvas snapshot
+            fs::write(sess.join("canvas.designos"), s1.engine.doc.to_json().unwrap()).unwrap();
+        }
+
+        let mut s2 = Session::with_session_dir(&ws, &sess).unwrap();
+        let page = s2.engine.doc.pages[0].0;
+        assert!(s2.engine.doc.get(designos_doc::NodeId(created_id)).is_some());
+        let count_before = s2.engine.doc.nodes.len();
+
+        let (reply2, meta2) = s2
+            .call_with_meta(
+                "designos_apply_batch",
+                json!({
+                    "idempotency_key": "k1",
+                    "ops": [{"op": "create", "parent": page, "kind": "frame", "name": "Hero"}]
+                }),
+            )
+            .unwrap();
+        assert_eq!(reply2, first_reply);
+        assert_eq!(meta2.unwrap().get("designos/idempotent_replay"), Some(&json!(true)));
+        assert_eq!(s2.engine.doc.nodes.len(), count_before);
+
+        let _ = fs::remove_dir_all(ws.parent().unwrap());
+    }
+
+    #[test]
+    fn reconnect_without_document_state_is_stale() {
+        let (ws, sess) = temp_test_dirs("reconnect-no-canvas");
+        let created_id: u64;
+        let page: u64;
+        {
+            let mut s1 = Session::with_session_dir(&ws, &sess).unwrap();
+            page = s1.engine.doc.pages[0].0;
+            let reply = s1
+                .call(
+                    "designos_apply_batch",
+                    json!({
+                        "idempotency_key": "k1",
+                        "ops": [{"op": "create", "parent": page, "kind": "frame", "name": "Hero"}]
+                    }),
+                )
+                .unwrap();
+            created_id = reply["created"][0].as_u64().unwrap();
+            // Do NOT write canvas.designos — new session starts without created_id
+        }
+
+        let mut s2 = Session::with_session_dir(&ws, &sess).unwrap();
+        let count_before = s2.engine.doc.nodes.len();
+        let depth_before = s2.engine.history.undo_depth();
+
+        let err = s2
+            .call(
+                "designos_apply_batch",
+                json!({
+                    "idempotency_key": "k1",
+                    "ops": [{"op": "create", "parent": page, "kind": "frame", "name": "Hero"}]
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::IdempotencyKeyStale);
+        assert!(err.safe_to_retry);
+        assert_eq!(s2.engine.doc.nodes.len(), count_before);
+        assert_eq!(s2.engine.history.undo_depth(), depth_before);
+
+        let get_err = s2.call("designos_get_node", json!({"node_id": created_id})).unwrap_err();
+        assert_eq!(get_err.code, ErrorCode::NodeNotFound);
+
+        let _ = fs::remove_dir_all(ws.parent().unwrap());
+    }
+
+    #[test]
+    fn reconnect_after_node_deleted_is_stale() {
+        let (ws, sess) = temp_test_dirs("reconnect-deleted");
+        let created_id: u64;
+        let page: u64;
+        {
+            let mut s1 = Session::with_session_dir(&ws, &sess).unwrap();
+            page = s1.engine.doc.pages[0].0;
+            let reply = s1
+                .call(
+                    "designos_apply_batch",
+                    json!({
+                        "idempotency_key": "k1",
+                        "ops": [{"op": "create", "parent": page, "kind": "frame", "name": "Hero"}]
+                    }),
+                )
+                .unwrap();
+            created_id = reply["created"][0].as_u64().unwrap();
+            fs::write(sess.join("canvas.designos"), s1.engine.doc.to_json().unwrap()).unwrap();
+        }
+
+        let mut s2 = Session::with_session_dir(&ws, &sess).unwrap();
+        s2.call("designos_delete_node", json!({"node_id": created_id})).unwrap();
+        let count_after_del = s2.engine.doc.nodes.len();
+
+        let err = s2
+            .call(
+                "designos_apply_batch",
+                json!({
+                    "idempotency_key": "k1",
+                    "ops": [{"op": "create", "parent": page, "kind": "frame", "name": "Hero"}]
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::IdempotencyKeyStale);
+        assert_eq!(s2.engine.doc.nodes.len(), count_after_del);
+
+        let _ = fs::remove_dir_all(ws.parent().unwrap());
+    }
+
+    #[test]
+    fn replay_after_created_node_deleted_is_stale() {
+        let (ws, _sess) = temp_test_dirs("inproc-deleted");
+        let mut s = Session::new(&ws).unwrap();
+        let page = s.engine.doc.pages[0].0;
+
+        let reply = s
+            .call(
+                "designos_create_node",
+                json!({
+                    "parent_id": page,
+                    "kind": "frame",
+                    "name": "Hero",
+                    "idempotency_key": "k1"
+                }),
+            )
+            .unwrap();
+        let node_id = reply["node"]["id"].as_u64().unwrap();
+
+        s.call("designos_delete_node", json!({"node_id": node_id})).unwrap();
+        assert!(s.engine.doc.get(designos_doc::NodeId(node_id)).is_none());
+
+        let err = s
+            .call(
+                "designos_create_node",
+                json!({
+                    "parent_id": page,
+                    "kind": "frame",
+                    "name": "Hero",
+                    "idempotency_key": "k1"
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::IdempotencyKeyStale);
+        assert!(s.engine.doc.get(designos_doc::NodeId(node_id)).is_none());
+
+        let _ = fs::remove_dir_all(ws.parent().unwrap());
+    }
+
+    #[test]
+    fn delete_key_replays_only_while_gone() {
+        let (ws, _sess) = temp_test_dirs("delete-key");
+        let mut s = Session::new(&ws).unwrap();
+        let page = s.engine.doc.pages[0].0;
+
+        let created = s.call("designos_create_node", json!({"parent_id": page, "kind": "frame", "name": "Temp"})).unwrap();
+        let m_id = created["node"]["id"].as_u64().unwrap();
+
+        let del1 = s.call("designos_delete_node", json!({"node_id": m_id, "idempotency_key": "k_del"})).unwrap();
+        assert_eq!(del1["deleted"], true);
+
+        let (del2, meta2) = s.call_with_meta("designos_delete_node", json!({"node_id": m_id, "idempotency_key": "k_del"})).unwrap();
+        assert_eq!(del2, del1);
+        assert_eq!(meta2.unwrap().get("designos/idempotent_replay"), Some(&json!(true)));
+
+        // Undo brings M back -> k_del must now be stale
+        s.call("designos_undo", json!({})).unwrap();
+        assert!(s.engine.doc.get(designos_doc::NodeId(m_id)).is_some());
+
+        let err = s.call("designos_delete_node", json!({"node_id": m_id, "idempotency_key": "k_del"})).unwrap_err();
+        assert_eq!(err.code, ErrorCode::IdempotencyKeyStale);
+        assert!(s.engine.doc.get(designos_doc::NodeId(m_id)).is_some());
+
+        let _ = fs::remove_dir_all(ws.parent().unwrap());
+    }
+
+    #[test]
+    fn reloaded_entry_without_checkable_ids_is_stale() {
+        let (ws, sess) = temp_test_dirs("no-checkable-ids");
+        let payload = json!({
+            "text": "General page comment without node_id",
+            "idempotency_key": "k_comment"
+        });
+        {
+            let mut s1 = Session::with_session_dir(&ws, &sess).unwrap();
+            let r1 = s1.call("designos_add_comment", payload.clone()).unwrap();
+            let (r2, meta2) = s1.call_with_meta("designos_add_comment", payload.clone()).unwrap();
+            assert_eq!(r1, r2);
+            assert_eq!(meta2.unwrap().get("designos/idempotent_replay"), Some(&json!(true)));
+            fs::write(sess.join("canvas.designos"), s1.engine.doc.to_json().unwrap()).unwrap();
+        }
+
+        let mut s2 = Session::with_session_dir(&ws, &sess).unwrap();
+        let err = s2.call("designos_add_comment", payload).unwrap_err();
+        assert_eq!(err.code, ErrorCode::IdempotencyKeyStale);
+
+        let _ = fs::remove_dir_all(ws.parent().unwrap());
+    }
+
+    #[test]
+    fn reloaded_key_follows_presence_not_depth() {
+        let (ws, sess) = temp_test_dirs("presence-not-depth");
+        let created_id: u64;
+        let page: u64;
+        let first_reply: Value;
+        {
+            let mut s1 = Session::with_session_dir(&ws, &sess).unwrap();
+            page = s1.engine.doc.pages[0].0;
+            first_reply = s1
+                .call(
+                    "designos_create_node",
+                    json!({
+                        "parent_id": page,
+                        "kind": "frame",
+                        "name": "Hero",
+                        "idempotency_key": "k1"
+                    }),
+                )
+                .unwrap();
+            created_id = first_reply["node"]["id"].as_u64().unwrap();
+            fs::write(sess.join("canvas.designos"), s1.engine.doc.to_json().unwrap()).unwrap();
+        }
+
+        let mut s2 = Session::with_session_dir(&ws, &sess).unwrap();
+        assert_eq!(s2.engine.history.undo_depth(), 0);
+        // Perform a new write on N in the reloaded session (history starts empty and grows to 1)
+        s2.call("designos_update_node", json!({"node_id": created_id, "name": "HeroRenamed"})).unwrap();
+        assert_eq!(s2.engine.history.undo_depth(), 1);
+
+        // Resend k1: N is still present with kind Frame, so k1 replays
+        let (reply2, meta2) = s2
+            .call_with_meta(
+                "designos_create_node",
+                json!({
+                    "parent_id": page,
+                    "kind": "frame",
+                    "name": "Hero",
+                    "idempotency_key": "k1"
+                }),
+            )
+            .unwrap();
+        assert_eq!(reply2, first_reply);
+        assert_eq!(meta2.unwrap().get("designos/idempotent_replay"), Some(&json!(true)));
+
+        let _ = fs::remove_dir_all(ws.parent().unwrap());
+    }
+
+    #[test]
+    fn ledger_cleared_on_document_switch() {
+        let (ws, _sess) = temp_test_dirs("doc-switch");
+        let mut s = Session::new(&ws).unwrap();
+        let page = s.engine.doc.pages[0].0;
+
+        s.call(
+            "designos_create_node",
+            json!({
+                "parent_id": page,
+                "kind": "frame",
+                "name": "Hero",
+                "idempotency_key": "k1"
+            }),
+        )
+        .unwrap();
+        assert_eq!(s.ledger.len(), 1);
+
+        s.call("designos_new_document", json!({"name": "SecondDoc", "discard_changes": true})).unwrap();
+        assert_eq!(s.ledger.len(), 0);
+
+        let new_page = s.engine.doc.pages[0].0;
+        let (_reply, meta) = s
+            .call_with_meta(
+                "designos_create_node",
+                json!({
+                    "parent_id": new_page,
+                    "kind": "frame",
+                    "name": "HeroInSecondDoc",
+                    "idempotency_key": "k1"
+                }),
+            )
+            .unwrap();
+        assert!(meta.is_none(), "After document switch, k1 must run as a fresh write");
+
+        let _ = fs::remove_dir_all(ws.parent().unwrap());
+    }
+
+    #[test]
+    fn errors_not_stored() {
+        let (ws, _sess) = temp_test_dirs("errors-not-stored");
+        let mut s = Session::new(&ws).unwrap();
+        let page = s.engine.doc.pages[0].0;
+
+        // First call with k1 fails validation (non-existent parent)
+        let err = s
+            .call(
+                "designos_create_node",
+                json!({
+                    "parent_id": 999_999,
+                    "kind": "frame",
+                    "name": "Hero",
+                    "idempotency_key": "k1"
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NodeNotFound);
+        assert!(s.ledger.is_empty());
+
+        // Fix payload and retry with the same key k1 -> succeeds as a fresh write and is stored
+        let (reply1, meta1) = s
+            .call_with_meta(
+                "designos_create_node",
+                json!({
+                    "parent_id": page,
+                    "kind": "frame",
+                    "name": "Hero",
+                    "idempotency_key": "k1"
+                }),
+            )
+            .unwrap();
+        assert!(meta1.is_none());
+
+        let (reply2, meta2) = s
+            .call_with_meta(
+                "designos_create_node",
+                json!({
+                    "parent_id": page,
+                    "kind": "frame",
+                    "name": "Hero",
+                    "idempotency_key": "k1"
+                }),
+            )
+            .unwrap();
+        assert_eq!(reply1, reply2);
+        assert_eq!(meta2.unwrap().get("designos/idempotent_replay"), Some(&json!(true)));
+
+        let _ = fs::remove_dir_all(ws.parent().unwrap());
+    }
+
+    #[test]
+    fn undo_then_same_key_is_refused_not_replayed() {
+        let (ws, _sess) = temp_test_dirs("undo-refused");
+        let mut s = Session::new(&ws).unwrap();
+        let page = s.engine.doc.pages[0].0;
+        let initial_count = s.engine.doc.nodes.len();
+
+        let payload = json!({
+            "idempotency_key": "k1",
+            "ops": [{"op": "create", "parent": page, "kind": "frame", "name": "Card"}]
+        });
+        s.call("designos_apply_batch", payload.clone()).unwrap();
+        assert_eq!(s.engine.doc.nodes.len(), initial_count + 1);
+
+        s.call("designos_undo", json!({})).unwrap();
+        assert_eq!(s.engine.doc.nodes.len(), initial_count);
+        let rev_after_undo = s.engine.revision;
+        let depth_after_undo = s.engine.history.undo_depth();
+
+        let err = s.call("designos_apply_batch", payload).unwrap_err();
+        assert_eq!(err.code, ErrorCode::IdempotencyKeyStale);
+        assert!(err.safe_to_retry);
+        assert_eq!(err.corrected_example.as_ref().unwrap()["idempotency_key"], "k1-2");
+        assert_eq!(s.engine.doc.nodes.len(), initial_count);
+        assert_eq!(s.engine.revision, rev_after_undo);
+        assert_eq!(s.engine.history.undo_depth(), depth_after_undo);
+
+        let _ = fs::remove_dir_all(ws.parent().unwrap());
+    }
+
+    #[test]
+    fn undo_second_write_keeps_first_key_valid() {
+        let (ws, _sess) = temp_test_dirs("undo-second");
+        let mut s = Session::new(&ws).unwrap();
+        let page = s.engine.doc.pages[0].0;
+
+        let p1 = json!({"parent_id": page, "kind": "frame", "name": "First", "idempotency_key": "k1"});
+        let p2 = json!({"parent_id": page, "kind": "frame", "name": "Second", "idempotency_key": "k2"});
+
+        let r1 = s.call("designos_create_node", p1.clone()).unwrap();
+        s.call("designos_create_node", p2.clone()).unwrap();
+
+        // Undo second write only
+        s.call("designos_undo", json!({})).unwrap();
+        let count_after_undo = s.engine.doc.nodes.len();
+
+        // k1 is still applied -> replays
+        let (r1_replay, meta1) = s.call_with_meta("designos_create_node", p1).unwrap();
+        assert_eq!(r1_replay, r1);
+        assert_eq!(meta1.unwrap().get("designos/idempotent_replay"), Some(&json!(true)));
+        assert_eq!(s.engine.doc.nodes.len(), count_after_undo);
+
+        // k2 was undone -> stale
+        let err2 = s.call("designos_create_node", p2).unwrap_err();
+        assert_eq!(err2.code, ErrorCode::IdempotencyKeyStale);
+
+        let _ = fs::remove_dir_all(ws.parent().unwrap());
+    }
+
+    #[test]
+    fn redo_makes_key_valid_again() {
+        let (ws, _sess) = temp_test_dirs("redo-valid");
+        let mut s = Session::new(&ws).unwrap();
+        let page = s.engine.doc.pages[0].0;
+
+        let p1 = json!({"parent_id": page, "kind": "frame", "name": "Hero", "idempotency_key": "k1"});
+        let r1 = s.call("designos_create_node", p1.clone()).unwrap();
+
+        s.call("designos_undo", json!({})).unwrap();
+        assert_eq!(s.call("designos_create_node", p1.clone()).unwrap_err().code, ErrorCode::IdempotencyKeyStale);
+
+        s.call("designos_redo", json!({})).unwrap();
+        let (r1_replay, meta) = s.call_with_meta("designos_create_node", p1).unwrap();
+        assert_eq!(r1_replay, r1);
+        assert_eq!(meta.unwrap().get("designos/idempotent_replay"), Some(&json!(true)));
+
+        let _ = fs::remove_dir_all(ws.parent().unwrap());
+    }
+
+    #[test]
+    fn new_write_after_undo_kills_undone_key() {
+        let (ws, _sess) = temp_test_dirs("new-write-kills");
+        let mut s = Session::new(&ws).unwrap();
+        let page = s.engine.doc.pages[0].0;
+
+        let p1 = json!({"parent_id": page, "kind": "frame", "name": "First", "idempotency_key": "k1"});
+        s.call("designos_create_node", p1.clone()).unwrap();
+
+        // Undo k1 (depth 1 -> 0)
+        s.call("designos_undo", json!({})).unwrap();
+
+        // New write k2 discards the redo branch and brings depth back to 1 (and then k3 to 2)
+        s.call("designos_create_node", json!({"parent_id": page, "kind": "frame", "name": "Second", "idempotency_key": "k2"})).unwrap();
+        s.call("designos_create_node", json!({"parent_id": page, "kind": "frame", "name": "Third", "idempotency_key": "k3"})).unwrap();
+        assert!(s.engine.history.undo_depth() >= 2);
+
+        // Even though undo_depth is now >= k1's original depth, k1 is permanently dead -> Stale
+        let err = s.call("designos_create_node", p1).unwrap_err();
+        assert_eq!(err.code, ErrorCode::IdempotencyKeyStale);
+
+        let _ = fs::remove_dir_all(ws.parent().unwrap());
+    }
+
+    #[test]
+    fn stale_mark_survives_reconnect() {
+        let (ws, sess) = temp_test_dirs("stale-mark-reconnect");
+        let page: u64;
+        let existing_node_id: u64;
+        {
+            let mut s1 = Session::with_session_dir(&ws, &sess).unwrap();
+            page = s1.engine.doc.pages[0].0;
+            let created = s1.call("designos_create_node", json!({"parent_id": page, "kind": "frame", "name": "Box"})).unwrap();
+            existing_node_id = created["node"]["id"].as_u64().unwrap();
+            fs::write(sess.join("canvas.designos"), s1.engine.doc.to_json().unwrap()).unwrap();
+
+            // Write with k1 on existing_node_id, then undo it (so the node still exists in canvas.designos,
+            // testing that the persisted {"key":"k1","state":"stale"} transition itself makes k1 stale!)
+            s1.call("designos_update_node", json!({"node_id": existing_node_id, "name": "BoxRenamed", "idempotency_key": "k1"})).unwrap();
+            s1.call("designos_undo", json!({})).unwrap();
+        }
+
+        let mut s2 = Session::with_session_dir(&ws, &sess).unwrap();
+        let err = s2.call("designos_update_node", json!({"node_id": existing_node_id, "name": "BoxRenamed", "idempotency_key": "k1"})).unwrap_err();
+        assert_eq!(err.code, ErrorCode::IdempotencyKeyStale);
+
+        let _ = fs::remove_dir_all(ws.parent().unwrap());
+    }
+
+    #[test]
+    fn ledger_cleared_on_canvas_reload() {
+        let (ws, sess) = temp_test_dirs("canvas-reload");
+        let canvas_path = sess.join("canvas.designos");
+        let mut initial_doc = Document::new("Initial");
+        initial_doc.add_page("Page 1");
+        fs::write(&canvas_path, initial_doc.to_json().unwrap()).unwrap();
+
+        let mut s = Session::with_session_dir(&ws, &sess).unwrap();
+        let page = s.engine.doc.pages[0].0;
+        let payload = json!({"parent_id": page, "kind": "frame", "name": "Hero", "idempotency_key": "k1"});
+
+        s.call("designos_create_node", payload.clone()).unwrap();
+        assert_eq!(s.ledger.len(), 1);
+
+        // Ensure mtime advances before writing a newer canvas snapshot
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut newer_doc = Document::new("NewerFromStudio");
+        newer_doc.add_page("Page 1");
+        fs::write(&canvas_path, newer_doc.to_json().unwrap()).unwrap();
+
+        let (_reply2, meta2) = s.call_with_meta("designos_create_node", payload).unwrap();
+        assert!(meta2.is_none(), "After canvas reload, k1 must execute as a fresh write");
+        assert_eq!(s.engine.doc.name, "NewerFromStudio");
+
+        let _ = fs::remove_dir_all(ws.parent().unwrap());
     }
 }

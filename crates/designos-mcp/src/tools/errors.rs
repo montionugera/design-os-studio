@@ -70,10 +70,12 @@ pub enum ErrorCode {
     HistoryDropped,
     InternalError,
 
-    // Active pack codes (3)
+    // Active pack codes (5)
     InvalidSelector,
     UnknownLanguage,
     OutsideOwnedFrames,
+    IdempotencyKeyReused,
+    IdempotencyKeyStale,
 }
 
 #[allow(non_upper_case_globals)]
@@ -112,8 +114,10 @@ impl ErrorCode {
     pub const EmptyRender: Self = Self::InvalidArguments;
     pub const IoError: Self = Self::InternalError;
     pub const SessionUnavailable: Self = Self::InternalError;
+    pub const IdempotencyKeyConflict: Self = Self::IdempotencyKeyReused;
+    pub const InvalidIdempotencyKey: Self = Self::InvalidArguments;
 
-    /// Every error code variant in `ErrorCode` (the 50 catalogue codes from §3.3 plus 3 active pack codes).
+    /// Every error code variant in `ErrorCode` (the 50 catalogue codes from §3.3 plus active pack codes).
     pub const ALL: &'static [ErrorCode] = &[
         Self::InvalidArguments,
         Self::UnknownField,
@@ -168,6 +172,8 @@ impl ErrorCode {
         Self::InvalidSelector,
         Self::UnknownLanguage,
         Self::OutsideOwnedFrames,
+        Self::IdempotencyKeyReused,
+        Self::IdempotencyKeyStale,
     ];
 
     pub const fn as_str(&self) -> &'static str {
@@ -225,6 +231,8 @@ impl ErrorCode {
             Self::InvalidSelector => "INVALID_SELECTOR",
             Self::UnknownLanguage => "UNKNOWN_LANGUAGE",
             Self::OutsideOwnedFrames => "OUTSIDE_OWNED_FRAMES",
+            Self::IdempotencyKeyReused => "IDEMPOTENCY_KEY_REUSED",
+            Self::IdempotencyKeyStale => "IDEMPOTENCY_KEY_STALE",
         }
     }
 
@@ -243,6 +251,10 @@ impl ErrorCode {
             Self::UnknownStyle | Self::StyleTypeMismatch => "Call designos_get_document to inspect shared styles or use one of valid_options.",
             Self::BatchTooLarge => "Split the batch into chunks of at most 200 operations.",
             Self::InternalError => "Call designos_get_document to inspect current state before retrying.",
+            Self::IdempotencyKeyReused => "Send this payload with a new idempotency_key.",
+            Self::IdempotencyKeyStale => {
+                "Read the target nodes; this write was undone or is not in the open document. Send it again with a new idempotency_key only if you still want it."
+            }
             _ => "Adjust the value at `path` using `valid_options` or `corrected_example` and retry.",
         }
     }
@@ -302,6 +314,8 @@ impl ErrorCode {
             "INVALID_SELECTOR" => Some(Self::InvalidSelector),
             "UNKNOWN_LANGUAGE" => Some(Self::UnknownLanguage),
             "OUTSIDE_OWNED_FRAMES" => Some(Self::OutsideOwnedFrames),
+            "IDEMPOTENCY_KEY_REUSED" | "IDEMPOTENCY_KEY_CONFLICT" | "E_IDEMPOTENCY_CONFLICT" => Some(Self::IdempotencyKeyReused),
+            "IDEMPOTENCY_KEY_STALE" => Some(Self::IdempotencyKeyStale),
             _ => None,
         }
     }

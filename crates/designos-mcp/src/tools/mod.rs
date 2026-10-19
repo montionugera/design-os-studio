@@ -2,6 +2,8 @@
 
 pub mod batch;
 pub mod errors;
+pub mod ledger;
+pub use ledger as idempotency;
 pub mod library_source;
 
 use crate::tools::errors::{ErrorCode, ToolError};
