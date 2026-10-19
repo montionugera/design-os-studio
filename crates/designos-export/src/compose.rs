@@ -515,6 +515,14 @@ mod tests {
     }
 
     #[test]
+    fn compose_hugging_row_all_fill_children() {
+        let (d, row, _) = fixture::row_with_counter_children(Sizing::Hug, &[20.0, 100.0], true, false);
+        let out = compose_for(&d, row);
+        assert_eq!(out.matches("height = 100.dp").count(), 2, "{out}");
+        assert!(!out.contains("fillMaxHeight"), "{out}");
+    }
+
+    #[test]
     fn grid_stretch_child_exports_its_solved_size() {
         // (row track, solved height): an auto row is sized by the child, a taller row is filled.
         for (track, height) in [(None, 20), (Some(GridTrack::Fixed(100.0)), 100)] {
@@ -524,6 +532,19 @@ mod tests {
             assert!(out.contains(&format!("width = 30.dp, height = {height}.dp")), "{track:?}: {out}");
             for banned in ["fillMax", "weight"] {
                 assert!(!out.contains(banned), "{track:?} has {banned}: {out}");
+            }
+        }
+    }
+
+    #[test]
+    fn compose_grid_fill_child_exports_solved_height() {
+        for (track, height) in [(None, 20), (Some(GridTrack::Fixed(100.0)), 100)] {
+            for (d, grid, _) in [fixture::grid_fill_child(track), fixture::grid_stretch_child(track, true)] {
+                let out = compose_for(&d, grid);
+                assert!(out.contains(&format!("width = 30.dp, height = {height}.dp")), "{track:?}: {out}");
+                for banned in ["fillMax", "weight"] {
+                    assert!(!out.contains(banned), "{track:?} has {banned}: {out}");
+                }
             }
         }
     }

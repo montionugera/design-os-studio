@@ -731,7 +731,10 @@ mod tests {
         assert!(!has(2, "justify-self-start") && !has(2, "self-start"), "{html}");
         assert!(has(3, "justify-self-start") && has(3, "self-start"), "a content-sized item must align to the start:\n{html}");
         assert!(!tokens(&html, 3).iter().any(|t| t.starts_with("w-") || t.starts_with("h-")), "{html}");
-        assert!(!tokens(&html, 4).iter().any(|t| t.starts_with("w-") || t.starts_with("h-") || t.contains("self-start")), "a Fill item is stretched: {html}");
+        assert!(
+            has(4, "h-10") && !tokens(&html, 4).iter().any(|t| t.starts_with("w-") || t.contains("self-start")),
+            "a Fill item stretches horizontally and keeps solved height: {html}"
+        );
     }
 
     #[test]
@@ -793,5 +796,26 @@ mod tests {
         let out = tailwind_for(&d, row);
         let child = out.lines().find(|l| l.contains("self-stretch")).unwrap_or_else(|| panic!("no stretch child in {out}"));
         assert!(!child.contains(" h-"), "{child}");
+    }
+
+    #[test]
+    fn tailwind_hugging_row_all_fill_children() {
+        use crate::codegen::fixture::row_with_counter_children;
+        let (d, row, _) = row_with_counter_children(Sizing::Hug, &[20.0, 100.0], true, false);
+        let out = tailwind_for(&d, row);
+        let children: Vec<&str> = out.lines().filter(|l| l.contains("self-stretch")).collect();
+        assert_eq!(children.len(), 2, "{out}");
+        assert!(children.iter().all(|l| l.contains("h-[100px]")), "all-fill row must not collapse: {out}");
+    }
+
+    #[test]
+    fn tailwind_grid_fill_child_exports_solved_height() {
+        use crate::codegen::fixture;
+        for (track, expected_h) in [(None, "h-5"), (Some(GridTrack::Fixed(100.0)), "h-[100px]")] {
+            let (d, grid, _) = fixture::grid_fill_child(track);
+            let html = tailwind_for(&d, grid);
+            let t = tokens(&html, 1);
+            assert!(t.iter().any(|c| c == expected_h), "{track:?}: {html}");
+        }
     }
 }

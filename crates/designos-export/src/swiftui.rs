@@ -606,6 +606,14 @@ mod tests {
     }
 
     #[test]
+    fn swiftui_hugging_row_all_fill_children() {
+        let (d, row, _) = fixture::row_with_counter_children(Sizing::Hug, &[20.0, 100.0], true, false);
+        let out = swiftui_for(&d, row);
+        assert_eq!(out.matches("height: 100").count(), 2, "{out}");
+        assert!(!out.contains("maxHeight"), "{out}");
+    }
+
+    #[test]
     fn grid_stretch_child_exports_its_solved_size() {
         // (row track, solved height): an auto row is sized by the child, a taller row is filled.
         for (track, height) in [(None, 20), (Some(GridTrack::Fixed(100.0)), 100)] {
@@ -617,5 +625,29 @@ mod tests {
                 assert!(!out.contains(banned), "{track:?} has {banned}: {out}");
             }
         }
+    }
+
+    #[test]
+    fn swiftui_grid_fill_child_exports_solved_height() {
+        for (track, height) in [(None, 20), (Some(GridTrack::Fixed(100.0)), 100)] {
+            for (d, grid, _) in [fixture::grid_fill_child(track), fixture::grid_stretch_child(track, true)] {
+                let out = swiftui_for(&d, grid);
+                assert!(out.contains(&format!("width: 30, height: {height}")), "{track:?}: {out}");
+                for banned in ["maxWidth", "maxHeight"] {
+                    assert!(!out.contains(banned), "{track:?} has {banned}: {out}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grid_child_horizontal_fill_unchanged() {
+        let al = AutoLayout { grid_columns: 2, primary_sizing: Sizing::Fixed, counter_sizing: Sizing::Fixed, ..Default::default() };
+        let (mut d, grid) = fixture::grid_frame(al, Vec2::new(400.0, 300.0));
+        let rect = fixture::add_rect(&mut d, grid, Vec2::new(30.0, 20.0));
+        d.get_mut(rect).unwrap().layout_child.horizontal = Sizing::Fill;
+        d.relayout_subtree(grid);
+        let out = swiftui_for(&d, grid);
+        assert!(out.contains("maxWidth: .infinity"), "horizontal Fill in grid stays maxWidth: .infinity: {out}");
     }
 }
