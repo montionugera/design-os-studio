@@ -10,7 +10,7 @@ async fn stdio_handshake_discovery_edit_and_error_recovery() {
         let client = ().serve(TokioChildProcess::new(command).unwrap()).await.unwrap();
         assert_eq!(client.peer_info().unwrap().server_info.as_ref().unwrap().name, "designos-mcp");
         let tools = client.list_all_tools().await.unwrap();
-        assert_eq!(tools.len(), 22);
+        assert_eq!(tools.len(), 24);
         assert!(tools.iter().all(|t| t.annotations.is_some()));
         let call = |name: &'static str, args: Value| CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone());
         let doc = client.call_tool(call("designos_get_document", json!({}))).await.unwrap();
@@ -18,6 +18,12 @@ async fn stdio_handshake_discovery_edit_and_error_recovery() {
         let page = doc.structured_content.unwrap()["pages"][0]["node_id"].clone();
         let created = client.call_tool(call("designos_create_node", json!({"parent_id":page,"kind":"rectangle","name":"MCP test","width":120}))).await.unwrap();
         let id = created.structured_content.unwrap()["node"]["id"].clone();
+        let shot = client.call_tool(call("designos_get_screenshot", json!({"node_id":id}))).await.unwrap();
+        assert_eq!(shot.is_error, Some(false));
+        assert!(shot.content.first().and_then(|c| c.as_image()).is_some());
+        let shot_meta = shot.structured_content.unwrap();
+        assert_eq!(shot_meta["width"], 60);
+        assert_eq!(shot_meta["bounds"]["width"], 120.0);
         let invalid = client.call_tool(call("designos_update_node", json!({"node_id":id,"width":-1}))).await.unwrap();
         assert_eq!(invalid.is_error, Some(true));
         let code = client.call_tool(call("designos_generate_code", json!({"node_id":id,"language":"css"}))).await.unwrap();
@@ -36,6 +42,39 @@ async fn stdio_handshake_discovery_edit_and_error_recovery() {
             .await
             .unwrap();
         assert_eq!(applied.is_error, Some(false));
+        let batch_res = client
+            .call_tool(call(
+                "designos_apply_batch",
+                json!({
+                    "ops": [
+                        {
+                            "op": "apply_spec",
+                            "as": "hero",
+                            "parent": page,
+                            "spec": {
+                                "kind": "frame",
+                                "name": "Hero",
+                                "layout": { "direction": "column", "gap": 16 },
+                                "children": [
+                                    { "kind": "text", "name": "Title", "text": "Plan your week" }
+                                ]
+                            }
+                        },
+                        {
+                            "op": "update",
+                            "node": "@hero/Title",
+                            "opacity": 0.9
+                        }
+                    ],
+                    "dry_run": false
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(batch_res.is_error, Some(false));
+        let batch_body = batch_res.structured_content.unwrap();
+        assert_eq!(batch_body["created_count"], 2);
+        assert!(batch_body["name_to_id"]["hero/Title"].as_u64().is_some());
         let comments = client.call_tool(call("designos_list_comments", json!({}))).await.unwrap();
         assert_eq!(comments.is_error, Some(false));
         client.cancel().await.unwrap();

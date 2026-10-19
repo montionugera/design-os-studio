@@ -207,6 +207,7 @@ impl Session {
                                 // does its undo history: it names the agent's old ids, which the
                                 // editor may have given to the user's layers.
                                 self.engine.take_live_ops();
+                                self.engine.live_patch_label = None;
                                 if self.engine.history.can_undo() || self.engine.history.can_redo() {
                                     self.engine.history = designos_doc::History::default();
                                     self.history_dropped = true;
@@ -251,6 +252,7 @@ impl Session {
     /// a scoped copy (large files), so the whole `self.engine.doc` must never be sent for an edit.
     pub fn publish_live_patch(&mut self) -> Result<(), String> {
         let ops = self.engine.take_live_ops();
+        let label = self.engine.live_patch_label.take();
         let Some(path) = self.bridge.live_doc_patch_path.as_ref().filter(|_| !ops.is_empty()) else {
             return Ok(());
         };
@@ -261,7 +263,7 @@ impl Session {
             return self.publish_live_doc_sync().map_err(|e| format!("the editor still shows the previous document: {e}"));
         }
         let base = self.bridge.last_canvas_mtime.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos() as u64);
-        let line = live_patch_line(&LivePatch::new(ops).with_base(base), MAX_LIVE_PATCH_LINE_BYTES)?;
+        let line = live_patch_line(&LivePatch::new(ops).with_base(base).with_label(label), MAX_LIVE_PATCH_LINE_BYTES)?;
         let path = path.clone();
         append_log_line(&path, &line)
     }
@@ -282,6 +284,7 @@ impl Session {
             })),
         };
         self.engine.take_live_ops();
+        self.engine.live_patch_label = None;
     }
 
     /// Atomically publishes the whole `self.engine.doc` to `live_doc_sync_path` (`doc-sync.designos`)
@@ -473,12 +476,16 @@ impl Session {
                 }
                 let path = self.png_output_path(&a.path)?;
                 self.engine.settle_layout();
-                let doc = designos_doc::apply_bound_variables(&self.engine.doc);
                 let id = designos_doc::NodeId(a.node_id);
-                if doc.get(id).is_none() {
+                if self.engine.doc.get(id).is_none() {
                     return Err(format!("Node {} does not exist", a.node_id));
                 }
-                let png = designos_export::export_png(&doc, id, a.scale);
+                let rendered = crate::tools::screenshot::render_target(&self.engine.doc, crate::tools::screenshot::ScreenshotTarget::Node(id), a.scale, 0)
+                    .map_err(|e| match e.code {
+                        "IMAGE_TOO_LARGE" => format!("IMAGE_TOO_LARGE: {}", e.message),
+                        _ => format!("Node {} produced an empty image", a.node_id),
+                    })?;
+                let png = designos_export::encode_png_pixmap(&rendered.pixmap);
                 if png.is_empty() {
                     return Err(format!("Node {} produced an empty image", a.node_id));
                 }
@@ -511,6 +518,7 @@ impl Session {
                         | "designos_update_node"
                         | "designos_delete_node"
                         | "designos_apply_spec"
+                        | "designos_apply_batch"
                         | "designos_add_comment"
                         | "designos_reply_comment"
                         | "designos_resolve_comment"
@@ -518,7 +526,8 @@ impl Session {
                         | "designos_undo"
                         | "designos_redo"
                 );
-                let live = mutating && self.bridge.live_doc_patch_path.is_some();
+                let is_dry_run_req = name == "designos_apply_batch" && args.get("dry_run").and_then(Value::as_bool) == Some(true);
+                let live = mutating && !is_dry_run_req && self.bridge.live_doc_patch_path.is_some();
                 // What a failed write to the editor rolls back to. Undo and redo revert each other.
                 let snapshot = (live && !matches!(name, "designos_undo" | "designos_redo")).then(|| EditSnapshot {
                     doc: self.engine.doc.clone(),
@@ -526,7 +535,13 @@ impl Session {
                     redo_steps: self.engine.history.redo_steps(),
                 });
                 let mut result = self.engine.call(name, args)?;
-                let changed = result.get("changed").and_then(Value::as_bool) != Some(false);
+                let is_dry_run = result.get("dry_run").and_then(Value::as_bool) == Some(true);
+                let changed = !is_dry_run
+                    && match result.get("changed") {
+                        Some(Value::Bool(b)) => *b,
+                        Some(Value::Object(map)) => map.values().any(|v| v.as_u64().unwrap_or(0) > 0),
+                        _ => true,
+                    };
                 if mutating && changed {
                     if let Err(e) = self.publish_live_patch() {
                         self.roll_back(name, snapshot);
@@ -646,12 +661,28 @@ impl ServerHandler for DesignOSServer {
         Ok(ListToolsResult { tools: tools(), ..Default::default() })
     }
     async fn call_tool(&self, request: CallToolRequestParams, _: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
+        let is_screenshot = request.name == "designos_get_screenshot" || request.name == "get_screenshot";
         let result = self
             .session
             .lock()
             .map_err(|_| "Session unavailable; restart the MCP server".to_string())
             .and_then(|mut session| session.call(&request.name, Value::Object(request.arguments.unwrap_or_default())));
         Ok(match result {
+            Ok(mut value) if is_screenshot => {
+                let image_content = value.get("content").and_then(Value::as_array).and_then(|arr| arr.first()).and_then(|item| {
+                    let data = item.get("data")?.as_str()?.to_string();
+                    let mime_type = item.get("mimeType")?.as_str()?.to_string();
+                    Some(ContentBlock::image(data, mime_type))
+                });
+                if let Some(obj) = value.as_object_mut() {
+                    obj.remove("content");
+                }
+                let mut res = CallToolResult::structured(value);
+                if let Some(img) = image_content {
+                    res.content = vec![img];
+                }
+                res
+            }
             Ok(value) => CallToolResult::structured(value),
             Err(message) => CallToolResult::structured_error(json!({"error":message})),
         }
