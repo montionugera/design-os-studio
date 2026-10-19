@@ -10,6 +10,7 @@
 
 #![allow(dead_code)]
 
+use crate::agent_session_failure::{self, BannerEvent, SessionFailure, SessionFailureClass};
 use crate::agent_start_failure::{self, FixAction, StartFailure};
 use crate::icons::{self, Icon};
 use crate::panels::clipped;
@@ -370,7 +371,7 @@ pub enum TerminalAction {
     ExportSelectionToTerminal,
 }
 
-/// Orca 3-tier live agent execution status (`Working` / `WaitingForInput` / `Done` / `Idle`).
+/// Orca live agent execution status (`Working` / `WaitingForInput` / `Done` / `Idle` / `Error`).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum AgentTabStatus {
     #[default]
@@ -378,6 +379,7 @@ pub enum AgentTabStatus {
     Working(Option<String>),
     WaitingForInput(Option<String>),
     Done,
+    Error(SessionFailureClass),
 }
 
 /// One live interactive PTY tab backed by `portable-pty` and a `vt100::Parser`.
@@ -406,6 +408,10 @@ pub struct TerminalTab {
     pub spawned_at: std::time::Instant,
     /// Why the agent CLI exited right after it was opened; shown instead of the dead terminal.
     pub start_failure: Option<StartFailure>,
+    /// Classified mid-session failure (`AX-686`), shown as a banner above the terminal output.
+    pub session_failure: Option<SessionFailure>,
+    /// Byte offset in `raw_log` where the current turn started (`UserPromptSubmit` / `PreInvocation`).
+    pub last_turn_log_offset: usize,
 }
 
 impl TerminalTab {
@@ -504,7 +510,9 @@ impl TerminalTab {
                             let (clean_chunk, detected_status) = parse_osc_agent_status_and_strip(&chunk);
                             if let Some(next_status) = detected_status {
                                 if let Ok(mut st) = status_bg.lock() {
-                                    *st = next_status;
+                                    if !matches!(*st, AgentTabStatus::Error(_)) {
+                                        *st = next_status;
+                                    }
                                 }
                             }
                             if let Ok(mut p) = parser_bg.lock() {
@@ -553,6 +561,8 @@ impl TerminalTab {
             exited_notice_shown: false,
             spawned_at: std::time::Instant::now(),
             start_failure: None,
+            session_failure: None,
+            last_turn_log_offset: 0,
         })
     }
 
@@ -605,6 +615,26 @@ impl TerminalTab {
     /// True when this tab is a live agent CLI (not a shell process, and the child is still running).
     pub fn accepts_agent_input(&mut self) -> bool {
         !self.is_shell_process() && self.is_alive()
+    }
+
+    /// Records a classified mid-session failure on this tab and sets its status dot to `Error`.
+    pub fn set_session_failure(&mut self, failure: SessionFailure) {
+        let class = failure.class;
+        self.session_failure = Some(failure);
+        if let Ok(mut st) = self.agent_status.lock() {
+            *st = AgentTabStatus::Error(class);
+        }
+    }
+
+    /// Clears any active mid-session failure banner (on the next turn or when the user runs its fix).
+    pub fn clear_session_failure(&mut self) {
+        self.session_failure = None;
+        self.last_turn_log_offset = self.raw_log.lock().map(|g| g.len()).unwrap_or(0);
+        if let Ok(mut st) = self.agent_status.lock() {
+            if matches!(*st, AgentTabStatus::Error(_)) {
+                *st = AgentTabStatus::Idle;
+            }
+        }
     }
 
     /// Writes `Ctrl-E` (end-of-line) then `Ctrl-U` (kill line / tty VKILL), then `line` and `\r`.
@@ -696,6 +726,10 @@ pub struct TerminalState {
     pub search_query: String,
     /// Whether `Cmd+F` terminal search is case-sensitive (`Aa`).
     pub search_case_sensitive: bool,
+    /// Last raw payload observed in `agent-status.json` so hook state transitions run once per write.
+    pub last_agent_status_raw: Option<String>,
+    /// Most recent redacted failure details copied via `Copy details` (`AX-686`).
+    pub last_copied_failure_details: Option<String>,
 }
 
 impl Default for TerminalState {
@@ -769,6 +803,8 @@ impl TerminalState {
             search_open: false,
             search_query: String::new(),
             search_case_sensitive: false,
+            last_agent_status_raw: None,
+            last_copied_failure_details: None,
         }
     }
 
@@ -789,6 +825,7 @@ impl TerminalState {
         self.last_watched_mtime = std::fs::metadata(&self.live_spec_path).and_then(|m| m.modified()).ok();
         self.live_patch = crate::live_patch_log::LivePatchLog::bind(self.session_dir.join("doc-patch.jsonl"));
         self.last_synced_key = None;
+        self.last_agent_status_raw = None;
     }
 
     /// Builds a [`SessionEnv`] snapshot for this terminal state's per-file session.
@@ -981,7 +1018,7 @@ impl TerminalState {
         }
     }
 
-    /// Runs the fix the user clicked on a tab's "failed to start" panel.
+    /// Runs the fix the user clicked on a tab's "failed to start" panel or mid-session failure banner.
     pub fn apply_start_fix(&mut self, fix: FixAction, file_path: Option<&Path>) {
         match fix {
             FixAction::OpenInstallPage(url) => {
@@ -989,7 +1026,18 @@ impl TerminalState {
                     self.status_msg = Some(e);
                 }
             }
+            FixAction::OpenBilling(url) => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.clear_session_failure();
+                }
+                if let Err(e) = crate::home::open_link(url) {
+                    self.status_msg = Some(e);
+                }
+            }
             FixAction::RunLogin(command) => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.clear_session_failure();
+                }
                 // A login runs as a plain command tab: it is not an agent tab, so a quick
                 // "already signed in" exit is not reported as a failed start.
                 if let Ok(idx) = self.spawn_tab_running(AgentCliPreset::Shell, file_path, Some(command)) {
@@ -999,7 +1047,38 @@ impl TerminalState {
                 }
             }
             FixAction::OpenShell => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.clear_session_failure();
+                }
                 let _ = self.spawn_tab(AgentCliPreset::Shell, file_path);
+            }
+            FixAction::RetryText => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.clear_session_failure();
+                    tab.send_line("");
+                }
+            }
+            FixAction::NewSession => {
+                let preset = self
+                    .active_tab()
+                    .map(|t| t.spawn_preset)
+                    .filter(|p| !matches!(p, AgentCliPreset::Shell | AgentCliPreset::DesignOsHelp))
+                    .unwrap_or(self.active_runtime);
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.clear_session_failure();
+                }
+                let _ = self.spawn_tab(preset, file_path);
+            }
+            FixAction::RetryWhenOnline => {
+                if let Some(tab) = self.active_tab_mut() {
+                    let online = tab.session_failure.as_ref().is_some_and(|failure| failure.attempt_retry_when_online());
+                    if online {
+                        tab.clear_session_failure();
+                        tab.send_line("");
+                    } else {
+                        self.status_msg = Some("Still offline — check your network connection and try again.".into());
+                    }
+                }
             }
         }
     }
@@ -1345,10 +1424,33 @@ impl TerminalState {
         // Channel 3: Scoped agent-status.json written by Claude/Codex/Grok/AGY session hooks
         let status_file = self.session_dir.join("agent-status.json");
         if let Ok(raw_status) = std::fs::read_to_string(&status_file) {
-            if let Some(parsed) = parse_agent_status_payload(raw_status.trim()) {
-                if let Some(tab) = self.active_tab() {
-                    if let Ok(mut st) = tab.agent_status.lock() {
-                        *st = parsed;
+            let trimmed_raw = raw_status.trim().to_string();
+            if self.last_agent_status_raw.as_deref() != Some(trimmed_raw.as_str()) {
+                self.last_agent_status_raw = Some(trimmed_raw.clone());
+                if let Some(event) = parse_agent_status_file_event(&trimmed_raw) {
+                    if let Some(tab) = self.active_tab_mut() {
+                        match event {
+                            StatusFileEvent::Status(AgentTabStatus::Working(detail)) => {
+                                tab.clear_session_failure();
+                                if let Ok(mut st) = tab.agent_status.lock() {
+                                    *st = AgentTabStatus::Working(detail);
+                                }
+                                let _ = std::fs::remove_file(&status_file);
+                                self.last_agent_status_raw = None;
+                            }
+                            StatusFileEvent::Status(parsed) => {
+                                if let Ok(mut st) = tab.agent_status.lock() {
+                                    *st = parsed;
+                                }
+                            }
+                            StatusFileEvent::StopFailure { hook_error } => {
+                                let output = tab.raw_log.lock().map(|log| log.clone()).unwrap_or_default();
+                                let tail = if tab.last_turn_log_offset < output.len() { &output[tab.last_turn_log_offset..] } else { output.as_str() };
+                                if let Some(failure) = agent_session_failure::classify_session_failure(tab.spawn_preset, hook_error.as_deref(), tail) {
+                                    tab.set_session_failure(failure);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1364,6 +1466,12 @@ impl TerminalState {
                 if agent_start_failure::counts_as_failed_start(tab.spawned_at.elapsed(), exit_code) {
                     let output = tab.raw_log.lock().map(|log| log.clone()).unwrap_or_default();
                     tab.start_failure = Some(agent_start_failure::diagnose(tab.spawn_preset, tab.spawn_preset.is_installed(), exit_code, &output));
+                } else if exit_code != Some(0) && tab.session_failure.is_none() {
+                    let output = tab.raw_log.lock().map(|log| log.clone()).unwrap_or_default();
+                    let tail = if tab.last_turn_log_offset < output.len() { &output[tab.last_turn_log_offset..] } else { output.as_str() };
+                    if let Some(failure) = agent_session_failure::classify_session_failure(tab.spawn_preset, None, tail) {
+                        tab.set_session_failure(failure);
+                    }
                 }
                 if let Ok(mut parser) = tab.parser.lock() {
                     parser.process("\r\n[design:os] Agent exited — this tab no longer accepts input. Open a new tab to continue.\r\n".as_bytes());
@@ -1371,6 +1479,14 @@ impl TerminalState {
                 tab.title.push_str(" (exited)");
                 tab.exited_notice_shown = true;
                 agent_exited = true;
+            } else if tab.spawn_preset == AgentCliPreset::Codex && tab.session_failure.is_none() {
+                let output = tab.raw_log.lock().map(|log| log.clone()).unwrap_or_default();
+                if tab.last_turn_log_offset < output.len() {
+                    let tail = &output[tab.last_turn_log_offset..];
+                    if let Some(failure) = agent_session_failure::classify_turn_output_if_matched(tab.spawn_preset, tail) {
+                        tab.set_session_failure(failure);
+                    }
+                }
             }
         }
         if agent_exited {
@@ -1592,6 +1708,34 @@ pub fn strip_selection_gutter(text: &str) -> String {
     let trimmed_lines: Vec<&str> = text.split('\n').map(|l| l.trim_end_matches([' ', '\t', '\r'])).collect();
     let min_indent = trimmed_lines.iter().filter(|l| !l.trim().is_empty()).map(|l| l.bytes().take_while(|&b| b == b' ').count()).min().unwrap_or(0);
     trimmed_lines.into_iter().map(|l| if l.trim().is_empty() { "" } else { &l[min_indent.min(l.len())..] }).collect::<Vec<&str>>().join("\n")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StatusFileEvent {
+    Status(AgentTabStatus),
+    StopFailure { hook_error: Option<String> },
+}
+
+fn parse_agent_status_file_event(payload: &str) -> Option<StatusFileEvent> {
+    let trimmed = payload.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        let state_str = val.get("state").or_else(|| val.get("status")).and_then(|v| v.as_str()).unwrap_or("").to_ascii_lowercase();
+        let hook_error = val
+            .get("error")
+            .or_else(|| val.get("failure_class"))
+            .or_else(|| val.get("reason"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if matches!(state_str.as_str(), "error" | "stop_failure" | "stopfailure" | "failed") || (state_str.is_empty() && hook_error.is_some()) {
+            return Some(StatusFileEvent::StopFailure { hook_error });
+        }
+    }
+    parse_agent_status_payload(trimmed).map(StatusFileEvent::Status)
 }
 
 fn parse_agent_status_payload(payload: &str) -> Option<AgentTabStatus> {
@@ -2007,6 +2151,7 @@ fn paint_orca_tab_status_and_provider(ui: &Ui, p: &Painter, tab: &TerminalTab, t
         && tab.last_output_at.lock().ok().and_then(|g| *g).is_some_and(|ts| ts.elapsed() < std::time::Duration::from_millis(600));
 
     let effective_status = match explicit_status {
+        AgentTabStatus::Error(c) => AgentTabStatus::Error(c),
         AgentTabStatus::Working(d) => AgentTabStatus::Working(d),
         AgentTabStatus::WaitingForInput(d) => AgentTabStatus::WaitingForInput(d),
         other if recent_pty_activity => AgentTabStatus::Working(None),
@@ -2014,6 +2159,9 @@ fn paint_orca_tab_status_and_provider(ui: &Ui, p: &Painter, tab: &TerminalTab, t
     };
 
     match effective_status {
+        AgentTabStatus::Error(_) => {
+            p.circle_filled(status_center, 2.9, theme::DANGER);
+        }
         AgentTabStatus::Working(_) => {
             // Orca 12fps stepped rotating `#EAB308` arc spinner + 83ms repaint cadence
             let step = ((ui.input(|i| i.time) * 12.0).floor() as i32).rem_euclid(12);
@@ -2233,6 +2381,7 @@ fn session_hooks_settings(status_path: &Path, context_reply: Option<&Path>) -> s
             "PostToolUse": command_handler_group(status_hook_command(status_path, "working")),
             "PermissionRequest": command_handler_group(status_hook_command(status_path, "waiting")),
             "Stop": command_handler_group(status_hook_command(status_path, "done")),
+            "StopFailure": command_handler_group(status_hook_command(status_path, "error")),
         }
     })
 }
@@ -2245,6 +2394,7 @@ fn agy_session_hooks(status_path: &Path) -> serde_json::Value {
         "designos-status": {
             "PreInvocation": handler("working"),
             "Stop": handler("done"),
+            "StopFailure": handler("error"),
         }
     })
 }
@@ -3621,6 +3771,30 @@ fn render_vt100_viewport(state: &mut TerminalState, ui: &mut Ui, viewport_rect: 
             state.pending_start_fix = Some(fix);
         }
         return;
+    }
+    let mut viewport_rect = viewport_rect;
+    let session_id = state.session_id.clone();
+    let session_banner_ctx = state.active_tab_mut().and_then(|t| {
+        if t.is_shell_process() {
+            return None;
+        }
+        let alive = t.is_alive();
+        t.session_failure.clone().map(|f| (f, alive))
+    });
+    if let Some((failure, tab_alive)) = session_banner_ctx {
+        let (remaining_rect, evt) = agent_session_failure::paint_banner(ui, viewport_rect, &failure, &session_id, tab_alive, None, surface_id);
+        match evt {
+            Some(BannerEvent::RunFix(fix)) => {
+                state.pending_start_fix = Some(fix);
+            }
+            Some(BannerEvent::CopyDetails(details)) => {
+                ui.ctx().copy_text(details.clone());
+                state.last_copied_failure_details = Some(details);
+                state.status_msg = Some("Copied redacted failure details to clipboard.".into());
+            }
+            None => {}
+        }
+        viewport_rect = remaining_rect;
     }
     let p = ui.painter().clone();
     p.rect_filled(viewport_rect, 0.0, TERM_BG_VIEWPORT);
@@ -5781,5 +5955,76 @@ Done!
         assert_eq!(failure.cause, agent_start_failure::StartFailureCause::NotLoggedIn);
         assert_eq!(failure.fix, FixAction::RunLogin("grok login"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn banner_clears_on_the_next_turn() {
+        let mut st = provisioned_session(686_001);
+        let mut cmd = build_agent_shell_cmd(&default_shell_program(), "sh -c 'sleep 2'");
+        isolate_zsh_from_home(&mut cmd);
+        let tab = TerminalTab::spawn_with_session_cmd(1, AgentCliPreset::Claude, 24, 80, None, None, Some(cmd)).expect("spawn stub tab");
+        st.tabs = vec![tab];
+        st.active_tab = 0;
+
+        // 1. Trigger a mid-session StopFailure via hook + captured output
+        if let Some(t) = st.active_tab_mut() {
+            if let Ok(mut log) = t.raw_log.lock() {
+                log.push_str("Error: 429 rate_limit_error: Rate limit reached. Resets at 14:30\n");
+            }
+        }
+        let claude_hooks = read_json(&st.session_dir.join("hooks.json"));
+        let stop_failure_cmd = claude_hooks["hooks"]["StopFailure"][0]["hooks"][0]["command"].as_str().expect("StopFailure hook command").to_string();
+        run_hook_command(&stop_failure_cmd);
+        let _ = st.poll_live_agent_bridge();
+
+        assert_eq!(st.active_tab().and_then(|t| t.session_failure.as_ref().map(|f| f.class)), Some(SessionFailureClass::RateLimited));
+        assert_eq!(st.active_tab().and_then(|t| t.agent_status.lock().ok().map(|s| s.clone())), Some(AgentTabStatus::Error(SessionFailureClass::RateLimited)));
+
+        // 2. Next turn (`UserPromptSubmit`) clears `session_failure` and resets the status dot to Working
+        let prompt_cmd = claude_hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().expect("UserPromptSubmit hook command").to_string();
+        run_hook_command(&prompt_cmd);
+        let _ = st.poll_live_agent_bridge();
+
+        assert!(st.active_tab().and_then(|t| t.session_failure.as_ref()).is_none(), "UserPromptSubmit must clear session_failure");
+        assert_eq!(st.active_tab().and_then(|t| t.agent_status.lock().ok().map(|s| s.clone())), Some(AgentTabStatus::Working(None)));
+
+        // 3. Antigravity `PreInvocation` also clears an active session_failure
+        let agy_hooks = read_json(&st.session_dir.join(".agents").join("hooks.json"));
+        let agy_stop_failure = agy_hooks["designos-status"]["StopFailure"][0]["command"].as_str().expect("agy StopFailure hook").to_string();
+        run_hook_command(&agy_stop_failure);
+        let _ = st.poll_live_agent_bridge();
+        assert!(st.active_tab().and_then(|t| t.session_failure.as_ref()).is_some());
+
+        let agy_pre = agy_hooks["designos-status"]["PreInvocation"][0]["command"].as_str().expect("agy PreInvocation hook").to_string();
+        run_hook_command(&agy_pre);
+        let _ = st.poll_live_agent_bridge();
+        assert!(st.active_tab().and_then(|t| t.session_failure.as_ref()).is_none(), "PreInvocation must clear session_failure");
+        assert_eq!(st.active_tab().and_then(|t| t.agent_status.lock().ok().map(|s| s.clone())), Some(AgentTabStatus::Working(None)));
+        kill_tabs(&mut st);
+    }
+
+    #[test]
+    fn non_zero_exit_after_start_window_records_session_failure_and_zero_exit_does_not() {
+        let mut st = exited_stub_state();
+        st.active_tab_mut().unwrap().spawned_at = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        let _ = st.poll_live_agent_bridge();
+        assert!(st.active_tab().unwrap().start_failure.is_none());
+        assert_eq!(st.active_tab().and_then(|t| t.session_failure.as_ref().map(|f| f.class)), Some(SessionFailureClass::Unknown));
+        assert_eq!(st.active_tab().and_then(|t| t.agent_status.lock().ok().map(|s| s.clone())), Some(AgentTabStatus::Error(SessionFailureClass::Unknown)));
+
+        // Clean exit (exit code 0) after START_FAILURE_WINDOW must never record a failure
+        let mut clean_cmd = build_agent_shell_cmd(&default_shell_program(), "sh -c 'echo BYE; exit 0'");
+        isolate_zsh_from_home(&mut clean_cmd);
+        let tab = TerminalTab::spawn_with_session_cmd(2, AgentCliPreset::Claude, 24, 80, None, None, Some(clean_cmd)).expect("spawn clean stub");
+        let mut st_clean = TerminalState { tabs: vec![tab], active_tab: 0, ..Default::default() };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while st_clean.active_tab_mut().unwrap().is_alive() {
+            assert!(std::time::Instant::now() < deadline, "clean stub must exit");
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        st_clean.active_tab_mut().unwrap().spawned_at = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        let _ = st_clean.poll_live_agent_bridge();
+        assert!(st_clean.active_tab().unwrap().start_failure.is_none());
+        assert!(st_clean.active_tab().unwrap().session_failure.is_none(), "exit code 0 is a clean exit and must not record session_failure");
     }
 }

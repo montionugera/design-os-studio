@@ -1,3 +1,5 @@
+mod agent_failure_redact;
+mod agent_session_failure;
 mod agent_start_failure;
 mod app;
 mod board;
