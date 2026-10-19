@@ -113,16 +113,17 @@ impl Engine {
                 let a: CodeArgs = parse(args)?;
                 let id = self.node(a.node_id)?.id;
                 let doc = designos_doc::apply_bound_variables(&self.doc);
-                let code = match a.language.as_str() {
-                    "css" => designos_export::css_for(&doc, id),
-                    "tailwind" => designos_export::tailwind_for(&doc, id),
-                    "react" => designos_export::react_for(&doc, id),
-                    "swiftui" => designos_export::swiftui_for(&doc, id),
-                    "uikit" => designos_export::uikit_for(&doc, id),
-                    "compose" => designos_export::compose_for(&doc, id),
-                    "android-xml" => designos_export::android_xml_for(&doc, id),
-                    "svg" => designos_export::export_svg(&doc, id, &Default::default()),
-                    _ => return Err("language must be css, tailwind, react, swiftui, uikit, compose, android-xml, or svg".into()),
+                let code = if a.language == "svg" {
+                    designos_export::export_svg(&doc, id, &Default::default())
+                } else if let Some(lang) = designos_export::CodeLanguage::from_id(&a.language) {
+                    if lang == designos_export::CodeLanguage::Html {
+                        designos_export::html_with(&doc, id, &designos_export::HtmlOptions { fragment: a.fragment })
+                    } else {
+                        lang.generate(&doc, id, false)
+                    }
+                } else {
+                    let allowed: Vec<&str> = designos_export::CodeLanguage::ALL.iter().map(|l| l.id()).chain(std::iter::once("svg")).collect();
+                    return Err(format!("language must be one of: {}", allowed.join(", ")));
                 };
                 Ok(json!({"node_id":id,"language":a.language,"code":code}))
             }
@@ -604,6 +605,8 @@ struct VariablesArgs {
 struct CodeArgs {
     node_id: u64,
     language: String,
+    #[serde(default)]
+    fragment: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -741,10 +744,11 @@ pub fn tools() -> Vec<Value> {
         true,
         true,
     );
+    let code_langs: Vec<&str> = designos_export::CodeLanguage::ALL.iter().map(|l| l.id()).chain(std::iter::once("svg")).collect();
     add(
         "generate_code",
         "Generate developer handoff code or SVG for a layer using resolved variable values. Returns source text; writes no files.",
-        json!({"node_id":id,"language":{"type":"string","enum":["css","tailwind","react","swiftui","uikit","compose","android-xml","svg"]}}),
+        json!({"node_id":id,"language":{"type":"string","enum":code_langs},"fragment":{"type":"boolean","default":false,"description":"When language is html, emit only <style> and the root element without <!doctype html>, <html>, <head>, or <body>."}}),
         vec!["node_id", "language"],
         true,
         true,
@@ -968,16 +972,20 @@ mod tests {
         assert_eq!(result["total"], 2);
         assert_eq!(result["nodes"][0]["node_id"], id);
         assert_eq!(result["next_offset"], 1);
-        for language in ["css", "tailwind", "react", "swiftui", "uikit", "compose", "android-xml", "svg"] {
+        for language in ["css", "tailwind", "react", "swiftui", "uikit", "compose", "android-xml", "html", "svg"] {
             let output = e.call("designos_generate_code", json!({"node_id":id,"language":language})).unwrap();
             assert!(!output["code"].as_str().unwrap().is_empty());
         }
+        let html_doc = e.call("designos_generate_code", json!({"node_id":id,"language":"html"})).unwrap();
+        assert!(html_doc["code"].as_str().unwrap().starts_with("<!doctype html>"), "{html_doc}");
+        let html_frag = e.call("designos_generate_code", json!({"node_id":id,"language":"html","fragment":true})).unwrap();
+        assert!(html_frag["code"].as_str().unwrap().starts_with("<style>"), "{html_frag}");
         let uikit = e.call("designos_generate_code", json!({"node_id":id,"language":"uikit"})).unwrap();
         assert!(uikit["code"].as_str().unwrap().starts_with("let card = "), "{uikit}");
         let xml = e.call("designos_generate_code", json!({"node_id":id,"language":"android-xml"})).unwrap();
         assert!(xml["code"].as_str().unwrap().starts_with("<!-- res/layout/card.xml -->"), "{xml}");
         let err = e.call("designos_generate_code", json!({"node_id":id,"language":"vue"})).unwrap_err();
-        assert!(err.contains("uikit") && err.contains("android-xml"), "{err}");
+        assert!(err.contains("uikit") && err.contains("android-xml") && err.contains("html"), "{err}");
         assert!(e.call("designos_list_nodes", json!({"limit":501})).is_err());
         assert!(e.call("designos_get_node", json!({"node_id":"2"})).is_err());
     }
