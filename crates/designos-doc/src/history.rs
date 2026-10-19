@@ -233,13 +233,7 @@ impl History {
     }
 
     /// Applies `cmd` and records the resulting undo step attributed to `run_id` / `label`.
-    pub fn exec_for_run(
-        &mut self,
-        doc: &mut Document,
-        cmd: Command,
-        run_id: Option<String>,
-        label: Option<String>,
-    ) -> Result<(), DocError> {
+    pub fn exec_for_run(&mut self, doc: &mut Document, cmd: Command, run_id: Option<String>, label: Option<String>) -> Result<(), DocError> {
         let inv = cmd.apply(doc)?;
         self.undo.push(inv);
         self.undo_meta.push(UndoStepMeta { run_id, label });
@@ -269,10 +263,7 @@ impl History {
         while self.undo_meta.len() < self.undo.len() {
             self.undo_meta.push(UndoStepMeta::default());
         }
-        let matching_indices: Vec<usize> = (0..self.undo.len())
-            .rev()
-            .filter(|&i| self.undo_meta[i].run_id.as_deref() == Some(run_id))
-            .collect();
+        let matching_indices: Vec<usize> = (0..self.undo.len()).rev().filter(|&i| self.undo_meta[i].run_id.as_deref() == Some(run_id)).collect();
         if matching_indices.is_empty() {
             return Ok(0);
         }
@@ -284,10 +275,7 @@ impl History {
         }
         let inv = apply_and_relayout(doc, Command::Batch(cmds_in_rev_order))?;
         self.redo.push(inv);
-        self.redo_meta.push(UndoStepMeta {
-            run_id: Some(run_id.to_string()),
-            label: Some(format!("Undo run {run_id}")),
-        });
+        self.redo_meta.push(UndoStepMeta { run_id: Some(run_id.to_string()), label: Some(format!("Undo run {run_id}")) });
         Ok(count)
     }
 
@@ -309,11 +297,7 @@ impl History {
                 if let Some(l) = label {
                     labels.push(l);
                 }
-                groups.push(RunUndoGroup {
-                    run_id,
-                    step_count: 1,
-                    labels,
-                });
+                groups.push(RunUndoGroup { run_id, step_count: 1, labels });
             }
         }
         groups
@@ -331,10 +315,7 @@ impl History {
 
     /// Number of undo steps currently recorded for `run_id`.
     pub fn run_step_count(&self, run_id: &str) -> usize {
-        self.undo_meta
-            .iter()
-            .filter(|m| m.run_id.as_deref() == Some(run_id))
-            .count()
+        self.undo_meta.iter().filter(|m| m.run_id.as_deref() == Some(run_id)).count()
     }
 
     /// Reverts the latest step. Any deferred auto-layout queue from the superseded edit is dropped

@@ -211,9 +211,7 @@ fn toast_text(r: &LivePatchReport, committed: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use designos_doc::live_patch::{
-        Lease, LeasePurpose, LiveOp, LivePatch, SiblingHint,
-    };
+    use designos_doc::live_patch::{Lease, LeasePurpose, LiveOp, LivePatch, SiblingHint};
     use designos_doc::{Document, Node, Rect};
 
     #[test]
@@ -223,21 +221,11 @@ mod tests {
         let mut app = App::new(doc);
         let frame_a = app.doc.alloc_id();
         let frame_b = app.doc.alloc_id();
-        app.doc
-            .insert(page_id, Node::frame(frame_a, Rect::new(0.0, 0.0, 400.0, 300.0)))
-            .unwrap();
-        app.doc
-            .insert(page_id, Node::frame(frame_b, Rect::new(500.0, 0.0, 400.0, 300.0)))
-            .unwrap();
+        app.doc.insert(page_id, Node::frame(frame_a, Rect::new(0.0, 0.0, 400.0, 300.0))).unwrap();
+        app.doc.insert(page_id, Node::frame(frame_b, Rect::new(500.0, 0.0, 400.0, 300.0))).unwrap();
 
-        app.terminal
-            .leases
-            .grant(Lease::new("agent-a", vec![frame_a], LeasePurpose::Split))
-            .unwrap();
-        app.terminal
-            .leases
-            .grant(Lease::new("agent-b", vec![frame_b], LeasePurpose::Split))
-            .unwrap();
+        app.terminal.leases.grant(Lease::new("agent-a", vec![frame_a], LeasePurpose::Split)).unwrap();
+        app.terminal.leases.grant(Lease::new("agent-b", vec![frame_b], LeasePurpose::Split)).unwrap();
         app.terminal.live_patch.state.leases = app.terminal.leases.clone();
 
         // Agent B writes 5 batches into frame_b; Agent A writes 2 batches into frame_a.
@@ -245,25 +233,17 @@ mod tests {
         for i in 0..2 {
             let nid = app.doc.alloc_id();
             let node = Node::rectangle(nid, Rect::new(i as f32 * 10.0, 0.0, 20.0, 20.0));
-            let patch = LivePatch::new(vec![LiveOp::Insert {
-                parent: frame_a,
-                at: SiblingHint::default(),
-                nodes: vec![node],
-            }])
-            .with_run_id(Some("agent-a".to_string()))
-            .with_label(Some(format!("a-batch-{i}")));
+            let patch = LivePatch::new(vec![LiveOp::Insert { parent: frame_a, at: SiblingHint::default(), nodes: vec![node] }])
+                .with_run_id(Some("agent-a".to_string()))
+                .with_label(Some(format!("a-batch-{i}")));
             patches.push(patch);
         }
         for i in 0..5 {
             let nid = app.doc.alloc_id();
             let node = Node::rectangle(nid, Rect::new(i as f32 * 10.0, 0.0, 20.0, 20.0));
-            let patch = LivePatch::new(vec![LiveOp::Insert {
-                parent: frame_b,
-                at: SiblingHint::default(),
-                nodes: vec![node],
-            }])
-            .with_run_id(Some("agent-b".to_string()))
-            .with_label(Some(format!("b-batch-{i}")));
+            let patch = LivePatch::new(vec![LiveOp::Insert { parent: frame_b, at: SiblingHint::default(), nodes: vec![node] }])
+                .with_run_id(Some("agent-b".to_string()))
+                .with_label(Some(format!("b-batch-{i}")));
             patches.push(patch);
         }
 

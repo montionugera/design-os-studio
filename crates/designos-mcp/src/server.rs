@@ -51,11 +51,7 @@ impl LiveSessionBridge {
 
         let any_env = session_dir.is_some() || env_canvas.is_some() || env_doc_sync.is_some() || env_spec.is_some() || env_ctx.is_some() || env_patch.is_some();
         if !any_env {
-            return Self {
-                run_id,
-                lead_run_id,
-                ..Self::default()
-            };
+            return Self { run_id, lead_run_id, ..Self::default() };
         }
 
         let live_canvas_path = env_canvas
@@ -190,14 +186,7 @@ impl Session {
         }
         let bridge = LiveSessionBridge::from_env();
         let lease_guard = crate::tools::lease::LeaseGuard::new(bridge.session_dir.clone());
-        let mut s = Self {
-            engine: Engine::default(),
-            root,
-            dirty: false,
-            history_dropped: false,
-            bridge,
-            lease_guard,
-        };
+        let mut s = Self { engine: Engine::default(), root, dirty: false, history_dropped: false, bridge, lease_guard };
         s.engine.leases = s.lease_guard.table.clone();
         s.record_live_ops();
         s.sync_from_live_canvas_if_newer();
@@ -212,14 +201,7 @@ impl Session {
         }
         let bridge = LiveSessionBridge::for_session_dir(session_dir);
         let lease_guard = crate::tools::lease::LeaseGuard::new(bridge.session_dir.clone());
-        let mut s = Self {
-            engine: Engine::default(),
-            root,
-            dirty: false,
-            history_dropped: false,
-            bridge,
-            lease_guard,
-        };
+        let mut s = Self { engine: Engine::default(), root, dirty: false, history_dropped: false, bridge, lease_guard };
         s.engine.leases = s.lease_guard.table.clone();
         s.record_live_ops();
         s.sync_from_live_canvas_if_newer();
@@ -227,19 +209,11 @@ impl Session {
     }
 
     pub fn effective_run_id(&self) -> Option<String> {
-        self.bridge
-            .run_id
-            .clone()
-            .or_else(|| self.engine.effective_run_id())
+        self.bridge.run_id.clone().or_else(|| self.engine.effective_run_id())
     }
 
     pub fn effective_lead_run_id(&self) -> Option<String> {
-        self.bridge.lead_run_id.clone().or_else(|| {
-            std::env::var("DESIGNOS_LEAD_RUN_ID")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
+        self.bridge.lead_run_id.clone().or_else(|| std::env::var("DESIGNOS_LEAD_RUN_ID").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
     }
 
     /// Reloads `self.engine.doc` from `live_canvas_path` if `design:os studio` wrote a newer canvas
@@ -465,11 +439,7 @@ impl Session {
         );
         if is_mutating_tool {
             let caller = self.effective_run_id();
-            let eff_table = crate::tools::lease::effective_lease_table(
-                &self.lease_guard.table,
-                self.engine.owned_frames.as_deref(),
-                caller.as_deref(),
-            );
+            let eff_table = crate::tools::lease::effective_lease_table(&self.lease_guard.table, self.engine.owned_frames.as_deref(), caller.as_deref());
             crate::tools::lease::check_tool_write_guard(
                 &self.engine.doc,
                 &self.engine.history,
@@ -485,13 +455,7 @@ impl Session {
             "designos_spawn_agents" => {
                 let caller = self.effective_run_id();
                 let lead = self.effective_lead_run_id();
-                let res = crate::tools::agents::spawn_agents(
-                    &mut self.engine,
-                    &mut self.lease_guard,
-                    caller.as_deref(),
-                    lead.as_deref(),
-                    args,
-                )?;
+                let res = crate::tools::agents::spawn_agents(&mut self.engine, &mut self.lease_guard, caller.as_deref(), lead.as_deref(), args)?;
                 if res.get("changed").and_then(Value::as_bool) == Some(true) {
                     self.publish_live_patch()?;
                     self.dirty = true;
@@ -501,13 +465,7 @@ impl Session {
             "designos_assign_frames" => {
                 let caller = self.effective_run_id();
                 let lead = self.effective_lead_run_id();
-                crate::tools::agents::assign_frames(
-                    &mut self.engine,
-                    &mut self.lease_guard,
-                    caller.as_deref(),
-                    lead.as_deref(),
-                    args,
-                )
+                crate::tools::agents::assign_frames(&mut self.engine, &mut self.lease_guard, caller.as_deref(), lead.as_deref(), args)
             }
             "designos_list_agents" => {
                 let _: serde_json::Map<String, Value> = parse(args)?;
@@ -516,13 +474,7 @@ impl Session {
             "designos_stop_agents" => {
                 let caller = self.effective_run_id();
                 let lead = self.effective_lead_run_id();
-                let res = crate::tools::agents::stop_agents(
-                    &mut self.engine,
-                    &mut self.lease_guard,
-                    caller.as_deref(),
-                    lead.as_deref(),
-                    args,
-                )?;
+                let res = crate::tools::agents::stop_agents(&mut self.engine, &mut self.lease_guard, caller.as_deref(), lead.as_deref(), args)?;
                 if res.get("changed").and_then(Value::as_bool) == Some(true) {
                     self.publish_live_patch()?;
                     self.dirty = true;

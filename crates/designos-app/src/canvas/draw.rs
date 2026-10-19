@@ -450,10 +450,8 @@ pub fn owner_pill_badge_rect(app: &App, id: NodeId, after_rect: ERect) -> Option
     let char_px = theme::FONT_SIZE_BODY * 0.58;
     let text_w = display_name.chars().count() as f32 * char_px + theme::OWNER_PILL_EXTRA_W;
     let half_h = theme::OWNER_PILL_HEIGHT * 0.5;
-    let pill_r = ERect::from_min_size(
-        Pos2::new(after_rect.right() + theme::OWNER_PILL_GAP, after_rect.center().y - half_h),
-        EV::new(text_w, theme::OWNER_PILL_HEIGHT),
-    );
+    let pill_r =
+        ERect::from_min_size(Pos2::new(after_rect.right() + theme::OWNER_PILL_GAP, after_rect.center().y - half_h), EV::new(text_w, theme::OWNER_PILL_HEIGHT));
     Some((pill_r, display_name, status, col))
 }
 

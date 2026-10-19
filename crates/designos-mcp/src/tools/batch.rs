@@ -1129,10 +1129,7 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
                 if let Some(rid) = caller_run_id.as_deref() {
                     for &sid in &subtree_ids {
                         if let Some(n_mut) = trial.get_mut(sid) {
-                            n_mut.plugin_data.insert(
-                                designos_doc::live_patch::PLUGIN_DATA_RUN_KEY.to_string(),
-                                rid.to_string(),
-                            );
+                            n_mut.plugin_data.insert(designos_doc::live_patch::PLUGIN_DATA_RUN_KEY.to_string(), rid.to_string());
                         }
                     }
                 }
@@ -1191,10 +1188,7 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
                     build_created_node(&mut trial, parent, a.index, &a.kind, a.name.clone(), a.text.clone(), a.x, a.y, a.width, a.height)
                         .map_err(|e| op_failed_error(op_idx, op_name, "INVALID_ARGUMENTS", &op_path, e))?;
                 if let Some(rid) = caller_run_id.as_deref() {
-                    node.plugin_data.insert(
-                        designos_doc::live_patch::PLUGIN_DATA_RUN_KEY.to_string(),
-                        rid.to_string(),
-                    );
+                    node.plugin_data.insert(designos_doc::live_patch::PLUGIN_DATA_RUN_KEY.to_string(), rid.to_string());
                 }
 
                 let cmd = Command::Insert { parent, index: target_idx, nodes: vec![node] };
@@ -1244,10 +1238,7 @@ pub fn apply(engine: &mut Engine, args: Value) -> Result<Value, String> {
                 }
                 if node_changed {
                     if let Some(rid) = caller_run_id.as_deref() {
-                        updated_node.plugin_data.insert(
-                            designos_doc::live_patch::PLUGIN_DATA_RUN_KEY.to_string(),
-                            rid.to_string(),
-                        );
+                        updated_node.plugin_data.insert(designos_doc::live_patch::PLUGIN_DATA_RUN_KEY.to_string(), rid.to_string());
                     }
                     let cmd = Command::Update { node: Box::new(updated_node) };
                     if recording_live {
@@ -2193,8 +2184,16 @@ mod tests {
         for (target_nodes, budget_ms) in cases {
             let (doc, page, target_board) = build_synthetic_document(target_nodes);
             let approx_doc_bytes = doc.nodes.len() * std::mem::size_of::<Node>();
-            let mut engine =
-                Engine { doc, history: Default::default(), active_page_id: Some(page), live_ops: None, live_patch_label: None, owned_frames: None, run_id: None, leases: Default::default() };
+            let mut engine = Engine {
+                doc,
+                history: Default::default(),
+                active_page_id: Some(page),
+                live_ops: None,
+                live_patch_label: None,
+                owned_frames: None,
+                run_id: None,
+                leases: Default::default(),
+            };
 
             let pre_hash = batch_state_hash(&engine.doc, &[page, target_board]);
             let pre_len = engine.doc.nodes.len();

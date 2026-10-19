@@ -1,8 +1,6 @@
 //! MCP write guard for RD-3 frame ownership leases (`docs/specs/v0.6/RD-3-parallel-agents-frame-ownership.md` §3.2).
 
-use designos_doc::live_patch::{
-    root_frame_of, AffectedSet, Lease, LeasePurpose, LeaseTable, LeaseViolation,
-};
+use designos_doc::live_patch::{root_frame_of, AffectedSet, Lease, LeasePurpose, LeaseTable, LeaseViolation};
 use designos_doc::{Document, History, NodeId};
 use serde_json::{json, Value};
 use std::fs;
@@ -10,13 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Structured MCP error JSON string matching the §6 error taxonomy.
-pub fn structured_error(
-    code: &str,
-    message: impl Into<String>,
-    path: &str,
-    valid_options: Option<Vec<String>>,
-    safe_to_retry: bool,
-) -> String {
+pub fn structured_error(code: &str, message: impl Into<String>, path: &str, valid_options: Option<Vec<String>>, safe_to_retry: bool) -> String {
     let msg = message.into();
     let mut obj = serde_json::Map::new();
     obj.insert("code".into(), json!(code));
@@ -32,21 +24,11 @@ pub fn structured_error(
 /// Formats a `LeaseViolation` into a structured `OUTSIDE_OWNED_FRAMES` or `FRAME_LEASED` JSON error string (§3.2, §6).
 pub fn format_lease_violation(doc: &Document, violation: &LeaseViolation, path_override: &str) -> String {
     match violation {
-        LeaseViolation::OutsideOwnedFrames {
-            run_id,
-            node_id,
-            owner_run_id,
-            valid_frames,
-            path,
-        } => {
+        LeaseViolation::OutsideOwnedFrames { run_id, node_id, owner_run_id, valid_frames, path } => {
             let caller = if run_id.is_empty() { "unknown" } else { run_id.as_str() };
             let valid_options: Vec<String> = valid_frames.iter().map(|id| id.0.to_string()).collect();
             let frames_list = valid_options.join(", ");
-            let eff_path = if !path_override.is_empty() {
-                path_override
-            } else {
-                path.as_str()
-            };
+            let eff_path = if !path_override.is_empty() { path_override } else { path.as_str() };
             let rf = node_id.and_then(|nid| root_frame_of(doc, nid));
             let message = match (*node_id, rf, owner_run_id) {
                 (Some(target), Some(root_f), Some(owner)) => {
@@ -64,16 +46,10 @@ pub fn format_lease_violation(doc: &Document, violation: &LeaseViolation, path_o
                     )
                 }
                 (Some(target), None, Some(owner)) => {
-                    format!(
-                        "node {} is owned by {}; this run ({}) may only write inside frames [{}]",
-                        target.0, owner, caller, frames_list
-                    )
+                    format!("node {} is owned by {}; this run ({}) may only write inside frames [{}]", target.0, owner, caller, frames_list)
                 }
                 (Some(target), None, None) => {
-                    format!(
-                        "node {} is not inside any owned frame; this run ({}) may only write inside frames [{}]",
-                        target.0, caller, frames_list
-                    )
+                    format!("node {} is not inside any owned frame; this run ({}) may only write inside frames [{}]", target.0, caller, frames_list)
                 }
                 (None, _, _) => {
                     format!(
@@ -84,25 +60,9 @@ pub fn format_lease_violation(doc: &Document, violation: &LeaseViolation, path_o
             };
             structured_error("OUTSIDE_OWNED_FRAMES", message, eff_path, Some(valid_options), true)
         }
-        LeaseViolation::FrameLeased {
-            frame_id,
-            owner_run_id,
-        } => {
-            let eff_path = if !path_override.is_empty() {
-                path_override
-            } else {
-                "/frames"
-            };
-            structured_error(
-                "FRAME_LEASED",
-                format!(
-                    "frame {} is already leased to active run '{}'",
-                    frame_id.0, owner_run_id
-                ),
-                eff_path,
-                None,
-                false,
-            )
+        LeaseViolation::FrameLeased { frame_id, owner_run_id } => {
+            let eff_path = if !path_override.is_empty() { path_override } else { "/frames" };
+            structured_error("FRAME_LEASED", format!("frame {} is already leased to active run '{}'", frame_id.0, owner_run_id), eff_path, None, false)
         }
     }
 }
@@ -120,13 +80,7 @@ pub struct LeaseGuard {
 
 impl LeaseGuard {
     pub fn new(session_dir: Option<PathBuf>) -> Self {
-        let mut g = Self {
-            session_dir,
-            table: LeaseTable::default(),
-            epoch: 0,
-            last_mtime: None,
-            in_memory_override: false,
-        };
+        let mut g = Self { session_dir, table: LeaseTable::default(), epoch: 0, last_mtime: None, in_memory_override: false };
         g.reload_if_needed();
         g
     }
@@ -199,23 +153,13 @@ pub fn write_leases_atomic(path: &Path, table: &LeaseTable) -> Result<(), String
 
 /// Computes the effective `LeaseTable` by combining `guard_table` with any `owned_frames`
 /// or `DESIGNOS_OWNED_FRAMES` override on `Engine`.
-pub fn effective_lease_table(
-    guard_table: &LeaseTable,
-    engine_owned_frames: Option<&[NodeId]>,
-    caller_run_id: Option<&str>,
-) -> LeaseTable {
+pub fn effective_lease_table(guard_table: &LeaseTable, engine_owned_frames: Option<&[NodeId]>, caller_run_id: Option<&str>) -> LeaseTable {
     if !guard_table.leases.is_empty() {
         return guard_table.clone();
     }
     let env_owned: Option<Vec<NodeId>> = std::env::var("DESIGNOS_OWNED_FRAMES")
         .ok()
-        .map(|s| {
-            s.split(',')
-                .filter_map(|p| p.trim().parse::<u64>().ok())
-                .filter(|&id| id > 0)
-                .map(NodeId)
-                .collect()
-        })
+        .map(|s| s.split(',').filter_map(|p| p.trim().parse::<u64>().ok()).filter(|&id| id > 0).map(NodeId).collect())
         .filter(|v: &Vec<NodeId>| !v.is_empty());
 
     if let Some(frames) = engine_owned_frames.or(env_owned.as_deref()) {
@@ -255,16 +199,11 @@ pub fn check_tool_write_guard(
         if tool_name == "designos_undo" {
             if let Some(meta) = history.undo_metas().last() {
                 let top_owner = meta.run_id.as_deref();
-                let ok = top_owner == Some(caller)
-                    || (top_owner.is_none() && caller_lease.is_none());
+                let ok = top_owner == Some(caller) || (top_owner.is_none() && caller_lease.is_none());
                 if !ok {
                     return Err(structured_error(
                         "OUTSIDE_OWNED_FRAMES",
-                        format!(
-                            "top undo step belongs to '{}'; run '{}' may only undo its own steps",
-                            top_owner.unwrap_or("editor"),
-                            caller
-                        ),
+                        format!("top undo step belongs to '{}'; run '{}' may only undo its own steps", top_owner.unwrap_or("editor"), caller),
                         "",
                         Some(allowed_frames),
                         true,
@@ -279,18 +218,11 @@ pub fn check_tool_write_guard(
         return Ok(());
     };
 
-    table
-        .allows(caller, doc, &affected)
-        .map_err(|v| format_lease_violation(doc, &v, &path))
+    table.allows(caller, doc, &affected).map_err(|v| format_lease_violation(doc, &v, &path))
 }
 
 /// Computes the [`AffectedSet`] and JSON pointer path for a mutating MCP tool call (§3.2).
-pub fn compute_tool_affected_set(
-    doc: &Document,
-    default_page: Option<NodeId>,
-    tool_name: &str,
-    args: &Value,
-) -> Option<(AffectedSet, String)> {
+pub fn compute_tool_affected_set(doc: &Document, default_page: Option<NodeId>, tool_name: &str, args: &Value) -> Option<(AffectedSet, String)> {
     match tool_name {
         "designos_open_file" | "designos_new_document" => {
             let mut set = AffectedSet::new();
@@ -298,20 +230,11 @@ pub fn compute_tool_affected_set(
             Some((set, "/document".to_string()))
         }
         "designos_create_node" | "designos_apply_spec" => {
-            let parent_id = args
-                .get("parent_id")
-                .and_then(Value::as_u64)
-                .filter(|&id| id != 0)
-                .map(NodeId)
-                .or(default_page)?;
+            let parent_id = args.get("parent_id").and_then(Value::as_u64).filter(|&id| id != 0).map(NodeId).or(default_page)?;
             Some((AffectedSet::for_nodes([parent_id]), "/parent_id".to_string()))
         }
         "designos_update_node" | "designos_delete_node" | "designos_set_dev_status" => {
-            let node_id = args
-                .get("node_id")
-                .and_then(Value::as_u64)
-                .filter(|&id| id != 0)
-                .map(NodeId)?;
+            let node_id = args.get("node_id").and_then(Value::as_u64).filter(|&id| id != 0).map(NodeId)?;
             Some((AffectedSet::for_nodes([node_id]), "/node_id".to_string()))
         }
         "designos_add_comment" => {
@@ -353,12 +276,7 @@ pub fn compute_tool_affected_set(
                         }
                         if let Some(apply_arr) = op.get("apply").and_then(Value::as_array) {
                             for item in apply_arr {
-                                if let Some(id) = item
-                                    .get("node")
-                                    .or_else(|| item.get("node_id"))
-                                    .and_then(Value::as_u64)
-                                    .filter(|&i| i > 0)
-                                {
+                                if let Some(id) = item.get("node").or_else(|| item.get("node_id")).and_then(Value::as_u64).filter(|&i| i > 0) {
                                     if set.nodes.is_empty() && set.shared_paths.is_empty() {
                                         first_path = format!("/ops/{idx}/apply");
                                     }
@@ -393,12 +311,7 @@ pub fn compute_tool_affected_set(
                         }
                     }
                     "update" | "delete" => {
-                        if let Some(id) = op
-                            .get("node")
-                            .or_else(|| op.get("node_id"))
-                            .and_then(Value::as_u64)
-                            .filter(|&i| i > 0)
-                        {
+                        if let Some(id) = op.get("node").or_else(|| op.get("node_id")).and_then(Value::as_u64).filter(|&i| i > 0) {
                             if set.nodes.is_empty() && set.shared_paths.is_empty() {
                                 first_path = format!("/ops/{idx}/node");
                             }
@@ -406,23 +319,13 @@ pub fn compute_tool_affected_set(
                         }
                     }
                     "move" => {
-                        if let Some(id) = op
-                            .get("node")
-                            .or_else(|| op.get("node_id"))
-                            .and_then(Value::as_u64)
-                            .filter(|&i| i > 0)
-                        {
+                        if let Some(id) = op.get("node").or_else(|| op.get("node_id")).and_then(Value::as_u64).filter(|&i| i > 0) {
                             if set.nodes.is_empty() && set.shared_paths.is_empty() {
                                 first_path = format!("/ops/{idx}/node");
                             }
                             set.add_node(NodeId(id));
                         }
-                        if let Some(pid) = op
-                            .get("parent")
-                            .or_else(|| op.get("parent_id"))
-                            .and_then(Value::as_u64)
-                            .filter(|&i| i > 0)
-                        {
+                        if let Some(pid) = op.get("parent").or_else(|| op.get("parent_id")).and_then(Value::as_u64).filter(|&i| i > 0) {
                             if set.nodes.is_empty() && set.shared_paths.is_empty() {
                                 first_path = format!("/ops/{idx}/parent");
                             }
@@ -462,11 +365,7 @@ pub fn check_batch_node_lease(
         let path = format!("/ops/{op_idx}/{field}");
         let inner_str = format_lease_violation(doc, &violation, &path);
         let inner_val: Value = serde_json::from_str(&inner_str).unwrap_or_else(|_| json!({ "code": "OUTSIDE_OWNED_FRAMES" }));
-        let msg = inner_val
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("target node is outside this agent run's owned frames")
-            .to_string();
+        let msg = inner_val.get("message").and_then(Value::as_str).unwrap_or("target node is outside this agent run's owned frames").to_string();
         let envelope = json!({
             "code": "OUTSIDE_OWNED_FRAMES",
             "failed_op": op_idx,

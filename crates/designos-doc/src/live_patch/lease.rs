@@ -50,14 +50,7 @@ pub struct Lease {
 
 impl Lease {
     pub fn new(run_id: impl Into<String>, frames: Vec<NodeId>, purpose: LeasePurpose) -> Self {
-        Self {
-            run_id: run_id.into(),
-            frames,
-            purpose,
-            lead_run_id: None,
-            allow_shared: false,
-            granted_ms: 0,
-        }
+        Self { run_id: run_id.into(), frames, purpose, lead_run_id: None, allow_shared: false, granted_ms: 0 }
     }
 
     pub fn with_lead(mut self, lead_run_id: Option<String>) -> Self {
@@ -172,17 +165,8 @@ impl AffectedSet {
 /// Violation returned by [`LeaseTable::allows`] or [`LeaseTable::grant`] (`RD-3 §3.2`, `§5`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LeaseViolation {
-    OutsideOwnedFrames {
-        run_id: String,
-        node_id: Option<NodeId>,
-        owner_run_id: Option<String>,
-        valid_frames: Vec<NodeId>,
-        path: String,
-    },
-    FrameLeased {
-        frame_id: NodeId,
-        owner_run_id: String,
-    },
+    OutsideOwnedFrames { run_id: String, node_id: Option<NodeId>, owner_run_id: Option<String>, valid_frames: Vec<NodeId>, path: String },
+    FrameLeased { frame_id: NodeId, owner_run_id: String },
 }
 
 impl LeaseViolation {
@@ -240,10 +224,8 @@ impl fmt::Display for LeaseViolation {
 /// True when `id` is a root frame or top-level container eligible for a frame lease (`E15-7` / `RD-3 §3.1`).
 pub fn is_root_frame(doc: &Document, id: NodeId) -> bool {
     let Some(node) = doc.get(id) else { return false };
-    let is_eligible_kind = matches!(
-        node.kind,
-        NodeKind::Frame(_) | NodeKind::Section | NodeKind::Component(_) | NodeKind::ComponentSet(_) | NodeKind::Instance { .. }
-    );
+    let is_eligible_kind =
+        matches!(node.kind, NodeKind::Frame(_) | NodeKind::Section | NodeKind::Component(_) | NodeKind::ComponentSet(_) | NodeKind::Instance { .. });
     if !is_eligible_kind {
         return false;
     }
@@ -251,10 +233,7 @@ pub fn is_root_frame(doc: &Document, id: NodeId) -> bool {
     let Some(parent) = doc.get(parent_id) else { return false };
     match parent.kind {
         NodeKind::Page { .. } => true,
-        NodeKind::Section => parent
-            .parent
-            .and_then(|gp| doc.get(gp))
-            .is_some_and(|gn| matches!(gn.kind, NodeKind::Page { .. })),
+        NodeKind::Section => parent.parent.and_then(|gp| doc.get(gp)).is_some_and(|gn| matches!(gn.kind, NodeKind::Page { .. })),
         _ => false,
     }
 }
@@ -373,10 +352,7 @@ impl LeaseTable {
     pub fn grant(&mut self, lease: Lease) -> Result<(), LeaseViolation> {
         for &fid in &lease.frames {
             if let Some(existing) = self.leases.iter().find(|l| l.run_id != lease.run_id && l.frames.contains(&fid)) {
-                return Err(LeaseViolation::FrameLeased {
-                    frame_id: fid,
-                    owner_run_id: existing.run_id.clone(),
-                });
+                return Err(LeaseViolation::FrameLeased { frame_id: fid, owner_run_id: existing.run_id.clone() });
             }
         }
         if let Some(slot) = self.leases.iter_mut().find(|l| l.run_id == lease.run_id) {
@@ -455,10 +431,7 @@ impl LeaseTable {
                     continue;
                 }
                 if !is_within_frames(doc, node_id, &active_frames) {
-                    let owner = self
-                        .owner_of_node(doc, node_id)
-                        .map(|(l, _)| l.run_id.clone())
-                        .filter(|r| r != run_id);
+                    let owner = self.owner_of_node(doc, node_id).map(|(l, _)| l.run_id.clone()).filter(|r| r != run_id);
                     return Err(LeaseViolation::OutsideOwnedFrames {
                         run_id: run_id.to_string(),
                         node_id: Some(node_id),
@@ -499,9 +472,7 @@ impl LeaseTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::live_patch::{
-        live_ops_for_command, replay_live_patch_with_leases, LivePatch, LivePatchState, SiblingHint,
-    };
+    use crate::live_patch::{live_ops_for_command, replay_live_patch_with_leases, LivePatch, LivePatchState, SiblingHint};
     use crate::{Command, Document, History, Node, NodeId, Rect};
     use serde_json::Map;
 
@@ -530,23 +501,12 @@ mod tests {
         // Hand-written patch line with run_id = "agent-a" attempting to mutate a node inside frame_b.
         let mut set = Map::new();
         set.insert("name".to_string(), serde_json::json!("HackedByA"));
-        let patch = LivePatch::new(vec![LiveOp::Update {
-            id: child_in_b,
-            set,
-            unset: Vec::new(),
-        }])
-        .with_run_id(Some("agent-a".to_string()))
-        .with_label(Some("update_node".to_string()));
+        let patch = LivePatch::new(vec![LiveOp::Update { id: child_in_b, set, unset: Vec::new() }])
+            .with_run_id(Some("agent-a".to_string()))
+            .with_label(Some("update_node".to_string()));
 
         let mut state = LivePatchState::default();
-        let report = replay_live_patch_with_leases(
-            &mut doc,
-            &patch,
-            &mut state,
-            &leases,
-            &mut |d, c| c.apply(d).map(|_| ()),
-        )
-        .unwrap();
+        let report = replay_live_patch_with_leases(&mut doc, &patch, &mut state, &leases, &mut |d, c| c.apply(d).map(|_| ())).unwrap();
 
         assert_eq!(report.applied, 0);
         assert_eq!(report.skipped.len(), 1);
@@ -569,27 +529,15 @@ mod tests {
 
         let mut interleaved_patches: Vec<LivePatch> = Vec::with_capacity(150);
         for batch_idx in 0..50 {
-            for (agent_doc, frame_id, run_id) in [
-                (&mut doc_a, f_a, "agent-a"),
-                (&mut doc_b, f_b, "agent-b"),
-                (&mut doc_c, f_c, "agent-c"),
-            ] {
+            for (agent_doc, frame_id, run_id) in [(&mut doc_a, f_a, "agent-a"), (&mut doc_b, f_b, "agent-b"), (&mut doc_c, f_c, "agent-c")] {
                 let nid = agent_doc.alloc_id();
                 let mut node = Node::rectangle(nid, Rect::new(batch_idx as f32 * 4.0, 0.0, 12.0, 12.0));
                 node.name = format!("{run_id}-rect-{batch_idx}");
                 let idx = agent_doc.get(frame_id).unwrap().children.len();
-                let cmd = Command::Insert {
-                    parent: frame_id,
-                    index: idx,
-                    nodes: vec![node],
-                };
+                let cmd = Command::Insert { parent: frame_id, index: idx, nodes: vec![node] };
                 let ops = live_ops_for_command(agent_doc, &cmd).unwrap();
                 cmd.apply(agent_doc).unwrap();
-                interleaved_patches.push(
-                    LivePatch::new(ops)
-                        .with_run_id(Some(run_id.to_string()))
-                        .with_label(Some("create_node".to_string())),
-                );
+                interleaved_patches.push(LivePatch::new(ops).with_run_id(Some(run_id.to_string())).with_label(Some("create_node".to_string())));
             }
         }
         assert_eq!(interleaved_patches.len(), 150);
@@ -599,13 +547,9 @@ mod tests {
         for patch in &interleaved_patches {
             let rid = patch.run_id.clone();
             let lbl = patch.label.clone();
-            let report = replay_live_patch_with_leases(
-                &mut studio_doc,
-                patch,
-                &mut state,
-                &leases,
-                &mut |d, c| studio_hist.exec_for_run(d, c, rid.clone(), lbl.clone()),
-            )
+            let report = replay_live_patch_with_leases(&mut studio_doc, patch, &mut state, &leases, &mut |d, c| {
+                studio_hist.exec_for_run(d, c, rid.clone(), lbl.clone())
+            })
             .unwrap();
             assert_eq!(report.skipped.len(), 0);
             assert_eq!(report.applied, 1);
@@ -632,28 +576,13 @@ mod tests {
                 let nid = studio_doc.alloc_id();
                 let mut node = Node::rectangle(nid, Rect::new(round as f32 * 10.0, 0.0, 20.0, 20.0));
                 node.name = format!("{run_id}-{round}");
-                let patch = LivePatch::new(vec![LiveOp::Insert {
-                    parent: frame_id,
-                    at: SiblingHint::default(),
-                    nodes: vec![node],
-                }])
-                .with_run_id(Some(run_id.to_string()))
-                .with_label(Some("create_node".to_string()));
+                let patch = LivePatch::new(vec![LiveOp::Insert { parent: frame_id, at: SiblingHint::default(), nodes: vec![node] }])
+                    .with_run_id(Some(run_id.to_string()))
+                    .with_label(Some("create_node".to_string()));
 
-                replay_live_patch_with_leases(
-                    &mut studio_doc,
-                    &patch,
-                    &mut state,
-                    &leases,
-                    &mut |d, c| {
-                        studio_hist.exec_for_run(
-                            d,
-                            c,
-                            Some(run_id.to_string()),
-                            Some("create_node".to_string()),
-                        )
-                    },
-                )
+                replay_live_patch_with_leases(&mut studio_doc, &patch, &mut state, &leases, &mut |d, c| {
+                    studio_hist.exec_for_run(d, c, Some(run_id.to_string()), Some("create_node".to_string()))
+                })
                 .unwrap();
             }
         }
@@ -678,29 +607,15 @@ mod tests {
 
         let nid = doc.alloc_id();
         let node = Node::rectangle(nid, Rect::new(0.0, 0.0, 100.0, 40.0));
-        let patch = LivePatch::new(vec![LiveOp::Insert {
-            parent: frame_a,
-            at: SiblingHint::default(),
-            nodes: vec![node],
-        }])
-        .with_run_id(Some("agent-a".to_string()))
-        .with_label(Some("create_node".to_string()));
+        let patch = LivePatch::new(vec![LiveOp::Insert { parent: frame_a, at: SiblingHint::default(), nodes: vec![node] }])
+            .with_run_id(Some("agent-a".to_string()))
+            .with_label(Some("create_node".to_string()));
 
         let mut state = LivePatchState::default();
-        let report = replay_live_patch_with_leases(
-            &mut doc,
-            &patch,
-            &mut state,
-            &leases,
-            &mut |d, c| c.apply(d).map(|_| ()),
-        )
-        .unwrap();
+        let report = replay_live_patch_with_leases(&mut doc, &patch, &mut state, &leases, &mut |d, c| c.apply(d).map(|_| ())).unwrap();
         assert_eq!(report.applied, 1);
         let inserted_id = report.inserted_roots[0];
         let created = doc.get(inserted_id).unwrap();
-        assert_eq!(
-            created.plugin_data.get(PLUGIN_DATA_RUN_KEY).map(String::as_str),
-            Some("agent-a")
-        );
+        assert_eq!(created.plugin_data.get(PLUGIN_DATA_RUN_KEY).map(String::as_str), Some("agent-a"));
     }
 }

@@ -761,14 +761,7 @@ pub const OWNER_ROSE: Color32 = Color32::from_rgb(0xEC, 0x48, 0x99);
 pub const OWNER_CYAN: Color32 = Color32::from_rgb(0x06, 0xB6, 0xD4);
 pub const OWNER_LIME: Color32 = Color32::from_rgb(0x84, 0xCC, 0x16);
 
-pub const OWNER_PALETTE: [Color32; 6] = [
-    OWNER_BLUE,
-    OWNER_EMERALD,
-    OWNER_AMBER,
-    OWNER_ROSE,
-    OWNER_CYAN,
-    OWNER_LIME,
-];
+pub const OWNER_PALETTE: [Color32; 6] = [OWNER_BLUE, OWNER_EMERALD, OWNER_AMBER, OWNER_ROSE, OWNER_CYAN, OWNER_LIME];
 
 /// Deterministic non-purple accent color for a sub-agent slot or `run_id` (`§7`).
 pub fn owner_color_for_run(run_id: &str) -> Color32 {
@@ -776,9 +769,7 @@ pub fn owner_color_for_run(run_id: &str) -> Color32 {
         .strip_prefix("agent-")
         .and_then(|s| s.parse::<usize>().ok())
         .and_then(|n| n.checked_sub(1))
-        .unwrap_or_else(|| {
-            run_id.bytes().fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize))
-        });
+        .unwrap_or_else(|| run_id.bytes().fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize)));
     OWNER_PALETTE[idx % OWNER_PALETTE.len()]
 }
 

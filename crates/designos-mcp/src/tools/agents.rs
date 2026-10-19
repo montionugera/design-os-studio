@@ -406,10 +406,7 @@ pub fn check_runtime_installed(runtime: &str) -> Result<(), String> {
     if !SUPPORTED_RUNTIMES.contains(&runtime) {
         return Err(structured_error(
             "RUNTIME_NOT_INSTALLED",
-            format!(
-                "runtime '{runtime}' is not supported or not installed (supported: {})",
-                SUPPORTED_RUNTIMES.join(", ")
-            ),
+            format!("runtime '{runtime}' is not supported or not installed (supported: {})", SUPPORTED_RUNTIMES.join(", ")),
             "/runtime",
             Some(SUPPORTED_RUNTIMES.iter().map(|s| (*s).to_string()).collect()),
             false,
@@ -454,13 +451,7 @@ pub fn check_runtime_installed(runtime: &str) -> Result<(), String> {
     });
 
     if !found {
-        return Err(structured_error(
-            "RUNTIME_NOT_INSTALLED",
-            format!("requested runtime binary '{runtime}' is not on PATH"),
-            "/runtime",
-            None,
-            false,
-        ));
+        return Err(structured_error("RUNTIME_NOT_INSTALLED", format!("requested runtime binary '{runtime}' is not on PATH"), "/runtime", None, false));
     }
     Ok(())
 }
@@ -472,11 +463,7 @@ pub fn load_agents_state(session_dir: &Path) -> AgentsStateFile {
             return parsed;
         }
     }
-    AgentsStateFile {
-        version: 1,
-        next_agent_seq: 1,
-        agents: Vec::new(),
-    }
+    AgentsStateFile { version: 1, next_agent_seq: 1, agents: Vec::new() }
 }
 
 pub fn save_agents_state(session_dir: &Path, state: &AgentsStateFile) -> Result<(), String> {
@@ -492,14 +479,8 @@ fn append_spawn_request(session_dir: &Path, req: &SpawnControlRequest) -> Result
     let _ = fs::create_dir_all(session_dir);
     let path = session_dir.join("spawn-requests.jsonl");
     let line = serde_json::to_string(req).map_err(|e| format!("serialize spawn request: {e}"))? + "\n";
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| format!("open {}: {e}", path.display()))?;
-    f.write_all(line.as_bytes())
-        .and_then(|_| f.flush())
-        .map_err(|e| format!("write {}: {e}", path.display()))
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    f.write_all(line.as_bytes()).and_then(|_| f.flush()).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 fn write_bootstrap_files(
@@ -558,11 +539,7 @@ fn write_bootstrap_files(
 
     let json_path = session_dir.join(format!("bootstrap.{run_id}.json"));
     let md_path = session_dir.join(format!("bootstrap.{run_id}.md"));
-    fs::write(
-        &json_path,
-        serde_json::to_vec_pretty(&json_payload).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| format!("write {}: {e}", json_path.display()))?;
+    fs::write(&json_path, serde_json::to_vec_pretty(&json_payload).map_err(|e| e.to_string())?).map_err(|e| format!("write {}: {e}", json_path.display()))?;
     fs::write(&md_path, system_prompt.as_bytes()).map_err(|e| format!("write {}: {e}", md_path.display()))?;
     Ok(md_path)
 }
@@ -611,31 +588,16 @@ fn clone_frame_subtree(
 /// Validates that `frame_id` exists in `doc` and is a top-level frame on a page.
 fn validate_root_frame(doc: &Document, frame_id: u64, path: &str) -> Result<NodeId, String> {
     if frame_id == 0 {
-        return Err(structured_error(
-            "VALUE_OUT_OF_RANGE",
-            "frame_id must be a positive integer",
-            path,
-            None,
-            false,
-        ));
+        return Err(structured_error("VALUE_OUT_OF_RANGE", "frame_id must be a positive integer", path, None, false));
     }
     let fid = NodeId(frame_id);
     let Some(node) = doc.get(fid) else {
-        return Err(structured_error(
-            "NODE_NOT_FOUND",
-            format!("frame {} not found in document", frame_id),
-            path,
-            None,
-            false,
-        ));
+        return Err(structured_error("NODE_NOT_FOUND", format!("frame {} not found in document", frame_id), path, None, false));
     };
     if !is_root_frame(doc, fid) {
         return Err(structured_error(
             "INVALID_ARGUMENTS",
-            format!(
-                "node {} ('{}') is not a top-level root frame on a page",
-                frame_id, node.name
-            ),
+            format!("node {} ('{}') is not a top-level root frame on a page", frame_id, node.name),
             path,
             None,
             false,
@@ -645,13 +607,7 @@ fn validate_root_frame(doc: &Document, frame_id: u64, path: &str) -> Result<Node
 }
 
 /// Handles `designos_spawn_agents` (`§§4–5`).
-pub fn spawn_agents(
-    engine: &mut Engine,
-    guard: &mut LeaseGuard,
-    caller_run_id: Option<&str>,
-    lead_run_id: Option<&str>,
-    args: Value,
-) -> Result<Value, String> {
+pub fn spawn_agents(engine: &mut Engine, guard: &mut LeaseGuard, caller_run_id: Option<&str>, lead_run_id: Option<&str>, args: Value) -> Result<Value, String> {
     guard.reload_if_needed();
     ensure_caller_is_lead(guard, caller_run_id, lead_run_id)?;
 
@@ -665,15 +621,8 @@ pub fn spawn_agents(
         ));
     };
 
-    let parsed: SpawnAgentsArgs = serde_json::from_value(args).map_err(|e| {
-        structured_error(
-            "INVALID_ARGUMENTS",
-            format!("invalid arguments: {e}"),
-            "",
-            None,
-            false,
-        )
-    })?;
+    let parsed: SpawnAgentsArgs =
+        serde_json::from_value(args).map_err(|e| structured_error("INVALID_ARGUMENTS", format!("invalid arguments: {e}"), "", None, false))?;
 
     let runtime = parsed.runtime.as_deref().unwrap_or("claude").to_string();
     check_runtime_installed(&runtime)?;
@@ -696,10 +645,7 @@ pub fn spawn_agents(
             if tasks.is_empty() || tasks.len() > MAX_SUB_AGENTS {
                 return Err(structured_error(
                     "TOO_MANY_AGENTS",
-                    format!(
-                        "mode 'split' supports 1..={MAX_SUB_AGENTS} tasks, got {}",
-                        tasks.len()
-                    ),
+                    format!("mode 'split' supports 1..={MAX_SUB_AGENTS} tasks, got {}", tasks.len()),
                     "/agents",
                     None,
                     false,
@@ -735,21 +681,11 @@ pub fn spawn_agents(
                     ));
                 }
                 if t.prompt.trim().is_empty() {
-                    return Err(structured_error(
-                        "INVALID_ARGUMENTS",
-                        "prompt must not be empty",
-                        &format!("/agents/{idx}/prompt"),
-                        None,
-                        false,
-                    ));
+                    return Err(structured_error("INVALID_ARGUMENTS", "prompt must not be empty", &format!("/agents/{idx}/prompt"), None, false));
                 }
                 let mut fids = Vec::with_capacity(t.frame_ids.len());
                 for (f_idx, raw_fid) in t.frame_ids.iter().copied().enumerate() {
-                    let fid = validate_root_frame(
-                        &engine.doc,
-                        raw_fid,
-                        &format!("/agents/{idx}/frames/{f_idx}"),
-                    )?;
+                    let fid = validate_root_frame(&engine.doc, raw_fid, &format!("/agents/{idx}/frames/{f_idx}"))?;
                     if !seen_in_call.insert(fid) {
                         return Err(structured_error(
                             "FRAME_LEASED",
@@ -762,10 +698,7 @@ pub fn spawn_agents(
                     if let Some(existing_owner) = guard.table.owner_of_frame(fid) {
                         return Err(structured_error(
                             "FRAME_LEASED",
-                            format!(
-                                "frame {} is already leased to active run '{}'",
-                                fid.0, existing_owner.run_id
-                            ),
+                            format!("frame {} is already leased to active run '{}'", fid.0, existing_owner.run_id),
                             &format!("/agents/{idx}/frames/{f_idx}"),
                             None,
                             false,
@@ -783,23 +716,13 @@ pub fn spawn_agents(
             for (name, fids, prompt, task_rt, allow_shared) in validated_tasks {
                 let run_id = alloc_run_id(&mut agents_state, &guard.table);
                 let purpose = LeasePurpose::Split;
-                let md_path = write_bootstrap_files(
-                    &session_dir,
-                    &engine.doc,
-                    &run_id,
-                    &name,
-                    "split",
-                    &purpose,
-                    &fids,
-                    &prompt,
-                )?;
+                let md_path = write_bootstrap_files(&session_dir, &engine.doc, &run_id, &name, "split", &purpose, &fids, &prompt)?;
                 let bootstrap_str = md_path.to_string_lossy().to_string();
 
-                guard.table.leases.push(
-                    Lease::new(run_id.clone(), fids.clone(), purpose)
-                        .with_allow_shared(allow_shared)
-                        .with_lead(Some(effective_lead_id.clone())),
-                );
+                guard
+                    .table
+                    .leases
+                    .push(Lease::new(run_id.clone(), fids.clone(), purpose).with_allow_shared(allow_shared).with_lead(Some(effective_lead_id.clone())));
 
                 agents_state.agents.push(AgentRunRecord {
                     run_id: run_id.clone(),
@@ -854,57 +777,27 @@ pub fn spawn_agents(
             let variants: Vec<SpawnVariantInput> = if let Some(v) = parsed.variants {
                 v
             } else {
-                let count = parsed
-                    .count
-                    .or_else(|| parsed.agents.as_ref().map(Vec::len))
-                    .unwrap_or(0);
+                let count = parsed.count.or_else(|| parsed.agents.as_ref().map(Vec::len)).unwrap_or(0);
                 if count == 0 {
-                    return Err(structured_error(
-                        "INVALID_ARGUMENTS",
-                        "mode 'side_by_side' requires 'count' (1..=8) or 'variants'",
-                        "/count",
-                        None,
-                        false,
-                    ));
+                    return Err(structured_error("INVALID_ARGUMENTS", "mode 'side_by_side' requires 'count' (1..=8) or 'variants'", "/count", None, false));
                 }
                 if count > MAX_SUB_AGENTS {
                     return Err(structured_error(
                         "TOO_MANY_AGENTS",
-                        format!(
-                            "mode 'side_by_side' supports at most {MAX_SUB_AGENTS} concurrent runs, got {count}"
-                        ),
+                        format!("mode 'side_by_side' supports at most {MAX_SUB_AGENTS} concurrent runs, got {count}"),
                         "/count",
                         None,
                         false,
                     ));
                 }
-                let base_prompt = parsed
-                    .prompt
-                    .clone()
-                    .or_else(|| {
-                        parsed
-                            .agents
-                            .as_ref()
-                            .and_then(|a| a.first())
-                            .map(|t| t.prompt.clone())
-                    })
-                    .unwrap_or_default();
+                let base_prompt =
+                    parsed.prompt.clone().or_else(|| parsed.agents.as_ref().and_then(|a| a.first()).map(|t| t.prompt.clone())).unwrap_or_default();
                 let mut synthesized = Vec::with_capacity(count);
                 for idx in 0..count {
                     let agent_item = parsed.agents.as_ref().and_then(|a| a.get(idx));
-                    let v_name = agent_item
-                        .and_then(|a| a.name.clone())
-                        .unwrap_or_else(|| format!("Variant {}", idx + 1));
-                    let v_prompt = agent_item
-                        .map(|a| a.prompt.clone())
-                        .unwrap_or_else(|| base_prompt.clone());
-                    synthesized.push(SpawnVariantInput {
-                        name: v_name,
-                        prompt: v_prompt,
-                        source_frame_id: parsed.anchor_frame,
-                        width: None,
-                        height: None,
-                    });
+                    let v_name = agent_item.and_then(|a| a.name.clone()).unwrap_or_else(|| format!("Variant {}", idx + 1));
+                    let v_prompt = agent_item.map(|a| a.prompt.clone()).unwrap_or_else(|| base_prompt.clone());
+                    synthesized.push(SpawnVariantInput { name: v_name, prompt: v_prompt, source_frame_id: parsed.anchor_frame, width: None, height: None });
                 }
                 synthesized
             };
@@ -912,10 +805,7 @@ pub fn spawn_agents(
             if variants.is_empty() || variants.len() > MAX_SUB_AGENTS {
                 return Err(structured_error(
                     "TOO_MANY_AGENTS",
-                    format!(
-                        "mode 'side_by_side' requires 1..={MAX_SUB_AGENTS} variants, got {}",
-                        variants.len()
-                    ),
+                    format!("mode 'side_by_side' requires 1..={MAX_SUB_AGENTS} variants, got {}", variants.len()),
                     "/variants",
                     None,
                     false,
@@ -935,45 +825,23 @@ pub fn spawn_agents(
                 ));
             }
 
-            let page_id = engine.resolve_default_page().map_err(|e| {
-                structured_error("NODE_NOT_FOUND", e, "/variants", None, false)
-            })?;
+            let page_id = engine.resolve_default_page().map_err(|e| structured_error("NODE_NOT_FOUND", e, "/variants", None, false))?;
 
             // Validate any source_frame_id references first.
             for (idx, v) in variants.iter().enumerate() {
                 if v.name.trim().is_empty() {
-                    return Err(structured_error(
-                        "INVALID_ARGUMENTS",
-                        "variant name must not be empty",
-                        &format!("/variants/{idx}/name"),
-                        None,
-                        false,
-                    ));
+                    return Err(structured_error("INVALID_ARGUMENTS", "variant name must not be empty", &format!("/variants/{idx}/name"), None, false));
                 }
                 if v.prompt.trim().is_empty() {
-                    return Err(structured_error(
-                        "INVALID_ARGUMENTS",
-                        "variant prompt must not be empty",
-                        &format!("/variants/{idx}/prompt"),
-                        None,
-                        false,
-                    ));
+                    return Err(structured_error("INVALID_ARGUMENTS", "variant prompt must not be empty", &format!("/variants/{idx}/prompt"), None, false));
                 }
                 if let Some(src_raw) = v.source_frame_id {
-                    validate_root_frame(
-                        &engine.doc,
-                        src_raw,
-                        &format!("/variants/{idx}/source_frame_id"),
-                    )?;
+                    validate_root_frame(&engine.doc, src_raw, &format!("/variants/{idx}/source_frame_id"))?;
                 }
             }
 
             // Compute placement X and Y to the right of the rightmost existing root frame on `page_id` (§5.1).
-            let page_children = engine
-                .doc
-                .get(page_id)
-                .map(|p| p.children.clone())
-                .unwrap_or_default();
+            let page_children = engine.doc.get(page_id).map(|p| p.children.clone()).unwrap_or_default();
             let mut rightmost_edge: Option<f32> = None;
             let mut baseline_y: f32 = 0.0;
             for cid in &page_children {
@@ -1008,15 +876,7 @@ pub fn spawn_agents(
                 let insert_index = trial.get(page_id).map(|p| p.children.len()).unwrap_or(0);
 
                 let nodes = if let Some(src_raw) = v.source_frame_id {
-                    clone_frame_subtree(
-                        &mut trial,
-                        NodeId(src_raw),
-                        &v.name,
-                        next_x,
-                        baseline_y,
-                        v.width,
-                        v.height,
-                    )?
+                    clone_frame_subtree(&mut trial, NodeId(src_raw), &v.name, next_x, baseline_y, v.width, v.height)?
                 } else {
                     let fid = trial
                         .try_alloc_id()
@@ -1031,14 +891,8 @@ pub fn spawn_agents(
                 let frame_w = nodes[0].size.x;
                 next_x += frame_w + SIDE_BY_SIDE_GAP_PX;
 
-                let cmd = Command::Insert {
-                    parent: page_id,
-                    index: insert_index,
-                    nodes,
-                };
-                cmd.clone()
-                    .apply(&mut trial)
-                    .map_err(|e| structured_error("INTERNAL_ERROR", e.to_string(), &format!("/variants/{idx}"), None, false))?;
+                let cmd = Command::Insert { parent: page_id, index: insert_index, nodes };
+                cmd.clone().apply(&mut trial).map_err(|e| structured_error("INTERNAL_ERROR", e.to_string(), &format!("/variants/{idx}"), None, false))?;
                 insert_cmds.push(cmd);
                 created_frames.push((frame_id, v.name, v.prompt));
             }
@@ -1058,22 +912,10 @@ pub fn spawn_agents(
                 let run_id = alloc_run_id(&mut agents_state, &guard.table);
                 let purpose = LeasePurpose::SideBySide;
                 let fids = vec![frame_id];
-                let md_path = write_bootstrap_files(
-                    &session_dir,
-                    &engine.doc,
-                    &run_id,
-                    &v_name,
-                    "side_by_side",
-                    &purpose,
-                    &fids,
-                    &v_prompt,
-                )?;
+                let md_path = write_bootstrap_files(&session_dir, &engine.doc, &run_id, &v_name, "side_by_side", &purpose, &fids, &v_prompt)?;
                 let bootstrap_str = md_path.to_string_lossy().to_string();
 
-                guard.table.leases.push(
-                    Lease::new(run_id.clone(), fids.clone(), purpose)
-                        .with_lead(Some(effective_lead_id.clone())),
-                );
+                guard.table.leases.push(Lease::new(run_id.clone(), fids.clone(), purpose).with_lead(Some(effective_lead_id.clone())));
 
                 agents_state.agents.push(AgentRunRecord {
                     run_id: run_id.clone(),
@@ -1132,14 +974,8 @@ pub fn spawn_agents(
                 cfg
             } else {
                 let first_agent = parsed.agents.as_ref().and_then(|a| a.first());
-                let fid = parsed
-                    .anchor_frame
-                    .or_else(|| first_agent.and_then(|a| a.frame_ids.first().copied()))
-                    .unwrap_or(0);
-                let prompt = parsed
-                    .prompt
-                    .or_else(|| first_agent.map(|a| a.prompt.clone()))
-                    .unwrap_or_default();
+                let fid = parsed.anchor_frame.or_else(|| first_agent.and_then(|a| a.frame_ids.first().copied())).unwrap_or(0);
+                let prompt = parsed.prompt.or_else(|| first_agent.map(|a| a.prompt.clone())).unwrap_or_default();
                 if fid == 0 || prompt.trim().is_empty() {
                     return Err(structured_error(
                         "INVALID_ARGUMENTS",
@@ -1149,35 +985,15 @@ pub fn spawn_agents(
                         false,
                     ));
                 }
-                SpawnIterateInput {
-                    frame_id: fid,
-                    prompt,
-                    max_rounds: parsed.max_rounds.unwrap_or_else(default_max_rounds),
-                    critic_runtime: None,
-                }
+                SpawnIterateInput { frame_id: fid, prompt, max_rounds: parsed.max_rounds.unwrap_or_else(default_max_rounds), critic_runtime: None }
             };
             if !(1..=20).contains(&iter_cfg.max_rounds) {
-                return Err(structured_error(
-                    "INVALID_ARGUMENTS",
-                    "iterate.max_rounds must be between 1 and 20",
-                    "/iterate/max_rounds",
-                    None,
-                    false,
-                ));
+                return Err(structured_error("INVALID_ARGUMENTS", "iterate.max_rounds must be between 1 and 20", "/iterate/max_rounds", None, false));
             }
             if iter_cfg.prompt.trim().is_empty() {
-                return Err(structured_error(
-                    "INVALID_ARGUMENTS",
-                    "iterate.prompt must not be empty",
-                    "/iterate/prompt",
-                    None,
-                    false,
-                ));
+                return Err(structured_error("INVALID_ARGUMENTS", "iterate.prompt must not be empty", "/iterate/prompt", None, false));
             }
-            let critic_rt = iter_cfg
-                .critic_runtime
-                .clone()
-                .unwrap_or_else(|| runtime.clone());
+            let critic_rt = iter_cfg.critic_runtime.clone().unwrap_or_else(|| runtime.clone());
             check_runtime_installed(&critic_rt)?;
 
             if active_sub_agents + 1 > MAX_SUB_AGENTS {
@@ -1194,10 +1010,7 @@ pub fn spawn_agents(
             if let Some(existing_owner) = guard.table.owner_of_frame(fid) {
                 return Err(structured_error(
                     "FRAME_LEASED",
-                    format!(
-                        "frame {} is already leased to active run '{}'",
-                        fid.0, existing_owner.run_id
-                    ),
+                    format!("frame {} is already leased to active run '{}'", fid.0, existing_owner.run_id),
                     "/iterate/frame_id",
                     None,
                     false,
@@ -1210,22 +1023,10 @@ pub fn spawn_agents(
             let name = format!("Iterate R1/{} ({})", iter_cfg.max_rounds, runtime);
             let purpose = LeasePurpose::Iterate;
             let fids = vec![fid];
-            let md_path = write_bootstrap_files(
-                &session_dir,
-                &engine.doc,
-                &run_id,
-                &name,
-                "iterate",
-                &purpose,
-                &fids,
-                &iter_cfg.prompt,
-            )?;
+            let md_path = write_bootstrap_files(&session_dir, &engine.doc, &run_id, &name, "iterate", &purpose, &fids, &iter_cfg.prompt)?;
             let bootstrap_str = md_path.to_string_lossy().to_string();
 
-            guard.table.leases.push(
-                Lease::new(run_id.clone(), fids.clone(), purpose)
-                    .with_lead(Some(effective_lead_id.clone())),
-            );
+            guard.table.leases.push(Lease::new(run_id.clone(), fids.clone(), purpose).with_lead(Some(effective_lead_id.clone())));
 
             agents_state.agents.push(AgentRunRecord {
                 run_id: run_id.clone(),
@@ -1241,10 +1042,7 @@ pub fn spawn_agents(
 
             // Save iterate loop state for Studio's Generator -> Critic -> Generator supervisor (§5.2).
             let iter_path = session_dir.join("iterate-runs.json");
-            let mut loops: Vec<IterateLoopSpec> = fs::read_to_string(&iter_path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
+            let mut loops: Vec<IterateLoopSpec> = fs::read_to_string(&iter_path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
             loops.push(IterateLoopSpec {
                 generator_run_id: run_id.clone(),
                 frame_id: fid,
@@ -1256,10 +1054,7 @@ pub fn spawn_agents(
                 active_phase: "generator".to_string(),
                 completed: false,
             });
-            let _ = fs::write(
-                &iter_path,
-                serde_json::to_vec_pretty(&loops).unwrap_or_default(),
-            );
+            let _ = fs::write(&iter_path, serde_json::to_vec_pretty(&loops).unwrap_or_default());
 
             let req = SpawnControlRequest::Spawn {
                 request_id: format!("req-{}-{}", guard.epoch, run_id),
@@ -1332,21 +1127,11 @@ pub fn assign_frames(
     guard.reload_if_needed();
     ensure_caller_is_lead(guard, caller_run_id, lead_run_id)?;
 
-    let mut parsed: AssignFramesArgs = serde_json::from_value(args).map_err(|e| {
-        structured_error(
-            "INVALID_ARGUMENTS",
-            format!("invalid arguments: {e}"),
-            "",
-            None,
-            false,
-        )
-    })?;
+    let mut parsed: AssignFramesArgs =
+        serde_json::from_value(args).map_err(|e| structured_error("INVALID_ARGUMENTS", format!("invalid arguments: {e}"), "", None, false))?;
 
     if let (Some(single_run), Some(single_frames)) = (parsed.run_id.take(), parsed.frames.take()) {
-        parsed.assignments.push(FrameAssignmentInput {
-            run_id: single_run,
-            frame_ids: single_frames,
-        });
+        parsed.assignments.push(FrameAssignmentInput { run_id: single_run, frame_ids: single_frames });
     }
 
     let effective_lead_id = lead_run_id.or(caller_run_id).unwrap_or("lead").to_string();
@@ -1360,19 +1145,12 @@ pub fn assign_frames(
     for (a_idx, assign) in parsed.assignments.iter().enumerate() {
         let mut fids = Vec::with_capacity(assign.frame_ids.len());
         for (f_idx, &raw_fid) in assign.frame_ids.iter().enumerate() {
-            let fid = validate_root_frame(
-                &engine.doc,
-                raw_fid,
-                &format!("/assignments/{a_idx}/frame_ids/{f_idx}"),
-            )?;
+            let fid = validate_root_frame(&engine.doc, raw_fid, &format!("/assignments/{a_idx}/frame_ids/{f_idx}"))?;
             if let Some(owner) = updated_table.owner_of_frame(fid) {
                 if owner.run_id != assign.run_id {
                     return Err(structured_error(
                         "FRAME_LEASED",
-                        format!(
-                            "frame {} is already leased to active run '{}'",
-                            fid.0, owner.run_id
-                        ),
+                        format!("frame {} is already leased to active run '{}'", fid.0, owner.run_id),
                         &format!("/assignments/{a_idx}/frame_ids/{f_idx}"),
                         None,
                         false,
@@ -1386,10 +1164,7 @@ pub fn assign_frames(
         if let Some(existing) = updated_table.leases.iter_mut().find(|l| l.run_id == assign.run_id) {
             existing.frames = fids;
         } else {
-            updated_table.leases.push(
-                Lease::new(assign.run_id.clone(), fids, LeasePurpose::Split)
-                    .with_lead(Some(effective_lead_id.clone())),
-            );
+            updated_table.leases.push(Lease::new(assign.run_id.clone(), fids, LeasePurpose::Split).with_lead(Some(effective_lead_id.clone())));
         }
     }
 
@@ -1442,9 +1217,7 @@ pub fn list_agents(engine: &Engine, guard: &mut LeaseGuard) -> Result<Value, Str
         let state = load_agents_state(session_dir);
         for a in state.agents {
             let active_lease = guard.table.get(&a.run_id);
-            let frames: Vec<u64> = active_lease
-                .map(|l| l.frames.iter().map(|f| f.0).collect())
-                .unwrap_or_else(|| a.frames.iter().map(|f| f.0).collect());
+            let frames: Vec<u64> = active_lease.map(|l| l.frames.iter().map(|f| f.0).collect()).unwrap_or_else(|| a.frames.iter().map(|f| f.0).collect());
             let edit_count = engine.history.run_step_count(&a.run_id);
             seen_runs.insert(a.run_id.clone());
             records.push(json!({
@@ -1483,41 +1256,17 @@ pub fn list_agents(engine: &Engine, guard: &mut LeaseGuard) -> Result<Value, Str
 }
 
 /// Handles `designos_stop_agents` (`§5`).
-pub fn stop_agents(
-    engine: &mut Engine,
-    guard: &mut LeaseGuard,
-    caller_run_id: Option<&str>,
-    lead_run_id: Option<&str>,
-    args: Value,
-) -> Result<Value, String> {
+pub fn stop_agents(engine: &mut Engine, guard: &mut LeaseGuard, caller_run_id: Option<&str>, lead_run_id: Option<&str>, args: Value) -> Result<Value, String> {
     guard.reload_if_needed();
     ensure_caller_is_lead(guard, caller_run_id, lead_run_id)?;
 
-    let parsed: StopAgentsArgs = serde_json::from_value(args).map_err(|e| {
-        structured_error(
-            "INVALID_ARGUMENTS",
-            format!("invalid arguments: {e}"),
-            "",
-            None,
-            false,
-        )
-    })?;
+    let parsed: StopAgentsArgs =
+        serde_json::from_value(args).map_err(|e| structured_error("INVALID_ARGUMENTS", format!("invalid arguments: {e}"), "", None, false))?;
 
-    let target_runs: Vec<String> = if parsed.all || parsed.run_ids.is_empty() {
-        guard
-            .table
-            .leases
-            .iter()
-            .map(|l| l.run_id.clone())
-            .collect()
-    } else {
-        parsed.run_ids.clone()
-    };
+    let target_runs: Vec<String> =
+        if parsed.all || parsed.run_ids.is_empty() { guard.table.leases.iter().map(|l| l.run_id.clone()).collect() } else { parsed.run_ids.clone() };
 
-    guard
-        .table
-        .leases
-        .retain(|l| !target_runs.contains(&l.run_id));
+    guard.table.leases.retain(|l| !target_runs.contains(&l.run_id));
     guard.epoch += 1;
     guard.save()?;
     engine.leases = guard.table.clone();
@@ -1525,9 +1274,7 @@ pub fn stop_agents(
     let mut rolled_back_steps = 0usize;
     if parsed.rollback {
         for rid in &target_runs {
-            rolled_back_steps += engine
-                .undo_run_and_record(rid)
-                .map_err(|e| structured_error("INTERNAL_ERROR", e, "", None, false))?;
+            rolled_back_steps += engine.undo_run_and_record(rid).map_err(|e| structured_error("INTERNAL_ERROR", e, "", None, false))?;
         }
     }
 
@@ -1535,20 +1282,12 @@ pub fn stop_agents(
         let mut state = load_agents_state(session_dir);
         for a in &mut state.agents {
             if target_runs.contains(&a.run_id) {
-                a.status = if parsed.rollback {
-                    "rolled_back".to_string()
-                } else {
-                    "stopped".to_string()
-                };
+                a.status = if parsed.rollback { "rolled_back".to_string() } else { "stopped".to_string() };
                 a.frames.clear();
             }
         }
         let _ = save_agents_state(session_dir, &state);
-        let req = SpawnControlRequest::Stop {
-            request_id: format!("stop-{}", guard.epoch),
-            run_ids: target_runs.clone(),
-            rollback: parsed.rollback,
-        };
+        let req = SpawnControlRequest::Stop { request_id: format!("stop-{}", guard.epoch), run_ids: target_runs.clone(), rollback: parsed.rollback };
         let _ = append_spawn_request(session_dir, &req);
     }
 
@@ -1574,12 +1313,7 @@ mod tests {
 
     fn temp_session_dir(tag: &str) -> PathBuf {
         let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "designos-rd3-test-{}-{}-{}",
-            tag,
-            std::process::id(),
-            seq
-        ));
+        let dir = std::env::temp_dir().join(format!("designos-rd3-test-{}-{}-{}", tag, std::process::id(), seq));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -1593,26 +1327,14 @@ mod tests {
         // Insert frame 10 and frame 20 on Page 1, plus a child rectangle under frame 20.
         let page_id = srv.engine.doc.pages[0];
         srv.engine.doc.reserve_ids(NodeId(20));
-        srv.engine
-            .doc
-            .insert(page_id, Node::frame(NodeId(10), Rect::new(0.0, 0.0, 400.0, 300.0)))
-            .unwrap();
-        srv.engine
-            .doc
-            .insert(page_id, Node::frame(NodeId(20), Rect::new(500.0, 0.0, 400.0, 300.0)))
-            .unwrap();
+        srv.engine.doc.insert(page_id, Node::frame(NodeId(10), Rect::new(0.0, 0.0, 400.0, 300.0))).unwrap();
+        srv.engine.doc.insert(page_id, Node::frame(NodeId(20), Rect::new(500.0, 0.0, 400.0, 300.0))).unwrap();
         let child_21 = NodeId(21);
         srv.engine.doc.reserve_ids(child_21);
-        srv.engine
-            .doc
-            .insert(NodeId(20), Node::rectangle(child_21, Rect::new(10.0, 10.0, 80.0, 40.0)))
-            .unwrap();
+        srv.engine.doc.insert(NodeId(20), Node::rectangle(child_21, Rect::new(10.0, 10.0, 80.0, 40.0))).unwrap();
 
         // Grant lease on frame [10] to agent-1.
-        srv.lease_guard
-            .table
-            .grant(Lease::new("agent-1", vec![NodeId(10)], LeasePurpose::Split))
-            .unwrap();
+        srv.lease_guard.table.grant(Lease::new("agent-1", vec![NodeId(10)], LeasePurpose::Split)).unwrap();
         srv.lease_guard.save().unwrap();
         srv.bridge.run_id = Some("agent-1".to_string());
 
@@ -1627,10 +1349,7 @@ mod tests {
             )
             .expect_err("update_node on frame 20's child must be refused");
 
-        assert!(
-            err.contains("OUTSIDE_OWNED_FRAMES"),
-            "expected OUTSIDE_OWNED_FRAMES, got: {err}"
-        );
+        assert!(err.contains("OUTSIDE_OWNED_FRAMES"), "expected OUTSIDE_OWNED_FRAMES, got: {err}");
         assert_eq!(srv.engine.doc.mutation_epoch(), rev_before);
         assert_ne!(srv.engine.doc.get(child_21).unwrap().name, "ShouldBeRefused");
         let _ = fs::remove_dir_all(&session_dir);
@@ -1683,23 +1402,11 @@ mod tests {
         let page_id = srv.engine.doc.pages[0];
         let frame_a = srv.engine.doc.alloc_id();
         let frame_b = srv.engine.doc.alloc_id();
-        srv.engine
-            .doc
-            .insert(page_id, Node::frame(frame_a, Rect::new(0.0, 0.0, 400.0, 300.0)))
-            .unwrap();
-        srv.engine
-            .doc
-            .insert(page_id, Node::frame(frame_b, Rect::new(500.0, 0.0, 400.0, 300.0)))
-            .unwrap();
+        srv.engine.doc.insert(page_id, Node::frame(frame_a, Rect::new(0.0, 0.0, 400.0, 300.0))).unwrap();
+        srv.engine.doc.insert(page_id, Node::frame(frame_b, Rect::new(500.0, 0.0, 400.0, 300.0))).unwrap();
 
-        srv.lease_guard
-            .table
-            .grant(Lease::new("agent-a", vec![frame_a], LeasePurpose::Split))
-            .unwrap();
-        srv.lease_guard
-            .table
-            .grant(Lease::new("agent-b", vec![frame_b], LeasePurpose::Split))
-            .unwrap();
+        srv.lease_guard.table.grant(Lease::new("agent-a", vec![frame_a], LeasePurpose::Split)).unwrap();
+        srv.lease_guard.table.grant(Lease::new("agent-b", vec![frame_b], LeasePurpose::Split)).unwrap();
         srv.lease_guard.save().unwrap();
 
         // Agent A writes 2 batches into frame_a; Agent B writes 5 batches into frame_b.
@@ -1763,15 +1470,9 @@ mod tests {
 
         let page_id = srv.engine.doc.pages[0];
         let frame_a = srv.engine.doc.alloc_id();
-        srv.engine
-            .doc
-            .insert(page_id, Node::frame(frame_a, Rect::new(0.0, 0.0, 400.0, 300.0)))
-            .unwrap();
+        srv.engine.doc.insert(page_id, Node::frame(frame_a, Rect::new(0.0, 0.0, 400.0, 300.0))).unwrap();
 
-        srv.lease_guard
-            .table
-            .grant(Lease::new("agent-a", vec![frame_a], LeasePurpose::Split))
-            .unwrap();
+        srv.lease_guard.table.grant(Lease::new("agent-a", vec![frame_a], LeasePurpose::Split)).unwrap();
         srv.lease_guard.save().unwrap();
         srv.bridge.run_id = Some("agent-a".to_string());
 
@@ -1789,18 +1490,9 @@ mod tests {
                 }),
             )
             .unwrap();
-        let nid = NodeId(
-            created
-                .get("node")
-                .and_then(|n| n.get("id"))
-                .and_then(Value::as_u64)
-                .unwrap(),
-        );
+        let nid = NodeId(created.get("node").and_then(|n| n.get("id")).and_then(Value::as_u64).unwrap());
         let node = srv.engine.doc.get(nid).unwrap();
-        assert_eq!(
-            node.plugin_data.get(PLUGIN_DATA_RUN_KEY).map(String::as_str),
-            Some("agent-a")
-        );
+        assert_eq!(node.plugin_data.get(PLUGIN_DATA_RUN_KEY).map(String::as_str), Some("agent-a"));
         let _ = fs::remove_dir_all(&session_dir);
     }
 
@@ -1812,10 +1504,7 @@ mod tests {
 
         let page_id = srv.engine.doc.pages[0];
         let f1 = srv.engine.doc.alloc_id();
-        srv.engine
-            .doc
-            .insert(page_id, Node::frame(f1, Rect::new(0.0, 0.0, 400.0, 300.0)))
-            .unwrap();
+        srv.engine.doc.insert(page_id, Node::frame(f1, Rect::new(0.0, 0.0, 400.0, 300.0))).unwrap();
 
         // Sub-agent calling spawn_agents -> NOT_LEAD
         srv.bridge.run_id = Some("agent-1".to_string());
@@ -1846,10 +1535,7 @@ mod tests {
         assert!(err.contains("TOO_MANY_AGENTS"), "expected TOO_MANY_AGENTS, got: {err}");
 
         // Grant f1 to agent-1, then try to assign f1 to agent-2 without revoking -> FRAME_LEASED
-        srv.lease_guard
-            .table
-            .grant(Lease::new("agent-1", vec![f1], LeasePurpose::Split))
-            .unwrap();
+        srv.lease_guard.table.grant(Lease::new("agent-1", vec![f1], LeasePurpose::Split)).unwrap();
         srv.lease_guard.save().unwrap();
         let err = srv
             .call(

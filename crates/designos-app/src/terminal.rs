@@ -356,10 +356,7 @@ pub enum TerminalAction {
     /// unresolved Canvas Pin-Comments directly into the active PTY stdin.
     ExportSelectionToTerminal,
     /// Rolls back all undo steps recorded by `run_id` and releases its frame leases (`RD-3 §3.4`).
-    RollbackAgentRun {
-        run_id: String,
-        reason: String,
-    },
+    RollbackAgentRun { run_id: String, reason: String },
 }
 
 /// Status and ownership entry for a parallel designer agent run (`RD-3 §6.2`).
@@ -1554,11 +1551,7 @@ impl TerminalState {
             let label = item.get("name").and_then(|v| v.as_str()).unwrap_or(run_id).to_string();
             let runtime = item.get("runtime").and_then(|v| v.as_str()).unwrap_or("claude").to_string();
             let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("running").to_string();
-            let frames: Vec<u64> = item
-                .get("frames")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_u64()).collect())
-                .unwrap_or_default();
+            let frames: Vec<u64> = item.get("frames").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64()).collect()).unwrap_or_default();
             let purpose = item
                 .get("purpose")
                 .and_then(|v| serde_json::from_value::<designos_doc::live_patch::LeasePurpose>(v.clone()).ok())
@@ -1624,22 +1617,8 @@ impl TerminalState {
                 continue;
             };
             match req {
-                SpawnControlRequest::Spawn {
-                    request_id,
-                    run_id,
-                    name,
-                    runtime,
-                    frames,
-                    purpose,
-                    prompt,
-                    bootstrap_path,
-                    ..
-                } => {
-                    let lease = designos_doc::live_patch::Lease::new(
-                        run_id.clone(),
-                        frames.clone(),
-                        purpose.clone(),
-                    );
+                SpawnControlRequest::Spawn { request_id, run_id, name, runtime, frames, purpose, prompt, bootstrap_path, .. } => {
+                    let lease = designos_doc::live_patch::Lease::new(run_id.clone(), frames.clone(), purpose.clone());
                     let _ = self.leases.grant(lease);
                     self.live_patch.state.leases = self.leases.clone();
                     self.persist_leases_to_disk();
@@ -1694,25 +1673,13 @@ impl TerminalState {
                         });
                     }
 
-                    self.append_spawn_result(&SpawnControlResult {
-                        request_id,
-                        run_id,
-                        status: "running".to_string(),
-                        error: None,
-                    });
+                    self.append_spawn_result(&SpawnControlResult { request_id, run_id, status: "running".to_string(), error: None });
                 }
-                SpawnControlRequest::Stop {
-                    request_id,
-                    run_ids,
-                    rollback,
-                } => {
+                SpawnControlRequest::Stop { request_id, run_ids, rollback } => {
                     for rid in run_ids {
                         if rollback {
                             self.finish_run_rollback(&rid, 0);
-                            actions.push(TerminalAction::RollbackAgentRun {
-                                run_id: rid.clone(),
-                                reason: "stopped with rollback".to_string(),
-                            });
+                            actions.push(TerminalAction::RollbackAgentRun { run_id: rid.clone(), reason: "stopped with rollback".to_string() });
                             self.append_spawn_result(&SpawnControlResult {
                                 request_id: request_id.clone(),
                                 run_id: rid,
@@ -1832,10 +1799,7 @@ impl TerminalState {
         }
         for (rid, exit_code) in exited_subagents {
             if exit_code.unwrap_or(0) != 0 {
-                actions.push(TerminalAction::RollbackAgentRun {
-                    run_id: rid,
-                    reason: format!("sub-agent exited with code {}", exit_code.unwrap_or(1)),
-                });
+                actions.push(TerminalAction::RollbackAgentRun { run_id: rid, reason: format!("sub-agent exited with code {}", exit_code.unwrap_or(1)) });
             } else {
                 if self.leases.release(&rid).is_some() {
                     self.lease_epoch += 1;
@@ -2959,14 +2923,7 @@ pub fn export_selection_and_comments_to_pty(
 
 /// Renders the compact `Runs` list (`28px` rows, `theme::INSET_FRAME = 8px` horizontal padding,
 /// `1px` `theme::BORDER` separator) above the terminal viewport in the Agents panel (`RD-3 §6.2`).
-fn render_agent_runs_list(
-    state: &mut TerminalState,
-    ui: &mut Ui,
-    p: &Painter,
-    rect: Rect,
-    start_y: f32,
-    actions: &mut Vec<TerminalAction>,
-) -> f32 {
+fn render_agent_runs_list(state: &mut TerminalState, ui: &mut Ui, p: &Painter, rect: Rect, start_y: f32, actions: &mut Vec<TerminalAction>) -> f32 {
     if state.agent_runs.is_empty() {
         return start_y;
     }
@@ -2977,10 +2934,7 @@ fn render_agent_runs_list(
     let mut focus_tab_id: Option<usize> = None;
 
     for run in &runs_snapshot {
-        let row_r = Rect::from_min_size(
-            Pos2::new(rect.left(), cur_y),
-            Vec2::new(rect.width(), theme::AGENT_RUN_ROW_H),
-        );
+        let row_r = Rect::from_min_size(Pos2::new(rect.left(), cur_y), Vec2::new(rect.width(), theme::AGENT_RUN_ROW_H));
         cur_y += theme::AGENT_RUN_ROW_H;
         p.rect_filled(row_r, 0.0, TERM_BG_ELEVATED);
         widgets::hline(p, row_r.left(), row_r.right(), row_r.bottom() - theme::BORDER_WIDTH, theme::BORDER);
@@ -2994,10 +2948,7 @@ fn render_agent_runs_list(
         if can_undo {
             let undo_x = right_edge - theme::AGENT_RUN_UNDO_W;
             let undo_y = row_r.top() + theme::AGENT_RUN_BTN_INSET_Y;
-            let undo_r = Rect::from_min_size(
-                Pos2::new(undo_x, undo_y),
-                Vec2::new(theme::AGENT_RUN_UNDO_W, theme::AGENT_RUN_TARGET_SIZE),
-            );
+            let undo_r = Rect::from_min_size(Pos2::new(undo_x, undo_y), Vec2::new(theme::AGENT_RUN_UNDO_W, theme::AGENT_RUN_TARGET_SIZE));
             let undo_resp = ui.interact(undo_r, Id::new(("agent-run-undo", &run.run_id)), Sense::click());
             let bg = if undo_resp.hovered() { TERM_BG_HOVER } else { TERM_BG_BAR };
             p.rect_filled(undo_r, theme::cr(theme::RADIUS_CONTROL), bg);
@@ -3014,10 +2965,7 @@ fn render_agent_runs_list(
         if is_running {
             let stop_x = right_edge - theme::AGENT_RUN_TARGET_SIZE;
             let stop_y = row_r.top() + theme::AGENT_RUN_BTN_INSET_Y;
-            let stop_r = Rect::from_min_size(
-                Pos2::new(stop_x, stop_y),
-                Vec2::splat(theme::AGENT_RUN_TARGET_SIZE),
-            );
+            let stop_r = Rect::from_min_size(Pos2::new(stop_x, stop_y), Vec2::splat(theme::AGENT_RUN_TARGET_SIZE));
             let stop_resp = ui.interact(stop_r, Id::new(("agent-run-stop", &run.run_id)), Sense::click());
             let bg = if stop_resp.hovered() { STATUS_BAD_BG } else { TERM_BG_BAR };
             p.rect_filled(stop_r, theme::cr(theme::RADIUS_CONTROL), bg);
@@ -3057,10 +3005,7 @@ fn render_agent_runs_list(
         state.stop_agent_run(&rid);
     }
     if let Some(rid) = undo_run {
-        actions.push(TerminalAction::RollbackAgentRun {
-            run_id: rid,
-            reason: "undone from Agents panel".to_string(),
-        });
+        actions.push(TerminalAction::RollbackAgentRun { run_id: rid, reason: "undone from Agents panel".to_string() });
     }
     cur_y
 }
@@ -5702,6 +5647,7 @@ Done!
     #[test]
     fn export_selection_pastes_fixed_sentence_only() {
         let mut st = TerminalState::default();
+        st.bind_session(format!("p{}-export-sel", std::process::id()));
         st.spawn_tab(AgentCliPreset::Shell, None).expect("spawn");
         st.active_tab_mut().unwrap().spawn_preset = AgentCliPreset::Claude;
         let rec = attach_recorder(st.active_tab_mut().unwrap());
@@ -5758,6 +5704,7 @@ Done!
         let _ = std::fs::remove_file(&marker);
 
         let mut st = TerminalState::default();
+        st.bind_session(format!("p{pid}-dead-agent"));
         spawn_stub_exiting_agent_into(&mut st);
         assert!(wait_until_tab_exits(&mut st, 8), "stub agent must exit");
         assert!(!st.active_tab_mut().unwrap().is_alive());

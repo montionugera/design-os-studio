@@ -25,10 +25,7 @@ impl Default for Engine {
     fn default() -> Self {
         let mut doc = Document::new("Untitled");
         let page = doc.add_page("Page 1");
-        let run_id = std::env::var("DESIGNOS_AGENT_RUN_ID")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        let run_id = std::env::var("DESIGNOS_AGENT_RUN_ID").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         Self {
             doc,
             history: History::default(),
@@ -45,12 +42,7 @@ impl Default for Engine {
 impl Engine {
     /// Returns the active agent `run_id` (`self.run_id` or `DESIGNOS_AGENT_RUN_ID`).
     pub fn effective_run_id(&self) -> Option<String> {
-        self.run_id.clone().or_else(|| {
-            std::env::var("DESIGNOS_AGENT_RUN_ID")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
+        self.run_id.clone().or_else(|| std::env::var("DESIGNOS_AGENT_RUN_ID").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
     }
 
     /// Resolves the target page when a tool call omits `parent_id` / `page_id`:
@@ -81,11 +73,7 @@ impl Engine {
                 | "designos_redo"
         ) {
             let caller = self.effective_run_id();
-            let eff_table = crate::tools::lease::effective_lease_table(
-                &self.leases,
-                self.owned_frames.as_deref(),
-                caller.as_deref(),
-            );
+            let eff_table = crate::tools::lease::effective_lease_table(&self.leases, self.owned_frames.as_deref(), caller.as_deref());
             crate::tools::lease::check_tool_write_guard(
                 &self.doc,
                 &self.history,
@@ -477,9 +465,7 @@ impl Engine {
             designos_doc::live_patch::stamp_command_authorship(&mut command, r);
         }
         let ops = self.live_ops_for(&command)?;
-        self.history
-            .exec_for_run(&mut self.doc, command, rid, self.live_patch_label.clone())
-            .map_err(|e| e.to_string())?;
+        self.history.exec_for_run(&mut self.doc, command, rid, self.live_patch_label.clone()).map_err(|e| e.to_string())?;
         self.record(ops);
         Ok(())
     }
