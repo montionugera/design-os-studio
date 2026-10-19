@@ -475,7 +475,7 @@ fn large_fixture_off_thread_budget() {
     let mut slices = 0usize;
     loop {
         slices += 1;
-        let mut budget = Budget { max_nodes: 400, max_duration: Some(Duration::from_millis(4)), cursor: cursor.clone(), shallow_nodes: None };
+        let mut budget = Budget { max_nodes: 400, max_duration: Some(Duration::from_millis(4)), cursor: cursor.clone(), shallow_nodes: Default::default() };
         let step_report = lint_subtree(&doc, &doc.pages, &full_cfg, &RenderLintEnv, &mut budget);
         sliced_findings.extend(step_report.findings);
         if step_report.complete {
