@@ -3578,13 +3578,13 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
 }
 
 fn render_runtime_dropdown_menu(state: &mut TerminalState, ui: &mut Ui, panel_rect: Rect, top_y: f32, file_path: Option<&Path>) {
-    let min_menu_w = theme::ROW_HEIGHT_STANDARD * 6.0 + theme::SPACE_PANEL_PAD;
-    let max_menu_w = theme::ROW_HEIGHT_STANDARD * 8.0;
+    let min_menu_w = theme::CONTROL_STANDARD * 6.0 + theme::INSET_PANEL;
+    let max_menu_w = theme::CONTROL_STANDARD * 8.0;
     let menu_w = (panel_rect.width() - theme::SPACE_SECTION).clamp(min_menu_w, max_menu_w);
     let entries = [AgentCliPreset::Claude, AgentCliPreset::Codex, AgentCliPreset::Grok, AgentCliPreset::Antigravity, AgentCliPreset::Shell];
     let last_resume = state.resumable_sessions().first().map(|e| (e.title.clone(), e.cli.clone()));
-    let row_h = theme::ROW_HEIGHT_STANDARD + theme::SPACE_ROW_GAP;
-    let header_h = theme::ROW_HEIGHT_COMPACT;
+    let row_h = theme::CONTROL_STANDARD + theme::SPACE_ROW;
+    let header_h = theme::CONTROL_DENSE;
     let extra_rows = if last_resume.is_some() { 1.0 } else { 0.0 };
     let menu_h = header_h + (entries.len() as f32 + extra_rows) * row_h + theme::SPACE_INLINE;
     let menu_x = (panel_rect.right() - menu_w - theme::SPACE_INLINE).max(panel_rect.left() + theme::SPACE_INLINE);
@@ -3595,11 +3595,11 @@ fn render_runtime_dropdown_menu(state: &mut TerminalState, ui: &mut Ui, panel_re
     p.rect_stroke(menu_r, CornerRadius::same(8), Stroke::new(1.0, Color32::from_rgb(0x3E, 0x3E, 0x46)), StrokeKind::Inside);
     widgets::record(ui, "agents-runtime-dropdown-menu", menu_r);
 
-    let row_y1 = theme::SPACE_ROW_GAP + theme::SPACE_TIGHT;
-    let row_y2 = theme::ROW_HEIGHT_COMPACT - 1.0;
-    let hdr_y = theme::SPACE_PANEL_PAD + 1.0;
-    let elide_pad = theme::SPACE_PANEL_PAD + theme::SPACE_ROW_GAP;
-    let elide_min = theme::ROW_HEIGHT_COMPACT + theme::SPACE_SECTION;
+    let row_y1 = theme::SPACE_ROW + theme::SPACE_FACT;
+    let row_y2 = theme::CONTROL_DENSE - 1.0;
+    let hdr_y = theme::INSET_PANEL + 1.0;
+    let elide_pad = theme::INSET_PANEL + theme::SPACE_ROW;
+    let elide_min = theme::CONTROL_DENSE + theme::SPACE_SECTION;
     p.text(
         Pos2::new(menu_r.left() + row_y1, menu_r.top() + hdr_y),
         Align2::LEFT_CENTER,
@@ -3607,16 +3607,16 @@ fn render_runtime_dropdown_menu(state: &mut TerminalState, ui: &mut Ui, panel_re
         theme::font_caption_strong(),
         theme::TEXT_SECONDARY,
     );
-    widgets::hline(&p, menu_r.left() + theme::SPACE_ROW_GAP, menu_r.right() - theme::SPACE_ROW_GAP, menu_r.top() + header_h, TERM_BORDER);
+    widgets::hline(&p, menu_r.left() + theme::SPACE_ROW, menu_r.right() - theme::SPACE_ROW, menu_r.top() + header_h, TERM_BORDER);
 
     let mut resume_clicked = false;
     let mut row_offset = 0usize;
     if let Some((prev_title, prev_cli)) = &last_resume {
-        let ry = menu_r.top() + header_h + theme::SPACE_TIGHT;
-        let row_r = Rect::from_min_size(Pos2::new(menu_r.left() + theme::SPACE_TIGHT, ry), Vec2::new(menu_w - theme::SPACE_INLINE, row_h - 2.0));
+        let ry = menu_r.top() + header_h + theme::SPACE_ROW;
+        let row_r = Rect::from_min_size(Pos2::new(menu_r.left() + theme::SPACE_ROW, ry), Vec2::new(menu_w - theme::SPACE_INLINE, row_h - 2.0));
         let resp = ui.interact(row_r, Id::new("agents-dropdown-resume-last"), Sense::click());
         if resp.hovered() {
-            p.rect_filled(row_r, theme::cr(theme::RADIUS_CHIP), TERM_BG_HOVER);
+            p.rect_filled(row_r, theme::cr(theme::RADIUS_CONTROL), TERM_BG_HOVER);
         }
         let title_str = widgets::elide(&p, "Resume last session", &theme::font_caption_medium(), (row_r.width() - elide_pad).max(elide_min));
         let sub_raw = format!("{prev_title} ({prev_cli})");
@@ -3638,8 +3638,8 @@ fn render_runtime_dropdown_menu(state: &mut TerminalState, ui: &mut Ui, panel_re
 
     let mut chosen: Option<AgentCliPreset> = None;
     for (i, preset) in entries.iter().copied().enumerate() {
-        let ry = menu_r.top() + header_h + theme::SPACE_TIGHT + (i + row_offset) as f32 * row_h;
-        let row_r = Rect::from_min_size(Pos2::new(menu_r.left() + theme::SPACE_TIGHT, ry), Vec2::new(menu_w - theme::SPACE_INLINE, row_h - 2.0));
+        let ry = menu_r.top() + header_h + theme::SPACE_ROW + (i + row_offset) as f32 * row_h;
+        let row_r = Rect::from_min_size(Pos2::new(menu_r.left() + theme::SPACE_ROW, ry), Vec2::new(menu_w - theme::SPACE_INLINE, row_h - 2.0));
         let id_str = match preset {
             AgentCliPreset::Claude => "agents-dropdown-claude",
             AgentCliPreset::Codex => "agents-dropdown-codex",
@@ -3650,7 +3650,7 @@ fn render_runtime_dropdown_menu(state: &mut TerminalState, ui: &mut Ui, panel_re
         };
         let resp = ui.interact(row_r, Id::new(id_str), Sense::click());
         if resp.hovered() {
-            p.rect_filled(row_r, theme::cr(theme::RADIUS_CHIP), TERM_BG_HOVER);
+            p.rect_filled(row_r, theme::cr(theme::RADIUS_CONTROL), TERM_BG_HOVER);
         }
         let (_widget_id, title, subtitle) = preset.dropdown_entry();
         let title_str = widgets::elide(&p, title, &theme::font_caption_medium(), (row_r.width() - elide_pad).max(elide_min));
