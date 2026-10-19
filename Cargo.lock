@@ -1036,6 +1036,7 @@ dependencies = [
  "designos-export",
  "designos-fig",
  "designos-library",
+ "designos-render",
  "rmcp",
  "serde",
  "serde_json",
@@ -1048,10 +1049,12 @@ version = "0.5.0"
 dependencies = [
  "cosmic-text",
  "designos-doc",
+ "designos-fig",
  "designos-fonts",
  "i_overlay",
  "image",
  "rayon",
+ "serde_json",
  "tiny-skia",
  "ttf-parser",
 ]

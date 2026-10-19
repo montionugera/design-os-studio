@@ -515,9 +515,10 @@ impl Session {
                         | "designos_reply_comment"
                         | "designos_resolve_comment"
                         | "designos_set_dev_status"
+                        | "designos_lint_fix"
                         | "designos_undo"
                         | "designos_redo"
-                );
+                ) || (matches!(name, "designos_lint" | "check_design") && args.get("fix").and_then(Value::as_bool) == Some(true));
                 let live = mutating && self.bridge.live_doc_patch_path.is_some();
                 // What a failed write to the editor rolls back to. Undo and redo revert each other.
                 let snapshot = (live && !matches!(name, "designos_undo" | "designos_redo")).then(|| EditSnapshot {

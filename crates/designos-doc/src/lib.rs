@@ -33,6 +33,7 @@ mod layout_solver_grid_placement;
 mod layout_solver_types;
 mod library;
 mod library_ops;
+pub mod lint;
 pub mod live_patch;
 mod load_repair;
 #[cfg(test)]
@@ -386,6 +387,45 @@ impl Document {
     /// Display name of a shared style: its metadata name, else the key.
     pub fn style_name<'a>(&'a self, key: &'a str) -> &'a str {
         self.style_meta.get(key).map(|m| m.name.as_str()).filter(|n| !n.is_empty()).unwrap_or(key)
+    }
+
+    /// Record a per-(rule, node) lint suppression in the unified `check_designs.ignored` store.
+    pub fn ignore_lint(&mut self, rule_id: &str, node: NodeId) {
+        let canonical = crate::lint::canonical_rule_id(rule_id).unwrap_or(rule_id);
+        self.check_designs.ignored.insert(IgnoreKey { node, rule: canonical.to_string(), property: String::new() });
+    }
+
+    /// Remove a per-(rule, node) lint suppression (matching either canonical or alias rule IDs).
+    pub fn unignore_lint(&mut self, rule_id: &str, node: NodeId) {
+        let target_canonical = crate::lint::canonical_rule_id(rule_id);
+        self.check_designs.ignored.retain(|key| {
+            if key.node != node {
+                return true;
+            }
+            if key.rule == rule_id {
+                return false;
+            }
+            if let Some(tc) = target_canonical {
+                if crate::lint::canonical_rule_id(&key.rule) == Some(tc) {
+                    return false;
+                }
+            }
+            true
+        });
+    }
+
+    /// Check whether a finding on `(rule_id, node)` is suppressed in `check_designs.ignored`.
+    pub fn is_lint_ignored(&self, rule_id: &str, node: NodeId) -> bool {
+        if self.check_designs.ignored.contains(&IgnoreKey { node, rule: rule_id.to_string(), property: String::new() }) {
+            return true;
+        }
+        let Some(target_canonical) = crate::lint::canonical_rule_id(rule_id) else {
+            return false;
+        };
+        if self.check_designs.ignored.contains(&IgnoreKey { node, rule: target_canonical.to_string(), property: String::new() }) {
+            return true;
+        }
+        self.check_designs.ignored.iter().any(|k| k.node == node && crate::lint::canonical_rule_id(&k.rule) == Some(target_canonical))
     }
 
     #[inline]
