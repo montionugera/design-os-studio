@@ -240,6 +240,20 @@ REGRESSIONS: List[Tuple[str, str, str, str, str]] = [
         'title: "Boost resolution",',
         'title: concat !("Boost ", stringify!(resolution)),',
     ),
+    (
+        '32. retired one-shot "claude -p" command back in terminal.rs',
+        "Z01",
+        "terminal.rs",
+        "let _ = self.send_to_agent(prompt, file_path);",
+        'let _ = "claude -p";\n        let _ = self.send_to_agent(prompt, file_path);',
+    ),
+    (
+        "33. retired build_real_cli_command helper back in terminal.rs",
+        "Z02",
+        "terminal.rs",
+        "let _ = self.send_to_agent(prompt, file_path);",
+        "fn build_real_cli_command() {}\n        let _ = self.send_to_agent(prompt, file_path);",
+    ),
 ]
 
 
