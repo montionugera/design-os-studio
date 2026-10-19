@@ -39,7 +39,51 @@ impl Default for Engine {
     }
 }
 
+/// Every tool name and legacy alias accepted by [`Engine::call`].
+pub const DISPATCHED: &[&str] = &[
+    "designos_get_document",
+    "designos_list_nodes",
+    "designos_get_node",
+    "designos_get_variables",
+    "designos_generate_code",
+    "designos_create_node",
+    "designos_update_node",
+    "designos_delete_node",
+    "designos_list_comments",
+    "designos_add_comment",
+    "designos_reply_comment",
+    "designos_resolve_comment",
+    "designos_apply_spec",
+    "designos_export_spec",
+    "designos_set_dev_status",
+    "designos_export_fig_file",
+    "export_fig_file",
+    "designos_query_xpath",
+    "query_nodes",
+    "designos_lint",
+    "check_design",
+    "designos_lint_fix",
+    "designos_apply_batch",
+    "designos_configure_session",
+    "designos_get_guidelines",
+    "get_guidelines",
+    "designos_undo",
+    "designos_redo",
+];
+
+/// Non-prefixed compatibility aliases accepted by [`Engine::call`].
+pub const ALIASES: &[&str] = &[
+    "export_fig_file",
+    "query_nodes",
+    "check_design",
+    "designos_lint_fix",
+    "get_guidelines",
+];
+
 impl Engine {
+    pub const DISPATCHED: &[&str] = DISPATCHED;
+    pub const ALIASES: &[&str] = ALIASES;
+
     /// Returns the active [`designos_doc::lint::LintEnv`] for this engine.
     pub fn lint_env(&self) -> &dyn designos_doc::lint::LintEnv {
         if self.disable_text_lint_engine {
@@ -874,6 +918,14 @@ pub fn tools() -> Vec<Value> {
         json!({"output_path":{"type":"string","description":"Destination .fig path inside the workspace."}}),
         vec!["output_path"],
         false,
+        true,
+    );
+    add(
+        "query_xpath",
+        "Query layers on a page using an XPath-like selector (e.g. //FRAME, //FRAME[@name='Card'], //TEXT[contains(@name, 'Title')]) or a kind/name substring.",
+        json!({"selector":{"type":"string","maxLength":1024},"query":{"type":"string","maxLength":1024},"page_id":id}),
+        vec![],
+        true,
         true,
     );
     add(

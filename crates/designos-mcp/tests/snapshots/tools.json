@@ -1,0 +1,408 @@
+[
+  {
+    "name": "designos_get_document",
+    "description": "Summarize the current in-memory document: pages, counts, shared styles (fill, text, effect, grid) with their values, and undo state.",
+    "required": [],
+    "properties": [],
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "designos_list_nodes",
+    "description": "List node summaries in numeric ID order. Query matches names case-insensitively; parent_id filters direct children. Use next_offset to paginate.",
+    "required": [],
+    "properties": [
+      "limit",
+      "offset",
+      "parent_id",
+      "query"
+    ],
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "designos_get_node",
+    "description": "Read the full native node including geometry, paints, text, bindings, and child IDs.",
+    "required": [
+      "node_id"
+    ],
+    "properties": [
+      "node_id"
+    ],
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "designos_get_variables",
+    "description": "Read variable definitions and collections. With node_id, also resolve that node's direct bindings using inherited collection modes.",
+    "required": [],
+    "properties": [
+      "node_id"
+    ],
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "designos_generate_code",
+    "description": "Generate developer handoff code or SVG for a layer using resolved variable values. Returns source text; writes no files.",
+    "required": [
+      "language",
+      "node_id"
+    ],
+    "properties": [
+      "language",
+      "node_id"
+    ],
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "designos_create_node",
+    "description": "Create one layer in a container; defaults to x/y=0, width/height=100. Supports undo. Text is only valid for text layers. Changes are in memory until saved.",
+    "required": [
+      "kind",
+      "parent_id"
+    ],
+    "properties": [
+      "height",
+      "kind",
+      "name",
+      "parent_id",
+      "text",
+      "width",
+      "x",
+      "y"
+    ],
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "designos_update_node",
+    "description": "Update specified fields of one non-page layer. Coordinates are parent-relative. Replacing text clears text runs and list ranges. Supports undo; changes remain in memory until saved.",
+    "required": [
+      "node_id"
+    ],
+    "properties": [
+      "height",
+      "name",
+      "node_id",
+      "opacity",
+      "text",
+      "visible",
+      "width",
+      "x",
+      "y"
+    ],
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "designos_delete_node",
+    "description": "Remove a non-page layer and its entire subtree. Supports undo; changes remain in memory until saved.",
+    "required": [
+      "node_id"
+    ],
+    "properties": [
+      "node_id"
+    ],
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "designos_list_comments",
+    "description": "List canvas comment threads enriched with resolved world coordinates, target node ID/name/kind, and top-level frame ID/name. Filter by resolved state, page_id, or node_id.",
+    "required": [],
+    "properties": [
+      "node_id",
+      "page_id",
+      "resolved"
+    ],
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "designos_add_comment",
+    "description": "Pin a new comment thread to a node (with local offset x/y) or page coordinates. Supports undo.",
+    "required": [
+      "text"
+    ],
+    "properties": [
+      "author",
+      "node_id",
+      "page_id",
+      "text",
+      "x",
+      "y"
+    ],
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "designos_reply_comment",
+    "description": "Append a reply message to an existing canvas comment thread and optionally mark it resolved/unresolved. Supports undo.",
+    "required": [
+      "text",
+      "thread_id"
+    ],
+    "properties": [
+      "author",
+      "resolved",
+      "text",
+      "thread_id"
+    ],
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "designos_resolve_comment",
+    "description": "Mark a canvas comment thread resolved (default true) or unresolved (false). Supports undo.",
+    "required": [
+      "thread_id"
+    ],
+    "properties": [
+      "resolved",
+      "thread_id"
+    ],
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "designos_apply_spec",
+    "description": "Build a complete UI subtree from a declarative NodeSpec (supports EaseUI BrainWave 2.0 presets like easeui-screen/easeui-card/easeui-button-primary, $easeui.* tokens, and Auto-Layout 5.0 row/column/wrap/hug/fill) in a single atomic undoable step.",
+    "required": [
+      "spec"
+    ],
+    "properties": [
+      "parent_id",
+      "spec"
+    ],
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "designos_export_spec",
+    "description": "Export a node and its descendants as a declarative NodeSpec JSON tree, enriched with Dev Mode status/annotations and any canvas comment threads pinned within the subtree.",
+    "required": [
+      "node_id"
+    ],
+    "properties": [
+      "node_id"
+    ],
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "designos_set_dev_status",
+    "description": "Set a layer's Dev Mode handoff status ('ready', 'completed', or 'clear') and/or append a developer annotation. Supports undo.",
+    "required": [
+      "node_id"
+    ],
+    "properties": [
+      "annotation",
+      "node_id",
+      "status"
+    ],
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "designos_export_fig_file",
+    "description": "Export the current session document to a Figma binary .fig container (with fig-kiwi header and deflate chunks) inside the workspace.",
+    "required": [
+      "output_path"
+    ],
+    "properties": [
+      "output_path"
+    ],
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "designos_query_xpath",
+    "description": "Query layers on a page using an XPath-like selector (e.g. //FRAME, //FRAME[@name='Card'], //TEXT[contains(@name, 'Title')]) or a kind/name substring.",
+    "required": [],
+    "properties": [
+      "page_id",
+      "query",
+      "selector"
+    ],
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "designos_lint",
+    "description": "Audit layers on a page for zero-bounds geometry and default layer names, returning structured findings and pass status.",
+    "required": [],
+    "properties": [
+      "page_id"
+    ],
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "designos_undo",
+    "description": "Undo the latest successful edit in this session; returns changed=false if the stack is empty.",
+    "required": [],
+    "properties": [],
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "designos_redo",
+    "description": "Redo the most recently undone edit in this session; returns changed=false if the stack is empty.",
+    "required": [],
+    "properties": [],
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "designos_open_file",
+    "description": "Import a .designos, .designos, .fig, SVG or Figma REST JSON file inside the workspace into this isolated session. Does not control an open editor. Unsaved changes require discard_changes=true.",
+    "required": [
+      "path"
+    ],
+    "properties": [
+      "discard_changes",
+      "path"
+    ],
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "designos_save_file",
+    "description": "Save this session to a .designos file inside the workspace. Existing files are not overwritten unless overwrite=true. Parent directory must exist.",
+    "required": [
+      "path"
+    ],
+    "properties": [
+      "overwrite",
+      "path"
+    ],
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "designos_render_png",
+    "description": "Rasterize a frame or layer to a NEW .png file inside the workspace using DESIGN:OS Studio's deterministic renderer. Existing files are never overwritten.",
+    "required": [
+      "node_id",
+      "path"
+    ],
+    "properties": [
+      "node_id",
+      "path",
+      "scale"
+    ],
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "designos_new_document",
+    "description": "Start a blank document with one page. Unsaved changes require discard_changes=true.",
+    "required": [
+      "name"
+    ],
+    "properties": [
+      "discard_changes",
+      "name"
+    ],
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    }
+  }
+]

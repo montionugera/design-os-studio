@@ -9,6 +9,10 @@ default-run = "designos-mcp"
 name = "designos-mcp"
 path = "src/main.rs"
 
+[[bin]]
+name = "gen-tool-docs"
+path = "src/bin/gen-tool-docs.rs"
+
 [dependencies]
 designos-doc.workspace = true
 designos-export.workspace = true
