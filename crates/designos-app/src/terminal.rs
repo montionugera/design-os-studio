@@ -5364,18 +5364,17 @@ Done!
         }
         assert!(!runtime_binary_available("stub-agent-673"), "stub name must not be on PATH or in install_dirs()");
 
-        let mut cmd = build_agent_shell_cmd(&default_shell_program(), &format!("exec '{}'", stub_path.display()));
+        let mut cmd = build_agent_shell_cmd(&default_shell_program(), &format!("'{}'", stub_path.display()));
         isolate_zsh_from_home(&mut cmd);
         let tab = TerminalTab::spawn_with_session_cmd(1, AgentCliPreset::Grok, 24, 80, None, None, Some(cmd)).expect("spawn stub tab");
         let mut st = TerminalState::default();
         st.tabs = vec![tab];
         st.active_tab = 0;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while st.active_tab_mut().unwrap().is_alive() {
-            assert!(std::time::Instant::now() < deadline, "stub agent must exit");
+        while st.active_tab_mut().unwrap().is_alive() || !st.active_tab().unwrap().raw_log.lock().map(|l| l.contains("unauthorized")).unwrap_or(false) {
+            assert!(std::time::Instant::now() < deadline, "stub agent must print unauthorized and exit");
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
         st.active_tab_mut().unwrap().spawned_at = std::time::Instant::now();
         let _ = st.poll_live_agent_bridge();
         let failure = st.active_tab().and_then(|t| t.start_failure.clone()).expect("start failure recorded");
