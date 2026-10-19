@@ -566,7 +566,7 @@ fn number_inherited(n: &Node, src: Option<&Node>, key: &str) -> bool {
 }
 
 fn check_single_number(doc: &Document, index: &Index, n: &Node, src: Option<&Node>, key: &str, label: &str, out: &mut Vec<Finding>) -> bool {
-    if n.variables.bindings.contains_key(key) || number_inherited(n, src, key) {
+    if n.variables.bindings.contains_key(key) || doc.effective_binding(n.id, key).is_some() || number_inherited(n, src, key) {
         return false;
     }
     let Some(val) = number_value_at(n, key) else { return false };
