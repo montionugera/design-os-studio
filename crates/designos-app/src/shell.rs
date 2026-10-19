@@ -1334,6 +1334,9 @@ pub fn execute_terminal_actions(app: &mut App, actions: Vec<crate::terminal::Ter
                     Err(e) => app.show_toast(e, true),
                 }
             }
+            crate::terminal::TerminalAction::CloseStoppedTurn { tab_id: _, turn_start_depth, run_id, agent } => {
+                crate::agent_stop::close_stopped_turn_on_app(app, turn_start_depth, run_id.as_deref(), agent.as_deref());
+            }
         }
     }
 }

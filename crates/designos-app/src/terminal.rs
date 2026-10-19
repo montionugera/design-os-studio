@@ -351,9 +351,12 @@ pub enum TerminalAction {
     /// `selection.spec.json` and pipes its path + node summary +
     /// unresolved Canvas Pin-Comments directly into the active PTY stdin.
     ExportSelectionToTerminal,
+    /// Closes a stopped agent turn: applies held patches, folds contiguous agent undo steps since
+    /// `turn_start_depth` into one `"Agent turn (stopped)"` batch, and clears in-progress flags (`#684`).
+    CloseStoppedTurn { tab_id: usize, turn_start_depth: usize, run_id: Option<String>, agent: Option<String> },
 }
 
-/// Orca 3-tier live agent execution status (`Working` / `WaitingForInput` / `Done` / `Idle`).
+/// Orca 3-tier live agent execution status (`Working` / `WaitingForInput` / `Done` / `Stopped` / `Idle`).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum AgentTabStatus {
     #[default]
@@ -361,6 +364,7 @@ pub enum AgentTabStatus {
     Working(Option<String>),
     WaitingForInput(Option<String>),
     Done,
+    Stopped,
 }
 
 /// One live interactive PTY tab backed by `portable-pty` and a `vt100::Parser`.
@@ -389,6 +393,20 @@ pub struct TerminalTab {
     pub spawned_at: std::time::Instant,
     /// Why the agent CLI exited right after it was opened; shown instead of the dead terminal.
     pub start_failure: Option<StartFailure>,
+    /// Active stop sequence state (`#684`), or `None` when not stopping.
+    pub stop_state: Option<crate::agent_stop::StopState>,
+    /// Keys sent by the stop sequence or Esc forwarding on this tab (for deterministic test inspection, `#684`).
+    pub stop_sent_keys: Vec<u8>,
+    /// Timestamp (`ms`) when the current turn started (`#684`).
+    pub turn_started_at_ms: Option<u64>,
+    /// `History::undo_depth` recorded at the start of the current turn (`#684`).
+    pub turn_start_undo_depth: usize,
+    /// Notice shown when the CLI ignored both interrupt keys (`#684 §8.1`).
+    pub still_running_notice: Option<String>,
+    /// Last turn receipt line (e.g. `"Stopped by you after 42s"`, `#684 §3.4`).
+    pub last_receipt: Option<String>,
+    /// Set on a restart-resumed tab (`#653`) that was running without a known turn (`#684 §8.6`).
+    pub resumed_without_known_turn: bool,
 }
 
 impl TerminalTab {
@@ -536,7 +554,21 @@ impl TerminalTab {
             exited_notice_shown: false,
             spawned_at: std::time::Instant::now(),
             start_failure: None,
+            stop_state: None,
+            stop_sent_keys: Vec::new(),
+            turn_started_at_ms: None,
+            turn_start_undo_depth: 0,
+            still_running_notice: None,
+            last_receipt: None,
+            resumed_without_known_turn: false,
         })
+    }
+
+    /// Test helper: spawns a stub `CommandBuilder` under `preset` (`#684`).
+    #[cfg(test)]
+    pub fn spawn_test_stub(id: usize, preset: AgentCliPreset, mut cmd: CommandBuilder) -> Result<Self, String> {
+        isolate_zsh_from_home(&mut cmd);
+        Self::spawn_with_session_cmd(id, preset, 24, 80, None, None, Some(cmd))
     }
 
     /// Test helper: Claude `spawn_preset` running a stub that prints and exits (no `$SHELL` fallback).
@@ -679,6 +711,10 @@ pub struct TerminalState {
     pub search_query: String,
     /// Whether `Cmd+F` terminal search is case-sensitive (`Aa`).
     pub search_case_sensitive: bool,
+    /// True when the last pointer press was in the panel's non-terminal chrome (header, tab strip, composer) (`#684 §3.1`).
+    pub chrome_focused: bool,
+    /// Deferred undo depth to fold once a user edit in progress finishes (`#684 §3.4`).
+    pub pending_stop_fold_depth: Option<usize>,
 }
 
 impl Default for TerminalState {
@@ -752,6 +788,8 @@ impl TerminalState {
             search_open: false,
             search_query: String::new(),
             search_case_sensitive: false,
+            chrome_focused: false,
+            pending_stop_fold_depth: None,
         }
     }
 
@@ -1329,22 +1367,34 @@ impl TerminalState {
         let status_file = self.session_dir.join("agent-status.json");
         if let Ok(raw_status) = std::fs::read_to_string(&status_file) {
             if let Some(parsed) = parse_agent_status_payload(raw_status.trim()) {
-                if let Some(tab) = self.active_tab() {
+                if let Some(tab) = self.active_tab_mut() {
+                    let is_new_work = matches!(parsed, AgentTabStatus::Working(_));
                     if let Ok(mut st) = tab.agent_status.lock() {
-                        *st = parsed;
+                        if !matches!(*st, AgentTabStatus::Stopped) || is_new_work {
+                            *st = parsed;
+                        }
+                    }
+                    if is_new_work && tab.turn_started_at_ms.is_none() {
+                        tab.turn_started_at_ms = Some(designos_doc::now_ms());
+                        tab.last_receipt = None;
+                        tab.still_running_notice = None;
                     }
                 }
             }
         }
 
+        actions.extend(crate::agent_stop::poll_stop_sequences(self, designos_doc::now_ms()));
+
         let mut agent_exited = false;
+        let mut stopped_exited = false;
         for tab in &mut self.tabs {
             if tab.is_shell_process() || tab.exited_notice_shown {
                 continue;
             }
             if !tab.is_alive() {
+                let was_stopped = matches!(tab.agent_status.lock().ok().as_deref(), Some(AgentTabStatus::Stopped));
                 let exit_code = tab.child.try_wait().ok().flatten().map(|status| status.exit_code());
-                if agent_start_failure::counts_as_failed_start(tab.spawned_at.elapsed(), exit_code) {
+                if !was_stopped && agent_start_failure::counts_as_failed_start(tab.spawned_at.elapsed(), exit_code) {
                     let output = tab.raw_log.lock().map(|log| log.clone()).unwrap_or_default();
                     tab.start_failure = Some(agent_start_failure::diagnose(tab.spawn_preset, tab.spawn_preset.is_installed(), exit_code, &output));
                 }
@@ -1353,10 +1403,14 @@ impl TerminalState {
                 }
                 tab.title.push_str(" (exited)");
                 tab.exited_notice_shown = true;
-                agent_exited = true;
+                if was_stopped {
+                    stopped_exited = true;
+                } else {
+                    agent_exited = true;
+                }
             }
         }
-        if agent_exited {
+        if agent_exited && !stopped_exited {
             self.status_msg = Some("Agent exited — this tab no longer accepts input. Open a new tab to continue.".into());
         }
 
@@ -1992,6 +2046,7 @@ fn paint_orca_tab_status_and_provider(ui: &Ui, p: &Painter, tab: &TerminalTab, t
     let effective_status = match explicit_status {
         AgentTabStatus::Working(d) => AgentTabStatus::Working(d),
         AgentTabStatus::WaitingForInput(d) => AgentTabStatus::WaitingForInput(d),
+        AgentTabStatus::Stopped => AgentTabStatus::Stopped,
         other if recent_pty_activity => AgentTabStatus::Working(None),
         other => other,
     };
@@ -2019,7 +2074,7 @@ fn paint_orca_tab_status_and_provider(ui: &Ui, p: &Painter, tab: &TerminalTab, t
             p.circle_stroke(status_center, 3.1, Stroke::new(1.3, wait_col));
             p.circle_filled(status_center, 1.2, wait_col);
         }
-        AgentTabStatus::Done | AgentTabStatus::Idle => {
+        AgentTabStatus::Done | AgentTabStatus::Idle | AgentTabStatus::Stopped => {
             p.circle_filled(status_center, 2.7, Color32::from_rgb(0x10, 0xB9, 0x81));
         }
     }
@@ -2478,15 +2533,20 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
         // Pure Interactive PTY Shell by Default + Top `+` Runtime Dropdown (`DIR-29`)
         p.rect_filled(rect, 0.0, TERM_BG_VIEWPORT);
 
+        let bar_h = 36.0;
+        let ctx_h = 20.0;
         if ui.input(|i| i.pointer.any_pressed()) {
             if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
                 if rect.contains(pos) {
-                    state.viewport_focused = true;
+                    let in_chrome = pos.y < rect.top() + bar_h + ctx_h;
+                    state.chrome_focused = in_chrome;
+                    state.viewport_focused = !in_chrome;
+                } else {
+                    state.chrome_focused = false;
                 }
             }
         }
 
-        let bar_h = 36.0;
         let bar_r = Rect::from_min_size(rect.min, Vec2::new(rect.width(), bar_h));
         p.rect_filled(bar_r, 0.0, TERM_BG_BAR);
         widgets::hline(&p, bar_r.left(), bar_r.right(), bar_r.bottom() - 1.0, TERM_BORDER);
@@ -2505,8 +2565,10 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
             state.dock_open = !state.dock_open;
         }
 
+        let stop_left = crate::agent_stop::paint_header_stop_controls(ui, &p, state, bar_r, pop_rect.left());
+
         // Left-aligned session tabs + `+` runtime dropdown button
-        let max_tabs_right = pop_rect.left() - 38.0;
+        let max_tabs_right = stop_left - 38.0;
         let mut x = bar_r.left() + 6.0;
         let mut tab_to_select: Option<usize> = None;
         let mut tab_to_close: Option<usize> = None;
@@ -2578,7 +2640,7 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
         }
 
         // Top `+` button (`agents-runtime-add-btn`) to open the runtime selector dropdown (`claude`, `codex`, `grok`, `antigravity`, `shell`)
-        let add_x = x.min(pop_rect.left() - 32.0);
+        let add_x = x.min(stop_left - 32.0);
         let add_rect = Rect::from_min_size(Pos2::new(add_x, bar_r.center().y - 12.0), Vec2::new(28.0, 24.0));
         let add_resp = ui.interact(add_rect, Id::new("agents-runtime-add-btn"), Sense::click());
         let add_bg = if state.runtime_dropdown_open {
@@ -2599,12 +2661,20 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
             state.runtime_dropdown_open = !state.runtime_dropdown_open;
         }
 
-        // Active File + Page Context Strip (20px) so the user & agent always see the bound Page
-        let ctx_h = 20.0;
+        // Active File + Page Context Strip (20px) so the user & agent always see the bound Page (or stopped receipt / still-running notice)
         let ctx_r = Rect::from_min_size(Pos2::new(rect.left(), bar_r.bottom()), Vec2::new(rect.width(), ctx_h));
         p.rect_filled(ctx_r, 0.0, TERM_BG_ELEVATED);
         widgets::hline(&p, ctx_r.left(), ctx_r.right(), ctx_r.bottom() - 1.0, TERM_BORDER);
-        let ctx_badge = format!("{} · {}", state.doc_name, state.current_page_name);
+        let active_notice_or_receipt = state.active_tab().and_then(|t| {
+            t.still_running_notice.clone().or_else(|| {
+                if matches!(t.agent_status.lock().ok().as_deref(), Some(AgentTabStatus::Stopped)) {
+                    t.last_receipt.clone()
+                } else {
+                    None
+                }
+            })
+        });
+        let ctx_badge = active_notice_or_receipt.unwrap_or_else(|| format!("{} · {}", state.doc_name, state.current_page_name));
         let ctx_elided = widgets::elide(&p, &ctx_badge, &theme::font_caption(), (ctx_r.width() - 24.0).max(40.0));
         p.circle_filled(Pos2::new(ctx_r.left() + 10.0, ctx_r.center().y), 2.5, STATUS_INFO_TEXT);
         p.text(Pos2::new(ctx_r.left() + 17.0, ctx_r.center().y), Align2::LEFT_CENTER, ctx_elided, theme::font_caption(), STATUS_INFO_TEXT);
@@ -2613,6 +2683,10 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
         let vp_r = Rect::from_min_max(Pos2::new(rect.left(), ctx_r.bottom()), rect.max);
 
         render_vt100_viewport(state, ui, vp_r, "agents-left-pty");
+        if !state.viewport_focused && ui.input(|i| i.key_pressed(Key::Escape)) {
+            let composer_focused = ui.ctx().memory(|m| m.has_focus(Id::new("agents-ask-for-changes-input")));
+            crate::agent_stop::handle_panel_escape(state, composer_focused, designos_doc::now_ms());
+        }
         if let Some(fix) = state.pending_start_fix.take() {
             state.apply_start_fix(fix, file_path);
         }

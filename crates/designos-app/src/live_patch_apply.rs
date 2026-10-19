@@ -48,23 +48,28 @@ fn replace_live_document(app: &mut App, mut new_doc: Document) {
 /// user is mid-edit. Runs every frame. What the log held for the previous document was already
 /// dropped when the switch was read (`LivePatchLog::ingest`); the toast says how many.
 pub fn apply_pending_live_patches(app: &mut App) {
-    if !app.terminal.live_patch.has_held() || user_edit_in_progress(app) {
+    if user_edit_in_progress(app) {
         return;
     }
-    let mut dropped = 0;
-    if let Some(doc) = app.terminal.live_patch.pending_doc.take() {
-        dropped = std::mem::take(&mut app.terminal.live_patch.dropped_old_epoch);
-        replace_live_document(app, doc);
+    if app.terminal.live_patch.has_held() {
+        let mut dropped = 0;
+        if let Some(doc) = app.terminal.live_patch.pending_doc.take() {
+            dropped = std::mem::take(&mut app.terminal.live_patch.dropped_old_epoch);
+            replace_live_document(app, doc);
+        }
+        let patches = std::mem::take(&mut app.terminal.live_patch.pending);
+        if !patches.is_empty() {
+            app.terminal.status_msg = Some(format!("Applied {} live MCP edit(s) from {}", patches.len(), app.terminal.live_patch.path.display()));
+            apply_live_patches(app, &patches);
+        }
+        if dropped > 0 {
+            note_dropped_edits(app, dropped);
+        }
+        publish_live_context(app);
     }
-    let patches = std::mem::take(&mut app.terminal.live_patch.pending);
-    if !patches.is_empty() {
-        app.terminal.status_msg = Some(format!("Applied {} live MCP edit(s) from {}", patches.len(), app.terminal.live_patch.path.display()));
-        apply_live_patches(app, &patches);
+    if let Some(depth) = app.terminal.pending_stop_fold_depth.take() {
+        app.hist.fold_since(depth, crate::agent_stop::STOP_UNDO_LABEL);
     }
-    if dropped > 0 {
-        note_dropped_edits(app, dropped);
-    }
-    publish_live_context(app);
 }
 
 /// Adds to the toast on screen that edits made on the previous document were dropped.
@@ -126,6 +131,7 @@ fn apply_one(app: &mut App, patch: &LivePatch) -> Result<(LivePatchReport, bool)
         e.to_string()
     })?;
     if committed {
+        app.hist.mark_last_undo_as_agent();
         relayout_touched(&mut app.doc, &report.needs_layout);
     }
     Ok((report, committed))

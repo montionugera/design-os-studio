@@ -1,4 +1,5 @@
 mod agent_start_failure;
+mod agent_stop;
 mod app;
 mod board;
 mod canvas;
