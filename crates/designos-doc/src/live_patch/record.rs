@@ -1,13 +1,14 @@
 //! Agent side: turn a command about to be executed into the [`LiveOp`]s it performs.
 
 use super::{LiveOp, SiblingHint, ThreadChange, STRUCTURAL_FIELDS};
-use crate::{Command, CommentThread, Document, Node};
+use crate::{Command, CommentThread, Document, Node, Variable, VariableCollection};
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 
 /// The [`LiveOp`]s `cmd` performs when applied to `doc`, read from the state before it runs.
 ///
 /// Errors for commands whose effect cannot be replayed on a document the agent only partly
-/// holds (page, style, variable, flow, library, guide and device edits); the caller should
+/// holds (page, style, flow, library, guide and device edits); the caller should
 /// refuse to run them while a live editor is attached instead of letting them vanish.
 pub fn live_ops_for_command(doc: &Document, cmd: &Command) -> Result<Vec<LiveOp>, String> {
     let mut out = Vec::new();
@@ -36,6 +37,11 @@ pub fn live_ops_for_command(doc: &Document, cmd: &Command) -> Result<Vec<LiveOp>
         }
         Command::SetComments { comments } => {
             if let Some(op) = comment_changes(&doc.comments, comments) {
+                out.push(op);
+            }
+        }
+        Command::SetVariables { variables, collections } => {
+            if let Some(op) = variable_changes(doc, variables, collections) {
                 out.push(op);
             }
         }
@@ -70,6 +76,19 @@ fn field_changes(before: &Node, after: &Node) -> Result<(Map<String, Value>, Vec
     Ok((set, unset))
 }
 
+/// What `SetVariables` changes in `doc`'s variables and collections, by id.
+fn variable_changes(doc: &Document, variables: &BTreeMap<String, Variable>, collections: &BTreeMap<String, VariableCollection>) -> Option<LiveOp> {
+    fn diff<T: Clone + PartialEq>(before: &BTreeMap<String, T>, after: &BTreeMap<String, T>) -> (Vec<T>, Vec<String>) {
+        let changed = after.iter().filter(|(id, v)| before.get(*id) != Some(*v)).map(|(_, v)| v.clone()).collect();
+        let removed = before.keys().filter(|id| !after.contains_key(*id)).cloned().collect();
+        (changed, removed)
+    }
+    let (variables, removed_variables) = diff(&doc.variables, variables);
+    let (collections, removed_collections) = diff(&doc.variable_collections, collections);
+    let any = !variables.is_empty() || !collections.is_empty() || !removed_variables.is_empty() || !removed_collections.is_empty();
+    any.then_some(LiveOp::Variables { collections, variables, removed_collections, removed_variables })
+}
+
 fn comment_changes(before: &[CommentThread], after: &[CommentThread]) -> Option<LiveOp> {
     let find = |list: &[CommentThread], id: &str| list.iter().find(|t| t.id == id).cloned();
     let added: Vec<_> = after.iter().filter(|t| find(before, &t.id).is_none()).cloned().collect();
@@ -99,7 +118,6 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::SetLibraryState { .. } => "Editing library state",
         Command::SetGuides { .. } => "Editing guides",
         Command::SetPrototypeDevice { .. } => "Editing the prototype device",
-        Command::SetVariables { .. } => "Editing variables",
         _ => "This edit",
     }
 }

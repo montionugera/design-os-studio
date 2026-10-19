@@ -48,13 +48,17 @@ mod settings;
 #[cfg(test)]
 mod slot_model_tests;
 pub mod spec;
+pub mod spec_bind;
+#[cfg(test)]
+mod spec_bind_rollback_label_tests;
+mod spec_data;
 pub mod spec_instance;
 mod styles_ops;
 mod text_fills;
 mod textmodel;
 mod variables;
-mod variables_apply;
 mod variables_edit;
+mod variables_apply;
 pub mod vector;
 mod vector_fit;
 
@@ -75,6 +79,7 @@ pub use paint::*;
 pub use prototype::*;
 pub use settings::*;
 pub use spec::*;
+pub use spec_bind::*;
 pub use spec_instance::*;
 pub use styles_ops::*;
 pub use text_fills::set_text_fills_everywhere;

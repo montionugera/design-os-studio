@@ -41,8 +41,14 @@ pub const ALLOWED_INSTANCE_SPEC_FIELDS: &[&str] = &[
 pub struct SpecError {
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub valid_options: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -58,11 +64,63 @@ impl SpecError {
         valid_options: Vec<String>,
         corrected_example: Option<Value>,
     ) -> Self {
-        Self { code: code.into(), message: message.into(), field_path, valid_options, corrected_example, safe_to_retry: true }
+        Self {
+            code: code.into(),
+            message: message.into(),
+            path: field_path.clone().unwrap_or_default(),
+            field_path,
+            received: None,
+            expected: None,
+            valid_options,
+            corrected_example,
+            safe_to_retry: true,
+        }
     }
 
     pub fn plain(message: impl Into<String>) -> Self {
-        Self { code: String::new(), message: message.into(), field_path: None, valid_options: Vec::new(), corrected_example: None, safe_to_retry: true }
+        Self {
+            code: String::new(),
+            message: message.into(),
+            path: String::new(),
+            field_path: None,
+            received: None,
+            expected: None,
+            valid_options: Vec::new(),
+            corrected_example: None,
+            safe_to_retry: true,
+        }
+    }
+}
+
+impl From<SpecBindError> for SpecError {
+    fn from(e: SpecBindError) -> Self {
+        Self {
+            code: e.code,
+            message: e.message,
+            field_path: (!e.path.is_empty()).then(|| e.path.clone()),
+            path: e.path,
+            received: e.received,
+            expected: e.expected,
+            valid_options: e.valid_options,
+            corrected_example: e.corrected_example,
+            safe_to_retry: e.safe_to_retry,
+        }
+    }
+}
+
+impl From<SpecError> for SpecBindError {
+    fn from(e: SpecError) -> Self {
+        let path = if !e.path.is_empty() { e.path } else { e.field_path.unwrap_or_default() };
+        Self {
+            code: e.code,
+            message: e.message,
+            path,
+            received: e.received,
+            expected: e.expected,
+            valid_options: e.valid_options,
+            corrected_example: e.corrected_example,
+            safe_to_retry: e.safe_to_retry,
+        }
     }
 }
 
@@ -117,6 +175,12 @@ pub struct ApplySpecReport {
     pub stale_library_assets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub issues: Vec<SpecIssue>,
+    #[serde(default)]
+    pub bindings_created: usize,
+    #[serde(default)]
+    pub styles_linked: usize,
+    #[serde(default)]
+    pub warnings: Vec<SpecWarning>,
 }
 
 #[derive(Clone, Debug)]
@@ -157,6 +221,8 @@ pub(crate) struct SpecBuildCtx<'a> {
     pub instances: Vec<PlacedInstanceInfo>,
     pub issues: Vec<SpecIssue>,
     pub touched_slot_containers: HashMap<NodeId, String>,
+    pub bind_index: SpecBindIndex,
+    pub bind_report: SpecApplyReport,
 }
 
 impl<'a> SpecBuildCtx<'a> {
@@ -267,6 +333,8 @@ impl<'a> SpecBuildCtx<'a> {
             instances: Vec::new(),
             issues: Vec::new(),
             touched_slot_containers: HashMap::new(),
+            bind_index: SpecBindIndex::build(doc),
+            bind_report: SpecApplyReport { root_node_id: NodeId(0), bindings_created: 0, styles_linked: 0, warnings: Vec::new() },
         }
     }
 
@@ -299,6 +367,7 @@ impl<'a> SpecBuildCtx<'a> {
         let snap = &self.snapshots[entry.snap_idx];
         let cmd = import_asset(doc, snap, &entry.asset_key, None);
         cmd.clone().apply(doc).map_err(|e| SpecError::plain(e.to_string()))?;
+        self.bind_index = SpecBindIndex::build(doc);
         self.import_cmds.push(cmd);
         if !self.imported_assets.contains(&entry.asset_key) {
             self.imported_assets.push(entry.asset_key.clone());
@@ -1626,7 +1695,7 @@ pub(crate) fn apply_instance_slots_with_ctx(
                 let mut built_ids = Vec::with_capacity(child_specs.len());
                 for (idx, child_spec) in child_specs.iter().enumerate() {
                     let item_path = format!("{field_path}[{idx}]");
-                    let child_id = doc.build_spec_node_with_ctx(slot_container_id, child_spec, ctx)?;
+                    let child_id = doc.build_spec_node_with_ctx(slot_container_id, child_spec, &item_path, ctx)?;
 
                     // Validate against preferred components (§3.2 / §4 / §5.2)
                     if !cfg.preferred.is_empty() {
@@ -1817,9 +1886,11 @@ impl Document {
                     }
                 }
             }
-            if (spec.opacity - 1.0).abs() >= 1e-6 {
-                inst_node.opacity = spec.opacity.clamp(0.0, 1.0);
-                inst_node.component.overrides.insert(OverrideField::Opacity);
+            if let Some(op) = spec.opacity.as_num() {
+                if (op - 1.0).abs() >= 1e-6 {
+                    inst_node.opacity = op.clamp(0.0, 1.0);
+                    inst_node.component.overrides.insert(OverrideField::Opacity);
+                }
             }
             if let Some(ws) = &spec.width_sizing {
                 let s = parse_sizing(ws);
@@ -1969,7 +2040,7 @@ impl Document {
         self.collect_exported_overrides(id, "", all_comments, &mut handled_containers, &mut overrides);
 
         let size_overridden = n.component.overrides.contains(&OverrideField::Size);
-        let opacity = if n.component.overrides.contains(&OverrideField::Opacity) { n.opacity } else { 1.0 };
+        let opacity = NumberOrVar::Num(if n.component.overrides.contains(&OverrideField::Opacity) { n.opacity } else { 1.0 });
         let dev_status = n.dev.status.map(|s| s.label().to_string());
         let annotations: Vec<String> = n.dev.annotations.iter().map(|a| a.text.clone()).collect();
         let comments: Vec<ResolvedCommentThread> = all_comments
@@ -2009,8 +2080,12 @@ impl Document {
             clips_content: None,
             text: None,
             font_size: None,
+            line_height: None,
             font_weight: None,
             text_color: None,
+            text_style: None,
+            effect_style: None,
+            mode: BTreeMap::new(),
             layout: None,
             dev_status,
             annotation: None,
@@ -2163,18 +2238,49 @@ impl Document {
     }
 }
 
+fn collect_node_only_commands(cmd: Command, out: &mut Vec<Command>) {
+    match cmd {
+        Command::SetVariables { .. } | Command::SetStyles { .. } | Command::SetLibraryState { .. } => {}
+        Command::Batch(cmds) => {
+            for c in cmds {
+                collect_node_only_commands(c, out);
+            }
+        }
+        other => out.push(other),
+    }
+}
+
 /// Builds `spec` on a trial clone of `doc` and returns a single undoable [`Command`]
-/// (combining any library `import_asset` commands and the subtree `Command::Insert`)
+/// (combining any library `import_asset` commands, variable/style changes, and the subtree `Command::Insert`)
 /// along with [`ApplySpecReport`]. On any error, `doc` is untouched.
 pub fn apply_spec_command(doc: &mut Document, parent: NodeId, spec: &NodeSpec, snapshots: &[LibrarySnapshot]) -> Result<(Command, ApplySpecReport), SpecError> {
-    let pnode = doc.get(parent).ok_or_else(|| SpecError::plain(format!("Parent node {} not found", parent.0)))?;
+    let pnode = doc.get(parent).ok_or_else(|| SpecBindError {
+        code: "NODE_NOT_FOUND".to_string(),
+        message: format!("Parent node {} not found", parent.0),
+        path: "/parent".to_string(),
+        received: Some(parent.0.to_string()),
+        expected: Some("an existing container node id".to_string()),
+        valid_options: Vec::new(),
+        corrected_example: None,
+        safe_to_retry: true,
+    })?;
     if !pnode.kind.is_container() {
-        return Err(SpecError::plain(format!("Parent node {} is not a container", parent.0)));
+        return Err(SpecBindError {
+            code: "NOT_A_CONTAINER".to_string(),
+            message: format!("Parent node {} is not a container", parent.0),
+            path: "/parent".to_string(),
+            received: Some(parent.0.to_string()),
+            expected: Some("a container node id (page, frame, section, component, group)".to_string()),
+            valid_options: Vec::new(),
+            corrected_example: None,
+            safe_to_retry: true,
+        }
+        .into());
     }
 
     let mut trial = doc.clone();
     let mut ctx = SpecBuildCtx::new(&trial, snapshots);
-    let root_id = trial.build_spec_node_with_ctx(parent, spec, &mut ctx)?;
+    let root_id = trial.build_spec_node_with_ctx(parent, spec, "spec", &mut ctx)?;
 
     let relayout_root = if trial.get(parent).and_then(|n| n.kind.frame_props()).and_then(|f| f.auto_layout.as_ref()).is_some() { parent } else { root_id };
     trial.relayout_subtree(relayout_root);
@@ -2189,11 +2295,11 @@ pub fn apply_spec_command(doc: &mut Document, parent: NodeId, spec: &NodeSpec, s
     let mut name_to_id = BTreeMap::new();
     populate_name_to_id(&trial, root_id, "", &mut name_to_id);
 
+    let data_cmds = doc.spec_data_commands(&trial);
+
     // If library assets were imported during the trial, ensure `doc` has the empty library page
     // container and any copied images so `import_cmds` apply cleanly on `doc`.
-    let final_cmd = if ctx.import_cmds.is_empty() {
-        insert_cmd
-    } else {
+    if !ctx.import_cmds.is_empty() {
         if let Some(lp_id) = trial.library_page {
             if let std::collections::btree_map::Entry::Vacant(e) = doc.nodes.entry(lp_id) {
                 let mut lp_node = Node::new(lp_id, NodeKind::Page { background: Color::rgb(0x5A, 0x5A, 0x5A) });
@@ -2206,10 +2312,15 @@ pub fn apply_spec_command(doc: &mut Document, parent: NodeId, spec: &NodeSpec, s
         for (k, v) in &trial.images {
             doc.images.entry(k.clone()).or_insert_with(|| v.clone());
         }
-        let mut cmds = ctx.import_cmds;
-        cmds.push(insert_cmd);
-        Command::Batch(cmds)
-    };
+    }
+
+    let mut cmds = Vec::new();
+    for ic in ctx.import_cmds {
+        collect_node_only_commands(ic, &mut cmds);
+    }
+    cmds.extend(data_cmds);
+    cmds.push(insert_cmd);
+    let final_cmd = if cmds.len() == 1 { cmds.remove(0) } else { Command::Batch(cmds) };
 
     let report = ApplySpecReport {
         root_node_id: root_id,
@@ -2219,6 +2330,9 @@ pub fn apply_spec_command(doc: &mut Document, parent: NodeId, spec: &NodeSpec, s
         imported_assets: ctx.imported_assets,
         stale_library_assets: ctx.stale_library_assets,
         issues: ctx.issues,
+        bindings_created: ctx.bind_report.bindings_created,
+        styles_linked: ctx.bind_report.styles_linked,
+        warnings: ctx.bind_report.warnings,
     };
 
     Ok((final_cmd, report))
