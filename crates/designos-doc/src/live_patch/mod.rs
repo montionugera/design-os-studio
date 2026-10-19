@@ -13,7 +13,7 @@ mod replay_comments;
 mod validate;
 
 pub use record::live_ops_for_command;
-pub use replay::{replay_live_patch, LivePatchReport, LivePatchState};
+pub use replay::{replay_live_patch, LivePatchReport, LivePatchState, TouchKind};
 
 use crate::{Comment, CommentAnchor, CommentThread, Node, NodeId};
 use serde::{Deserialize, Serialize};
@@ -31,16 +31,28 @@ pub struct LivePatch {
     /// base: after the agent reloads a newer canvas it sees the editor's own ids.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<u64>,
+    /// Optional agent session / run identifier (`#682`, `#572`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Optional human-readable agent label (`Claude`, `Codex`, `Grok`, `Antigravity`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_label: Option<String>,
     pub ops: Vec<LiveOp>,
 }
 
 impl LivePatch {
     pub fn new(ops: Vec<LiveOp>) -> Self {
-        Self { v: LIVE_PATCH_VERSION, base: None, ops }
+        Self { v: LIVE_PATCH_VERSION, base: None, session_id: None, agent_label: None, ops }
     }
 
     pub fn with_base(mut self, base: Option<u64>) -> Self {
         self.base = base;
+        self
+    }
+
+    pub fn with_agent(mut self, session_id: impl Into<String>, agent_label: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self.agent_label = Some(agent_label.into());
         self
     }
 }

@@ -139,6 +139,16 @@ impl AgentCliPreset {
         }
     }
 
+    pub fn short_agent_name(self) -> &'static str {
+        match self {
+            AgentCliPreset::Claude => "Claude",
+            AgentCliPreset::Codex => "Codex",
+            AgentCliPreset::Antigravity => "Antigravity",
+            AgentCliPreset::Grok => "Grok",
+            AgentCliPreset::Shell | AgentCliPreset::DesignOsHelp => "Claude",
+        }
+    }
+
     pub fn binary_name(self) -> &'static str {
         match self {
             AgentCliPreset::Shell => "zsh",
@@ -791,6 +801,18 @@ impl TerminalState {
             current_page_name: self.current_page_name.clone(),
             doc_name: self.doc_name.clone(),
         }
+    }
+
+    /// Returns `(session_id, agent_label)` for the active agent tab (or `active_runtime` when no agent tab is open).
+    pub fn active_agent_session_identity(&self) -> (String, String) {
+        let id = if self.session_id.trim().is_empty() { "default".to_string() } else { self.session_id.clone() };
+        let label = self
+            .tabs
+            .get(self.active_tab)
+            .filter(|t| !matches!(t.spawn_preset, AgentCliPreset::Shell | AgentCliPreset::DesignOsHelp))
+            .map(|t| t.spawn_preset.short_agent_name())
+            .unwrap_or_else(|| self.active_runtime.short_agent_name());
+        (id, label.to_string())
     }
 
     /// Synchronizes the open file's document, currently selected page (`page`), and selection into
