@@ -18,7 +18,7 @@
 mod board;
 pub mod changelog_features;
 mod comments;
-mod components;
+pub mod components;
 mod dev;
 pub mod find;
 pub mod finite_json;
