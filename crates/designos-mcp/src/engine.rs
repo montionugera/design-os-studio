@@ -13,13 +13,37 @@ pub struct Engine {
     /// Edits executed since the last [`Engine::take_live_ops`], recorded while an open editor
     /// mirrors this session (`None` = not recording).
     pub live_ops: Option<Vec<LiveOp>>,
+    /// Open file path synced from Studio (`context.json`) or `designos_open_file` / `designos_save_file`.
+    pub file_path: Option<String>,
+    /// Canvas selection node IDs synced from Studio (`context.json`).
+    /// Never exposed unless `designos_get_app_state` is called with `include_selection: true` (`#698`).
+    pub selected_node_ids: Vec<NodeId>,
+    /// True when attached to a live Studio session (`scoped` flag in `designos_get_app_state`).
+    pub scoped: bool,
+    /// Optional enabled tool names filter (`E15-15`).
+    pub enabled_tools: Option<Vec<String>>,
+    /// Base document revision synced from Studio (`context.json` / `bootstrap.json`).
+    pub base_doc_revision: Option<u64>,
+    /// Timestamp synced from Studio's `bootstrap.json` when the session document has not mutated since sync.
+    pub bootstrap_generated_at: Option<String>,
 }
 
 impl Default for Engine {
     fn default() -> Self {
         let mut doc = Document::new("Untitled");
         let page = doc.add_page("Page 1");
-        Self { doc, history: History::default(), active_page_id: Some(page), live_ops: None }
+        Self {
+            doc,
+            history: History::default(),
+            active_page_id: Some(page),
+            live_ops: None,
+            file_path: None,
+            selected_node_ids: Vec::new(),
+            scoped: false,
+            enabled_tools: None,
+            base_doc_revision: None,
+            bootstrap_generated_at: None,
+        }
     }
 }
 
@@ -39,6 +63,7 @@ impl Engine {
         // or serialize a document with deferred layout still in it.
         self.settle_layout();
         match name {
+            "designos_get_app_state" => crate::tools::bootstrap::call_get_app_state(self, args),
             "designos_get_document" => {
                 let _: Empty = parse(args)?;
                 Ok(json!({"name":self.doc.name,"kind":self.doc.kind,
@@ -711,6 +736,7 @@ pub fn tools() -> Vec<Value> {
     let text = json!({"type":"string","maxLength":100000,"description":"Plain text; limited to 100000 UTF-8 bytes."});
     let name = json!({"type":"string","maxLength":1024,"description":"Layer name; limited to 1024 UTF-8 bytes."});
     let mut out = Vec::new();
+    out.push(crate::tools::bootstrap::tool_definition());
     let mut add = |tool: &str, description: &str, properties: Value, required: Vec<&str>, read_only: bool, idempotent: bool| {
         out.push(json!({"name":format!("designos_{tool}"),"description":description,
             "inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},

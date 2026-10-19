@@ -11,6 +11,7 @@
 //! vector PDF 1.4 pages, one page per frame. Pages preserve frame dimensions,
 //! vector paths, gradients, clipping masks, and selectable text runs.
 
+pub mod agent_context;
 mod android_xml;
 mod bounds;
 mod codegen;

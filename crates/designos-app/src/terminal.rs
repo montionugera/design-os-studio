@@ -613,12 +613,28 @@ pub struct AgentChatTurn {
     pub role: AgentChatRole,
     pub runtime: AgentCliPreset,
     pub text: String,
+    pub dispatched_prompt: String,
+    pub context_attached: bool,
     pub shell_cmd: String,
     pub tab_id: usize,
     pub log_start_offset: usize,
     pub log_end_offset: Option<usize>,
     pub extracted_spec_json: Option<String>,
     pub applied_to_canvas: bool,
+}
+
+/// Shared state of a background bootstrap build job (`E15-16 §3.2`, `§8.5`, `§11`).
+#[derive(Clone, Debug)]
+pub struct BootstrapJobState {
+    pub done: bool,
+    pub markdown: Option<String>,
+}
+
+/// Handle to an in-flight background bootstrap build job with a `compact_bootstrap` fallback (`§8.5`).
+#[derive(Clone)]
+pub struct BootstrapJobHandle {
+    pub state: Arc<(Mutex<BootstrapJobState>, std::sync::Condvar)>,
+    pub compact_fallback_markdown: String,
 }
 
 /// Persistent state for the embedded multi-tab PTY terminal, isolated per open document tab.
@@ -630,9 +646,21 @@ pub struct TerminalState {
     pub live_canvas_path: PathBuf,
     pub context_json_path: PathBuf,
     pub selection_spec_path: PathBuf,
+    pub bootstrap_md_path: PathBuf,
+    pub bootstrap_json_path: PathBuf,
     /// Agent edits log (`doc-patch.jsonl`) written by `designos-mcp`, with its read position.
     pub live_patch: crate::live_patch_log::LivePatchLog,
     pub last_synced_key: Option<(u64, u64, u64)>,
+    /// Key `(doc.mutation_epoch(), page.0)` for which `bootstrap.md` and `bootstrap.json` were built (`E15-16`).
+    pub last_bootstrap_key: Option<(u64, u64)>,
+    /// Monotonically increasing agent run identifier (`E15-16 §3.2`).
+    pub run_id: u64,
+    /// Which `run_id` has already received the first-turn `bootstrap.md` block in `submit_chat_prompt`.
+    pub prompt_bootstrap_delivered_run: Option<u64>,
+    /// Cached `bootstrap.md` text for the active document/page.
+    pub bootstrap_markdown: Option<String>,
+    /// Optional in-flight background bootstrap build (`E15-16 §8.5`).
+    pub bootstrap_job: Option<BootstrapJobHandle>,
     /// The user holds an open edit (drag, text session, shape builder...): the editor's canvas
     /// is not published until it ends. Refreshed by `live_patch_apply::publish_live_context`.
     pub edit_in_progress: bool,
@@ -699,6 +727,52 @@ pub fn tab_session_id(instance_id: &str, tab_id: u64) -> String {
     format!("{instance_id}-tab-{tab_id}")
 }
 
+fn serialize_bootstrap_json(boot: &designos_export::agent_context::Bootstrap) -> serde_json::Value {
+    let sections_json: Vec<serde_json::Value> = boot
+        .sections
+        .iter()
+        .map(|sec| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("id".into(), serde_json::json!(sec.id));
+            obj.insert("title".into(), serde_json::json!(sec.title));
+            obj.insert("tokens".into(), serde_json::json!(sec.tokens));
+            obj.insert("truncated".into(), serde_json::json!(sec.truncated));
+            if let Some(note) = &sec.truncation_note {
+                obj.insert("truncation_note".into(), serde_json::json!(note));
+            }
+            obj.insert("content".into(), serde_json::json!(sec.content));
+            serde_json::Value::Object(obj)
+        })
+        .collect();
+    serde_json::json!({
+        "generated_at": boot.generated_at,
+        "doc_revision": boot.doc_revision,
+        "scoped": boot.scoped,
+        "sections": sections_json,
+        "total_tokens": boot.total_tokens,
+    })
+}
+
+fn write_bootstrap_artifacts(
+    session_dir: &Path,
+    boot: &designos_export::agent_context::Bootstrap,
+    page_context: &serde_json::Value,
+) {
+    let _ = atomic_write_session_file(&session_dir.join("bootstrap.md"), boot.markdown.as_bytes());
+    if let Ok(json_bytes) = serde_json::to_vec_pretty(&serialize_bootstrap_json(boot)) {
+        let _ = atomic_write_session_file(&session_dir.join("bootstrap.json"), &json_bytes);
+    }
+    let boot_reply = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": format!("DESIGN:OS Studio page context: {page_context}\n\n{}", boot.markdown),
+        }
+    });
+    if let Ok(reply_bytes) = serde_json::to_vec_pretty(&boot_reply) {
+        let _ = atomic_write_session_file(&session_dir.join("bootstrap-context-reply.json"), &reply_bytes);
+    }
+}
+
 impl TerminalState {
     /// Creates an isolated `TerminalState` bound to document tab `tab_id` of this process
     /// (`/tmp/designos-sessions/p<pid>-tab-{tab_id}`). A window's terminal is bound to its own
@@ -711,6 +785,8 @@ impl TerminalState {
         let live_canvas_path = session_dir.join("canvas.designos");
         let context_json_path = session_dir.join("context.json");
         let selection_spec_path = session_dir.join("selection.spec.json");
+        let bootstrap_md_path = session_dir.join("bootstrap.md");
+        let bootstrap_json_path = session_dir.join("bootstrap.json");
         let initial_spec_mtime = std::fs::metadata(&live_spec_path).and_then(|m| m.modified()).ok();
         let fallback_spec_mtime = std::fs::metadata("/tmp/designos-live-agent-out.spec.json").and_then(|m| m.modified()).ok();
         let live_patch = crate::live_patch_log::LivePatchLog::bind(session_dir.join("doc-patch.jsonl"));
@@ -722,8 +798,15 @@ impl TerminalState {
             live_canvas_path,
             context_json_path,
             selection_spec_path,
+            bootstrap_md_path,
+            bootstrap_json_path,
             live_patch,
             last_synced_key: None,
+            last_bootstrap_key: None,
+            run_id: 1,
+            prompt_bootstrap_delivered_run: None,
+            bootstrap_markdown: None,
+            bootstrap_job: None,
             edit_in_progress: false,
             current_page_id: 1,
             current_page_name: "Page 1".to_string(),
@@ -768,10 +851,16 @@ impl TerminalState {
         self.live_canvas_path = session_dir.join("canvas.designos");
         self.context_json_path = session_dir.join("context.json");
         self.selection_spec_path = session_dir.join("selection.spec.json");
+        self.bootstrap_md_path = session_dir.join("bootstrap.md");
+        self.bootstrap_json_path = session_dir.join("bootstrap.json");
         self.session_dir = session_dir;
         self.last_watched_mtime = std::fs::metadata(&self.live_spec_path).and_then(|m| m.modified()).ok();
         self.live_patch = crate::live_patch_log::LivePatchLog::bind(self.session_dir.join("doc-patch.jsonl"));
         self.last_synced_key = None;
+        self.last_bootstrap_key = None;
+        self.prompt_bootstrap_delivered_run = None;
+        self.bootstrap_markdown = None;
+        self.bootstrap_job = None;
     }
 
     /// Builds a [`SessionEnv`] snapshot for this terminal state's per-file session.
@@ -793,8 +882,126 @@ impl TerminalState {
         }
     }
 
+    fn page_context_value(&self, file_path: Option<&Path>) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": self.session_id,
+            "doc_name": self.doc_name,
+            "file_path": file_path.map(|p| p.display().to_string()),
+            "current_page_id": self.current_page_id,
+            "current_page_name": self.current_page_name,
+        })
+    }
+
+    /// Starts or restarts an agent run, advancing `run_id` so the next prompt / hook invocation
+    /// delivers the 7-section `bootstrap.md` block once (`E15-16 §3.2`, `§10`).
+    pub fn reset_agent_run(&mut self, file_path: Option<&Path>) {
+        self.run_id = self.run_id.saturating_add(1);
+        self.prompt_bootstrap_delivered_run = None;
+        self.provision_session_agent_files(file_path);
+    }
+
+    /// Spawns a background bootstrap build job (`E15-16 §3.2`, `§8.5`, `§11`) with an immediate
+    /// `compact_bootstrap` fallback if `resolve_bootstrap_markdown` times out at `500 ms`.
+    pub fn start_bootstrap_job(
+        &mut self,
+        doc: Document,
+        page: NodeId,
+        file_path: Option<PathBuf>,
+        simulated_delay: Option<std::time::Duration>,
+    ) {
+        let opts = designos_export::agent_context::BootstrapOptions {
+            file_path: file_path.as_ref().map(|p| p.display().to_string()),
+            current_page_id: Some(page),
+            target_node_ids: Vec::new(),
+            max_tokens: designos_export::agent_context::DEFAULT_BOOTSTRAP_MAX_TOKENS,
+            sections: None,
+            include_selection: false,
+            selected_node_ids: Vec::new(),
+            scoped: doc.nodes.len() > 25_000,
+            generated_at: None,
+            doc_revision: Some(doc.mutation_epoch()),
+            active_style: None,
+            enabled_tools: None,
+            in_progress: Default::default(),
+        };
+        let compact = designos_export::agent_context::compact_bootstrap(
+            &doc,
+            &opts,
+            designos_export::agent_context::DEFAULT_RULES_PACK,
+        );
+        let state = Arc::new((
+            Mutex::new(BootstrapJobState { done: false, markdown: None }),
+            std::sync::Condvar::new(),
+        ));
+        let state_bg = Arc::clone(&state);
+        let session_dir = self.session_dir.clone();
+        let page_ctx = self.page_context_value(file_path.as_deref());
+        std::thread::spawn(move || {
+            if let Some(d) = simulated_delay {
+                std::thread::sleep(d);
+            }
+            let boot = designos_export::agent_context::bootstrap(
+                &doc,
+                &opts,
+                &doc.library.enabled,
+                designos_export::agent_context::DEFAULT_RULES_PACK,
+            );
+            write_bootstrap_artifacts(&session_dir, &boot, &page_ctx);
+            if let Ok(mut guard) = state_bg.0.lock() {
+                guard.done = true;
+                guard.markdown = Some(boot.markdown);
+                state_bg.1.notify_all();
+            }
+        });
+        self.bootstrap_job = Some(BootstrapJobHandle {
+            state,
+            compact_fallback_markdown: compact.markdown,
+        });
+    }
+
+    /// Resolves the `bootstrap.md` text for the first turn of a run, waiting up to `timeout` (`500 ms`)
+    /// on any in-flight background job and falling back to `compact_bootstrap` if still building (`§8.5`).
+    pub fn resolve_bootstrap_markdown(&mut self, timeout: std::time::Duration) -> String {
+        if let Some(job) = self.bootstrap_job.clone() {
+            if let Ok(guard) = job.state.0.lock() {
+                let res = job.state.1.wait_timeout_while(guard, timeout, |s| !s.done);
+                if let Ok((guard, _)) = res {
+                    if guard.done {
+                        if let Some(md) = guard.markdown.clone() {
+                            self.bootstrap_markdown = Some(md.clone());
+                            self.bootstrap_job = None;
+                            return md;
+                        }
+                    }
+                }
+            }
+            return job.compact_fallback_markdown;
+        }
+        if let Some(md) = &self.bootstrap_markdown {
+            return md.clone();
+        }
+        if let Ok(md) = std::fs::read_to_string(&self.bootstrap_md_path) {
+            self.bootstrap_markdown = Some(md.clone());
+            return md;
+        }
+        let mut fallback_doc = Document::new(&self.doc_name);
+        let pid = fallback_doc.add_page(&self.current_page_name);
+        let opts = designos_export::agent_context::BootstrapOptions {
+            current_page_id: Some(pid),
+            ..Default::default()
+        };
+        let boot = designos_export::agent_context::bootstrap(
+            &fallback_doc,
+            &opts,
+            &fallback_doc.library.enabled,
+            designos_export::agent_context::DEFAULT_RULES_PACK,
+        );
+        self.bootstrap_markdown = Some(boot.markdown.clone());
+        boot.markdown
+    }
+
     /// Synchronizes the open file's document, currently selected page (`page`), and selection into
-    /// `self.session_dir` (`context.json`, `canvas.designos`, `mcp-config.json`, `hooks.json`, `SKILL.md`)
+    /// `self.session_dir` (`context.json`, `canvas.designos`, `bootstrap.md`, `bootstrap.json`, `mcp-config.json`, `hooks.json`, `SKILL.md`)
     /// so any CLI agent (`claude`, `codex`, `agy`, `grok`) in this file's terminal automatically
     /// targets THIS file and its currently selected page.
     pub fn sync_live_file_context(&mut self, doc: &Document, page: NodeId, selection: &[NodeId], file_path: Option<&Path>) {
@@ -828,6 +1035,7 @@ impl TerminalState {
                 "file_path": file_path.map(|p| p.display().to_string()),
                 "current_page_id": page.0,
                 "current_page_name": self.current_page_name,
+                "doc_revision": doc.mutation_epoch(),
                 "selected_node_ids": selected_ids,
             });
             if let Ok(ctx_bytes) = serde_json::to_vec_pretty(&ctx_val) {
@@ -847,6 +1055,35 @@ impl TerminalState {
                 if !cfg!(test) {
                     let _ = atomic_write_session_file(Path::new("/tmp/designos-live-canvas.designos"), json_str.as_bytes());
                 }
+            }
+
+            let bootstrap_key = (doc.mutation_epoch(), page.0);
+            if self.last_bootstrap_key != Some(bootstrap_key) {
+                let opts = designos_export::agent_context::BootstrapOptions {
+                    file_path: file_path.map(|p| p.display().to_string()),
+                    current_page_id: Some(page),
+                    target_node_ids: Vec::new(),
+                    max_tokens: designos_export::agent_context::DEFAULT_BOOTSTRAP_MAX_TOKENS,
+                    sections: None,
+                    include_selection: false,
+                    selected_node_ids: Vec::new(),
+                    scoped: doc.nodes.len() > 25_000,
+                    generated_at: None,
+                    doc_revision: Some(doc.mutation_epoch()),
+                    active_style: None,
+                    enabled_tools: None,
+                    in_progress: Default::default(),
+                };
+                let boot = designos_export::agent_context::bootstrap(
+                    doc,
+                    &opts,
+                    &doc.library.enabled,
+                    designos_export::agent_context::DEFAULT_RULES_PACK,
+                );
+                let page_ctx = self.page_context_value(file_path);
+                write_bootstrap_artifacts(&self.session_dir, &boot, &page_ctx);
+                self.bootstrap_markdown = Some(boot.markdown);
+                self.last_bootstrap_key = Some(bootstrap_key);
             }
 
             self.provision_session_agent_files(file_path);
@@ -885,13 +1122,7 @@ impl TerminalState {
         }
         write_grok_session_config(&self.session_dir, &mcp_config);
 
-        let page_context = serde_json::json!({
-            "session_id": self.session_id,
-            "doc_name": self.doc_name,
-            "file_path": file_path.map(|p| p.display().to_string()),
-            "current_page_id": self.current_page_id,
-            "current_page_name": self.current_page_name,
-        });
+        let page_context = self.page_context_value(file_path);
         // Claude's reply to a prompt hook: the page as `additionalContext`, nothing that could block the prompt.
         let context_reply_path = self.session_dir.join("page-context-reply.json");
         let context_reply = serde_json::json!({
@@ -903,8 +1134,13 @@ impl TerminalState {
         if let Ok(bytes) = serde_json::to_vec_pretty(&context_reply) {
             let _ = atomic_write_session_file(&context_reply_path, &bytes);
         }
+        let bootstrap_reply_path = self.session_dir.join("bootstrap-context-reply.json");
+        let delivered_marker_path = self.session_dir.join(format!("bootstrap.delivered.{}", self.run_id));
         let status_path = self.session_dir.join("agent-status.json");
-        if let Ok(bytes) = serde_json::to_vec_pretty(&session_hooks_settings(&status_path, Some(&context_reply_path))) {
+        if let Ok(bytes) = serde_json::to_vec_pretty(&session_hooks_settings(
+            &status_path,
+            Some((&context_reply_path, &bootstrap_reply_path, &delivered_marker_path)),
+        )) {
             let _ = atomic_write_session_file(&self.session_dir.join("hooks.json"), &bytes);
         }
         if let Ok(bytes) = serde_json::to_vec_pretty(&session_hooks_settings(&status_path, None)) {
@@ -1066,8 +1302,30 @@ impl TerminalState {
             || trimmed.starts_with("designos ");
         let raw_cmd = if is_raw_shell { trimmed.trim_start_matches('$').trim_start_matches('!').trim().to_string() } else { String::new() };
 
+        let (dispatched_prompt, context_attached) = if is_raw_shell {
+            (trimmed.to_string(), false)
+        } else if self.prompt_bootstrap_delivered_run != Some(self.run_id) {
+            self.prompt_bootstrap_delivered_run = Some(self.run_id);
+            let boot_md = self.resolve_bootstrap_markdown(std::time::Duration::from_millis(500));
+            (
+                format!("```designos-context\n{}\n```\n\n{trimmed}", boot_md.trim_end()),
+                true,
+            )
+        } else {
+            let page_ctx = self.page_context_value(file_path);
+            (
+                format!("```designos-context\nDESIGN:OS Studio page context: {page_ctx}\n```\n\n{trimmed}"),
+                false,
+            )
+        };
+
         let selection_path = self.selection_spec_path.clone();
-        let real_cli_cmd = build_real_cli_command(runtime, trimmed, &self.live_spec_path, &selection_path);
+        let cli_prompt_arg = if !is_raw_shell && runtime != AgentCliPreset::Claude {
+            dispatched_prompt.as_str()
+        } else {
+            trimmed
+        };
+        let real_cli_cmd = build_real_cli_command(runtime, cli_prompt_arg, &self.live_spec_path, &selection_path);
         let display_cmd = if is_raw_shell { raw_cmd.clone() } else { real_cli_cmd.clone() };
 
         let run_real_cli = !is_raw_shell
@@ -1116,6 +1374,8 @@ impl TerminalState {
             role: AgentChatRole::User,
             runtime,
             text: trimmed.to_string(),
+            dispatched_prompt: dispatched_prompt.clone(),
+            context_attached,
             shell_cmd: display_cmd.clone(),
             tab_id,
             log_start_offset: current_log_len,
@@ -1129,6 +1389,8 @@ impl TerminalState {
             role: AgentChatRole::Assistant,
             runtime,
             text: String::new(),
+            dispatched_prompt,
+            context_attached: false,
             shell_cmd: display_cmd,
             tab_id,
             log_start_offset: current_log_len,
@@ -1151,6 +1413,32 @@ impl TerminalState {
         if cfg!(test) || !self.side_panel_pty_open {
             self.side_panel_pty_open = false;
             self.chat_mode = true;
+        }
+    }
+
+    /// Opens `bootstrap.md` in the raw terminal view for inspection (`E15-16 §7`).
+    pub fn open_bootstrap_in_raw_terminal(&mut self) {
+        self.side_panel_pty_open = true;
+        self.chat_mode = false;
+        let text = self
+            .bootstrap_markdown
+            .clone()
+            .or_else(|| std::fs::read_to_string(&self.bootstrap_md_path).ok())
+            .unwrap_or_default();
+        if !text.is_empty() {
+            if let Some(tab) = self.active_tab() {
+                let formatted = format!(
+                    "\r\n--- {} ---\r\n{}\r\n",
+                    self.bootstrap_md_path.display(),
+                    text.replace('\n', "\r\n")
+                );
+                if let Ok(mut parser) = tab.parser.lock() {
+                    parser.process(formatted.as_bytes());
+                }
+                if let Ok(mut log) = tab.raw_log.lock() {
+                    log.push_str(&formatted);
+                }
+            }
         }
     }
 
@@ -1221,6 +1509,10 @@ impl TerminalState {
     fn spawn_tab_running(&mut self, preset: AgentCliPreset, file_path: Option<&Path>, command: Option<&str>) -> Result<usize, String> {
         let id = self.next_tab_id.max(1);
         self.next_tab_id = id + 1;
+        if !matches!(preset, AgentCliPreset::Shell | AgentCliPreset::DesignOsHelp) {
+            self.run_id = self.run_id.saturating_add(1);
+            self.prompt_bootstrap_delivered_run = None;
+        }
         let _ = std::fs::create_dir_all(&self.session_dir);
         self.provision_session_agent_files(file_path);
         let env = self.session_env();
@@ -1400,6 +1692,8 @@ impl TerminalState {
                 role: AgentChatRole::User,
                 runtime,
                 text: format!("[{task_title}] {cli_prompt}"),
+                dispatched_prompt: cli_prompt.to_string(),
+                context_attached: false,
                 shell_cmd: display_cmd.clone(),
                 tab_id,
                 log_start_offset: current_log_len,
@@ -1412,6 +1706,8 @@ impl TerminalState {
                 role: AgentChatRole::Assistant,
                 runtime,
                 text: format!("[Figma AI · {task_title}] {cli_prompt}"),
+                dispatched_prompt: cli_prompt.to_string(),
+                context_attached: false,
                 shell_cmd: display_cmd,
                 tab_id,
                 log_start_offset: current_log_len,
@@ -2200,13 +2496,22 @@ fn command_handler_group(command: String) -> serde_json::Value {
 }
 
 /// Session hooks in Claude's settings shape (`{"hooks": {Event: [{matcher, hooks: [...]}]}}`) for the
-/// status channel. With `context_reply` the prompt hook also prints that file, a Claude
-/// `additionalContext` reply carrying the page (never the selection). Without it the prompt hook prints
-/// nothing: Grok reads any stdout that starts with `{` as a decision (a context reply shows as a
-/// failed hook) and discards an allowing hook's context anyway.
-fn session_hooks_settings(status_path: &Path, context_reply: Option<&Path>) -> serde_json::Value {
-    let prompt = match context_reply {
-        Some(reply) => format!("{} && cat '{}'", status_hook_command(status_path, "working"), reply.display()),
+/// status channel. With `context_replies` (`(page_reply, bootstrap_reply, marker)`) the prompt hook
+/// prints `bootstrap_reply` once per run (creating `marker`) and `page_reply` on subsequent turns
+/// (never the selection). Without it the prompt hook prints nothing: Grok reads any stdout that starts
+/// with `{` as a decision (a context reply shows as a failed hook) and discards an allowing hook's
+/// context anyway.
+fn session_hooks_settings(status_path: &Path, context_replies: Option<(&Path, &Path, &Path)>) -> serde_json::Value {
+    let prompt = match context_replies {
+        Some((page_reply, boot_reply, marker)) => format!(
+            "{} && if [ ! -e '{}' ] && [ -f '{}' ]; then : > '{}'; cat '{}'; else cat '{}'; fi",
+            status_hook_command(status_path, "working"),
+            marker.display(),
+            boot_reply.display(),
+            marker.display(),
+            boot_reply.display(),
+            page_reply.display()
+        ),
         None => status_hook_command(status_path, "working"),
     };
     serde_json::json!({
@@ -3205,6 +3510,7 @@ fn wrap_chat_lines(p: &Painter, text: &str, font: &FontId, max_w: f32, max_lines
 
 fn render_agent_chat_thread(state: &mut TerminalState, ui: &mut Ui, center_rect: Rect, actions: &mut Vec<TerminalAction>) {
     let mut apply_turn_idx: Option<usize> = None;
+    let mut open_bootstrap_in_terminal = false;
     clipped(ui, center_rect, |ui| {
         let p = ui.painter().clone();
         let font = theme::font_caption();
@@ -3243,7 +3549,25 @@ fn render_agent_chat_thread(state: &mut TerminalState, ui: &mut Ui, center_rect:
                         );
                     }
                     widgets::record(ui, &format!("agents-chat-turn-{}", turn.id), card_r);
-                    y += card_h + 8.0;
+                    y += card_h + theme::SPACE_ROW;
+                    if turn.context_attached {
+                        let cap_r = Rect::from_min_size(Pos2::new(card_r.left(), y), Vec2::new(card_w, theme::LINE_CAPTION));
+                        let cap_resp = ui.interact(cap_r, Id::new(("agents-chat-context-attached", turn.id)), Sense::click());
+                        p.text(
+                            Pos2::new(cap_r.left(), cap_r.center().y),
+                            Align2::LEFT_CENTER,
+                            "Context attached",
+                            font.clone(),
+                            theme::TEXT_SECONDARY,
+                        );
+                        widgets::record(ui, &format!("agents-chat-context-attached-{}", turn.id), cap_r);
+                        if cap_resp.clicked() {
+                            open_bootstrap_in_terminal = true;
+                        }
+                        y += theme::LINE_CAPTION + theme::SPACE_INLINE;
+                    } else {
+                        y += theme::SPACE_ROW;
+                    }
                 }
                 AgentChatRole::Assistant => {
                     let card_w = (center_rect.width() - 20.0).max(120.0);
@@ -3310,6 +3634,10 @@ fn render_agent_chat_thread(state: &mut TerminalState, ui: &mut Ui, center_rect:
             }
         }
     });
+
+    if open_bootstrap_in_terminal {
+        state.open_bootstrap_in_raw_terminal();
+    }
 
     if let Some(idx) = apply_turn_idx {
         if let Some(turn) = state.chat_turns.get_mut(idx) {
@@ -5725,5 +6053,463 @@ Done!
         assert_eq!(st.tabs.len(), tabs_before + 1, "the fix must open a tab (status: {:?}, pending: {:?})", st.status_msg, st.pending_start_fix);
         assert_eq!(st.tabs.last().map(|t| t.spawn_preset), Some(AgentCliPreset::Shell));
         kill_tabs(&mut st);
+    }
+
+    mod bootstrap {
+        use super::*;
+        use designos_doc::{
+            Color, ComponentLink, FrameProps, LibraryRef, Node, NodeKind, Rect as DocRect,
+            Variable, VariableCollection, VariableKind, VariableMode, VariableValue,
+        };
+        use serde_json::json;
+
+        struct BootstrapFixture {
+            doc: Document,
+            page1: NodeId,
+            page2: NodeId,
+            frame_ids: Vec<NodeId>,
+            component_ids: Vec<NodeId>,
+            selected_ids: Vec<NodeId>,
+        }
+
+        fn build_tokens_fixture() -> BootstrapFixture {
+            let mut doc = Document::new("Bootstrap Tokens Fixture");
+            let page1 = doc.add_page("Page 1");
+            let page2 = doc.add_page("Page 2");
+
+            // 6 top-level frames on Page 1
+            let mut frame_ids = Vec::new();
+            for i in 0..6 {
+                let fid = doc.alloc_id();
+                let mut f = Node::frame(fid, DocRect::new(i as f32 * 360.0, 0.0, 320.0, 240.0));
+                f.name = format!("Frame {}", i + 1);
+                let _ = doc.insert(page1, f);
+                frame_ids.push(fid);
+            }
+
+            // 3 deep leaf nodes (depth >= 4 so they do not appear in the depth-3 outline) used as selection
+            let mut selected_ids = Vec::new();
+            let host = frame_ids[0];
+            let d1 = doc.alloc_id();
+            let mut n1 = Node::frame(d1, DocRect::new(0.0, 0.0, 100.0, 100.0));
+            n1.name = "Wrap L1".into();
+            let _ = doc.insert(host, n1);
+            let d2 = doc.alloc_id();
+            let mut n2 = Node::frame(d2, DocRect::new(0.0, 0.0, 80.0, 80.0));
+            n2.name = "Wrap L2".into();
+            let _ = doc.insert(d1, n2);
+            let d3 = doc.alloc_id();
+            let mut n3 = Node::frame(d3, DocRect::new(0.0, 0.0, 60.0, 60.0));
+            n3.name = "Wrap L3".into();
+            let _ = doc.insert(d2, n3);
+            for i in 0..3 {
+                let sid = doc.alloc_id();
+                let mut leaf = Node::rectangle(sid, DocRect::new(0.0, 0.0, 20.0, 20.0));
+                leaf.name = format!("Selected Secret Leaf {}", i + 1);
+                let _ = doc.insert(d3, leaf);
+                selected_ids.push(sid);
+            }
+
+            // 1 collection / 2 modes / 18 variables
+            let mut var_ids = Vec::new();
+            for i in 0..18 {
+                let vid = format!("var-tok-{:02}", i + 1);
+                let vname = format!("color/token-{:02}", i + 1);
+                let mut values = std::collections::BTreeMap::new();
+                values.insert("mode-light".to_string(), VariableValue::Color(Color::rgb(240, 240, 245)));
+                values.insert("mode-dark".to_string(), VariableValue::Color(Color::rgb(24, 24, 28)));
+                doc.variables.insert(
+                    vid.clone(),
+                    Variable {
+                        id: vid.clone(),
+                        name: vname,
+                        collection: "col-primitives".into(),
+                        kind: VariableKind::Color,
+                        values,
+                        description: String::new(),
+                        scopes: Vec::new(),
+                        hidden_from_publishing: false,
+                        key: None,
+                        code_syntax: std::collections::BTreeMap::new(),
+                    },
+                );
+                var_ids.push(vid);
+            }
+            doc.variable_collections.insert(
+                "col-primitives".into(),
+                VariableCollection {
+                    id: "col-primitives".into(),
+                    name: "Primitives".into(),
+                    modes: vec![
+                        VariableMode { id: "mode-light".into(), name: "Light".into() },
+                        VariableMode { id: "mode-dark".into(), name: "Dark".into() },
+                    ],
+                    default_mode: "mode-light".into(),
+                    variables: var_ids,
+                    key: None,
+                    source_library_key: None,
+                },
+            );
+
+            // 4 components on Page 2 (so Page 1 top-level frames stay the 6 frames)
+            let mut component_ids = Vec::new();
+            for name in ["Button Primary", "Analytics Card", "Status Badge", "Dialog Modal"] {
+                let cid = doc.alloc_id();
+                let mut comp = Node::frame(cid, DocRect::new(0.0, 0.0, 160.0, 48.0));
+                comp.name = name.into();
+                comp.kind = NodeKind::Component(FrameProps::default());
+                comp.component = ComponentLink::default();
+                let _ = doc.insert(page2, comp);
+                component_ids.push(cid);
+            }
+
+            // 1 active enabled library
+            doc.library.enabled.push(LibraryRef {
+                id: "lib-core-ui".into(),
+                name: "Core UI Kit".into(),
+                version: 1,
+            });
+
+            BootstrapFixture { doc, page1, page2, frame_ids, component_ids, selected_ids }
+        }
+
+        #[test]
+        fn first_turn_contains_every_section() {
+            let fx = build_tokens_fixture();
+            let mut st = TerminalState::for_tab(8601);
+            let file_path = std::env::temp_dir().join("bootstrap-fixture-8601.designos");
+            st.sync_live_file_context(&fx.doc, fx.page1, &[], Some(&file_path));
+            st.submit_chat_prompt("Build a hero section", Some(&file_path));
+
+            let first_prompt = &st.chat_turns[0].dispatched_prompt;
+            assert!(st.chat_turns[0].context_attached, "first turn must mark context_attached=true");
+            for header in [
+                "## 1. Freshness",
+                "## 2. Document",
+                "## 3. Target frames outline",
+                "## 4. Variables summary",
+                "## 5. Components and libraries",
+                "## 6. Active style",
+                "## 7. Rules pack",
+            ] {
+                assert!(first_prompt.contains(header), "missing section {header} in first prompt:\n{first_prompt}");
+            }
+            // Pages, frame IDs & names, tokens, components, and library slug
+            assert!(first_prompt.contains("Page 1") && first_prompt.contains("Page 2"));
+            for (idx, fid) in fx.frame_ids.iter().enumerate() {
+                let fname = format!("Frame {}", idx + 1);
+                assert!(
+                    first_prompt.contains(&format!("id=\"{}\"", fid.0)) && first_prompt.contains(&fname),
+                    "missing frame {fname} ({}) in first prompt",
+                    fid.0
+                );
+            }
+            assert!(first_prompt.contains("Primitives") && first_prompt.contains("color/token-01"));
+            for cid in &fx.component_ids {
+                assert!(first_prompt.contains(&cid.0.to_string()), "missing component id {} in first prompt", cid.0);
+            }
+            assert!(first_prompt.contains("lib-core-ui") || first_prompt.contains("Core UI Kit"));
+
+            // Also verify Claude UserPromptSubmit hook output on the first turn
+            let claude_hooks = read_json(&st.session_dir.join("hooks.json"));
+            let hook_cmd = claude_hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap();
+            let hook_stdout = run_hook_command(hook_cmd);
+            let hook_json: serde_json::Value = serde_json::from_str(hook_stdout.trim()).expect("valid hook JSON");
+            let add_ctx = hook_json["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+            assert!(add_ctx.contains("## 1. Freshness") && add_ctx.contains("## 7. Rules pack"));
+            kill_tabs(&mut st);
+        }
+
+        #[test]
+        fn selection_never_injected() {
+            let fx = build_tokens_fixture();
+            assert_eq!(fx.selected_ids.len(), 3);
+            let mut st = TerminalState::for_tab(8602);
+            st.sync_live_file_context(&fx.doc, fx.page1, &fx.selected_ids, None);
+
+            // 1. Check bootstrap.json and bootstrap.md on disk
+            let boot_json = read_json(&st.bootstrap_json_path);
+            let sections = boot_json["sections"].as_array().expect("sections array");
+            assert!(
+                !sections.iter().any(|s| s["id"] == "selection"),
+                "bootstrap.json must never contain a selection section"
+            );
+            let boot_md = std::fs::read_to_string(&st.bootstrap_md_path).expect("read bootstrap.md");
+            assert!(!boot_md.contains("## Selection") && !boot_md.contains("selected_node_ids"));
+            for (i, sid) in fx.selected_ids.iter().enumerate() {
+                let sname = format!("Selected Secret Leaf {}", i + 1);
+                assert!(
+                    !boot_md.contains(&sname) && !boot_md.contains(&format!("id=\"{}\"", sid.0)),
+                    "bootstrap.md must not inject selected node {sname} ({})",
+                    sid.0
+                );
+            }
+
+            // 2. Check first prompt and second prompt
+            st.submit_chat_prompt("First prompt with selection active", None);
+            st.submit_chat_prompt("Second prompt with selection active", None);
+            for turn in &st.chat_turns {
+                assert!(!turn.dispatched_prompt.contains("selected_node_ids"));
+                assert!(!turn.dispatched_prompt.contains("## Selection"));
+                for i in 0..3 {
+                    let sname = format!("Selected Secret Leaf {}", i + 1);
+                    assert!(!turn.dispatched_prompt.contains(&sname));
+                }
+            }
+
+            // 3. Check Claude hook output on turn 1 and turn 2
+            let claude_hooks = read_json(&st.session_dir.join("hooks.json"));
+            let hook_cmd = claude_hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap();
+            for turn_no in 1..=2 {
+                let hook_out = run_hook_command(hook_cmd);
+                assert!(
+                    !hook_out.contains("selected_node_ids") && !hook_out.contains("Selected Secret Leaf"),
+                    "hook turn {turn_no} leaked selection: {hook_out}"
+                );
+            }
+            kill_tabs(&mut st);
+        }
+
+        #[test]
+        fn selection_only_by_explicit_argument() {
+            let fx = build_tokens_fixture();
+            let mut st = TerminalState::for_tab(8603);
+            let workspace = std::env::temp_dir();
+            let file_path = workspace.join("bootstrap-fixture-8603.designos");
+            st.sync_live_file_context(&fx.doc, fx.page1, &fx.selected_ids, Some(&file_path));
+
+            let mut mcp = designos_mcp::server::Session::with_session_dir(&workspace, &st.session_dir).expect("mcp session");
+
+            // Default call (include_selection omitted): no selection section
+            let res_default = mcp.call("designos_get_app_state", json!({})).expect("default get_app_state");
+            let secs_default = res_default["sections"].as_array().unwrap();
+            assert!(!secs_default.iter().any(|s| s["id"] == "selection"));
+
+            // Explicit include_selection: true -> selection section lists the 3 selected nodes
+            let res_sel = mcp
+                .call("designos_get_app_state", json!({ "include_selection": true }))
+                .expect("explicit selection get_app_state");
+            let secs_sel = res_sel["sections"].as_array().unwrap();
+            let sel_sec = secs_sel.iter().find(|s| s["id"] == "selection").expect("selection section present");
+            let content = sel_sec["content"].as_str().unwrap();
+            for (i, sid) in fx.selected_ids.iter().enumerate() {
+                let sname = format!("Selected Secret Leaf {}", i + 1);
+                assert!(
+                    content.contains(&sid.0.to_string()) && content.contains(&sname),
+                    "selection section must list {sname} ({}):\n{content}",
+                    sid.0
+                );
+            }
+            kill_tabs(&mut st);
+        }
+
+        #[test]
+        fn large_fixture_within_budget_with_markers() {
+            let mut doc = Document::new("Large Synthetic Fixture");
+            let page = doc.add_page("Page 1");
+            // 25 top-level frames, each with children
+            for i in 0..25 {
+                let fid = doc.alloc_id();
+                let mut f = Node::frame(fid, DocRect::new((i % 5) as f32 * 400.0, (i / 5) as f32 * 300.0, 360.0, 260.0));
+                f.name = format!("Screen Frame {:02}", i + 1);
+                let _ = doc.insert(page, f);
+                for j in 0..12 {
+                    let cid = doc.alloc_id();
+                    let mut child = Node::rectangle(cid, DocRect::new(0.0, 0.0, 100.0, 40.0));
+                    child.name = format!("Card Item {:02}-{:02}", i + 1, j + 1);
+                    let _ = doc.insert(fid, child);
+                }
+            }
+            // 120 variables so variables section also truncates with a follow-up marker
+            let mut var_ids = Vec::new();
+            for i in 0..120 {
+                let vid = format!("var-lg-{:03}", i + 1);
+                let mut values = std::collections::BTreeMap::new();
+                values.insert("m1".into(), VariableValue::Number(i as f32));
+                doc.variables.insert(
+                    vid.clone(),
+                    Variable {
+                        id: vid.clone(),
+                        name: format!("spacing/scale-{:03}/token-name-long", i + 1),
+                        collection: "col-lg".into(),
+                        kind: VariableKind::Number,
+                        values,
+                        description: String::new(),
+                        scopes: Vec::new(),
+                        hidden_from_publishing: false,
+                        key: None,
+                        code_syntax: std::collections::BTreeMap::new(),
+                    },
+                );
+                var_ids.push(vid);
+            }
+            doc.variable_collections.insert(
+                "col-lg".into(),
+                VariableCollection {
+                    id: "col-lg".into(),
+                    name: "Large Scale".into(),
+                    modes: vec![VariableMode { id: "m1".into(), name: "Default".into() }],
+                    default_mode: "m1".into(),
+                    variables: var_ids,
+                    key: None,
+                    source_library_key: None,
+                },
+            );
+
+            let mut st = TerminalState::for_tab(8604);
+            let t0 = std::time::Instant::now();
+            st.sync_live_file_context(&doc, page, &[], None);
+            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            assert!(elapsed_ms <= 300.0, "large fixture bootstrap build took {elapsed_ms:.2}ms (> 300ms budget)");
+
+            let boot_json = read_json(&st.bootstrap_json_path);
+            let total_tokens = boot_json["total_tokens"].as_u64().unwrap();
+            assert!(
+                total_tokens <= designos_export::agent_context::DEFAULT_BOOTSTRAP_MAX_TOKENS as u64,
+                "total_tokens {total_tokens} exceeds 12000 budget"
+            );
+            let sections = boot_json["sections"].as_array().unwrap();
+            let outline = sections.iter().find(|s| s["id"] == "outline").unwrap();
+            assert_eq!(outline["truncated"], json!(true), "25-frame outline must be truncated to 12 frames");
+            let note = outline["truncation_note"].as_str().expect("outline truncation_note");
+            assert!(
+                note.contains("designos_get_metadata") || note.contains("designos_get_app_state"),
+                "outline truncation note must name follow-up tool: {note}"
+            );
+            kill_tabs(&mut st);
+        }
+
+        #[test]
+        fn stub_agent_zero_discovery_calls() {
+            let fx = build_tokens_fixture();
+            let mut st = TerminalState::for_tab(8605);
+            let workspace = std::env::temp_dir();
+            let file_path = workspace.join("bootstrap-fixture-8605.designos");
+            st.sync_live_file_context(&fx.doc, fx.page1, &[], Some(&file_path));
+
+            st.submit_chat_prompt("Create a card inside Frame 1 using token color/token-01", Some(&file_path));
+            let first_prompt = &st.chat_turns[0].dispatched_prompt;
+
+            // Stub agent parses target frame id ("Frame 1") directly from the pre-fetched outline in first_prompt
+            let frame1_marker = "name=\"Frame 1\"";
+            let pos = first_prompt.find(frame1_marker).expect("Frame 1 present in pre-fetched outline");
+            let before = &first_prompt[..pos];
+            let id_start = before.rfind("id=\"").expect("frame id attribute") + 4;
+            let id_end = before[id_start..].find('"').unwrap() + id_start;
+            let parsed_frame_id: u64 = before[id_start..id_end].parse().expect("numeric frame id");
+            assert_eq!(parsed_frame_id, fx.frame_ids[0].0);
+
+            // Stub agent executes its first MCP call directly as a write (`designos_create_node`), with 0 discovery calls
+            let mut mcp = designos_mcp::server::Session::with_session_dir(&workspace, &st.session_dir).expect("mcp session");
+            let mut mcp_call_log: Vec<String> = Vec::new();
+            let call_name = "designos_create_node";
+            mcp_call_log.push(call_name.to_string());
+            let create_res = mcp
+                .call(
+                    call_name,
+                    json!({
+                        "parent_id": parsed_frame_id,
+                        "kind": "frame",
+                        "name": "Direct Card",
+                        "x": 16.0,
+                        "y": 16.0,
+                        "width": 240.0,
+                        "height": 120.0
+                    }),
+                )
+                .expect("direct create_node succeeds without discovery calls");
+            assert!(create_res["node"]["id"].as_u64().is_some());
+            assert_eq!(mcp_call_log, vec!["designos_create_node".to_string()]);
+            kill_tabs(&mut st);
+        }
+
+        #[test]
+        fn app_state_tool_matches_studio_block() {
+            let fx = build_tokens_fixture();
+            let mut st = TerminalState::for_tab(8606);
+            let workspace = std::env::temp_dir();
+            let file_path = workspace.join("bootstrap-fixture-8606.designos");
+            st.sync_live_file_context(&fx.doc, fx.page1, &fx.selected_ids, Some(&file_path));
+
+            let studio_boot = read_json(&st.bootstrap_json_path);
+            let mut mcp = designos_mcp::server::Session::with_session_dir(&workspace, &st.session_dir).expect("mcp session");
+            let tool_boot = mcp.call("designos_get_app_state", json!({})).expect("designos_get_app_state");
+
+            assert_eq!(tool_boot["doc_revision"], studio_boot["doc_revision"]);
+            assert_eq!(tool_boot["sections"], studio_boot["sections"]);
+            kill_tabs(&mut st);
+        }
+
+        #[test]
+        fn delivered_once_per_run() {
+            let fx = build_tokens_fixture();
+            let mut st = TerminalState::for_tab(8607);
+            st.sync_live_file_context(&fx.doc, fx.page1, &[], None);
+
+            // Turn 1 of run 1: full bootstrap block attached
+            st.submit_chat_prompt("First turn in run 1", None);
+            assert!(st.chat_turns[0].context_attached);
+            assert!(st.chat_turns[0].dispatched_prompt.contains("## 3. Target frames outline"));
+
+            // Turn 2 of run 1: only lightweight page context refresh, no bootstrap block
+            st.submit_chat_prompt("Second turn in run 1", None);
+            assert!(!st.chat_turns[2].context_attached);
+            assert!(!st.chat_turns[2].dispatched_prompt.contains("## 3. Target frames outline"));
+            assert!(st.chat_turns[2].dispatched_prompt.contains("DESIGN:OS Studio page context:"));
+
+            // Claude hook: first invocation in run 1 prints bootstrap, second prints lightweight page context
+            let claude_hooks = read_json(&st.session_dir.join("hooks.json"));
+            let hook_cmd = claude_hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap();
+            let hook_turn_1 = run_hook_command(hook_cmd);
+            let hook_turn_2 = run_hook_command(hook_cmd);
+            assert!(hook_turn_1.contains("## 3. Target frames outline"));
+            assert!(!hook_turn_2.contains("## 3. Target frames outline"));
+            assert!(hook_turn_2.contains("DESIGN:OS Studio page context:"));
+
+            // Resetting the agent run delivers a fresh bootstrap block once again
+            st.reset_agent_run(None);
+            st.submit_chat_prompt("First turn in run 2", None);
+            assert!(st.chat_turns[4].context_attached);
+            assert!(st.chat_turns[4].dispatched_prompt.contains("## 3. Target frames outline"));
+
+            let claude_hooks_r2 = read_json(&st.session_dir.join("hooks.json"));
+            let hook_cmd_r2 = claude_hooks_r2["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap();
+            let hook_r2_turn_1 = run_hook_command(hook_cmd_r2);
+            let hook_r2_turn_2 = run_hook_command(hook_cmd_r2);
+            assert!(hook_r2_turn_1.contains("## 3. Target frames outline"));
+            assert!(!hook_r2_turn_2.contains("## 3. Target frames outline"));
+            kill_tabs(&mut st);
+        }
+
+        #[test]
+        fn slow_bootstrap_falls_back_to_compact_and_caption_opens_raw_terminal() {
+            let fx = build_tokens_fixture();
+            let mut st = TerminalState::for_tab(8608);
+            st.sync_live_file_context(&fx.doc, fx.page1, &[], None);
+            st.start_bootstrap_job(
+                fx.doc.clone(),
+                fx.page1,
+                None,
+                Some(std::time::Duration::from_millis(1200)),
+            );
+
+            let t0 = std::time::Instant::now();
+            st.submit_chat_prompt("Prompt while slow bootstrap is still indexing", None);
+            let waited_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            assert!(waited_ms < 900.0, "submit_chat_prompt must bound wait to ~500ms (took {waited_ms:.1}ms)");
+            let prompt_sent = &st.chat_turns[0].dispatched_prompt;
+            assert!(prompt_sent.contains("## 1. Freshness") && prompt_sent.contains("## 2. Document") && prompt_sent.contains("## 7. Rules"));
+            assert!(
+                prompt_sent.contains("Bootstrap build exceeded 500 ms; call designos_get_app_state"),
+                "compact fallback note missing:\n{prompt_sent}"
+            );
+
+            // Clicking `Context attached` switches to raw terminal view and renders bootstrap.md
+            st.open_bootstrap_in_raw_terminal();
+            assert!(st.side_panel_pty_open && !st.chat_mode);
+            let raw_log = st.active_tab().unwrap().raw_log.lock().unwrap().clone();
+            assert!(raw_log.contains("bootstrap.md") && raw_log.contains("## 1. Freshness"));
+            kill_tabs(&mut st);
+        }
     }
 }

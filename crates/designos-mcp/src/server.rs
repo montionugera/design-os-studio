@@ -224,6 +224,40 @@ impl Session {
             if let Ok(raw) = fs::read_to_string(ctx_path) {
                 if let Ok(val) = serde_json::from_str::<Value>(&raw) {
                     loaded_page_id = val.get("current_page_id").and_then(Value::as_u64);
+                    if let Some(fp) = val.get("file_path").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                        self.engine.file_path = Some(fp.to_string());
+                    }
+                    if let Some(rev) = val.get("doc_revision").and_then(Value::as_u64) {
+                        self.engine.base_doc_revision = Some(rev);
+                    }
+                    if let Some(arr) = val.get("selected_node_ids").and_then(Value::as_array) {
+                        self.engine.selected_node_ids = arr.iter().filter_map(Value::as_u64).map(designos_doc::NodeId).collect();
+                    }
+                }
+            }
+        }
+        if self.engine.file_path.is_none() {
+            if let Ok(env_fp) = std::env::var("DESIGNOS_FILE") {
+                if !env_fp.trim().is_empty() {
+                    self.engine.file_path = Some(env_fp.trim().to_string());
+                }
+            }
+        }
+        if let Some(sess_dir) = &self.bridge.session_dir {
+            let boot_json_path = sess_dir.join("bootstrap.json");
+            if let Ok(raw) = fs::read_to_string(&boot_json_path) {
+                if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+                    if let Some(gen_at) = val.get("generated_at").and_then(Value::as_str) {
+                        self.engine.bootstrap_generated_at = Some(gen_at.to_string());
+                    }
+                    if let Some(scoped) = val.get("scoped").and_then(Value::as_bool) {
+                        self.engine.scoped = scoped;
+                    }
+                    if self.engine.base_doc_revision.is_none() {
+                        if let Some(rev) = val.get("doc_revision").and_then(Value::as_u64) {
+                            self.engine.base_doc_revision = Some(rev);
+                        }
+                    }
                 }
             }
         }
