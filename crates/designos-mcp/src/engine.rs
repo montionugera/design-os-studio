@@ -23,7 +23,40 @@ impl Default for Engine {
     }
 }
 
+/// Every tool name and legacy alias accepted by [`Engine::call`].
+pub const DISPATCHED: &[&str] = &[
+    "designos_get_document",
+    "designos_list_nodes",
+    "designos_get_node",
+    "designos_get_variables",
+    "designos_generate_code",
+    "designos_create_node",
+    "designos_update_node",
+    "designos_delete_node",
+    "designos_list_comments",
+    "designos_add_comment",
+    "designos_reply_comment",
+    "designos_resolve_comment",
+    "designos_apply_spec",
+    "designos_export_spec",
+    "designos_set_dev_status",
+    "designos_export_fig_file",
+    "export_fig_file",
+    "designos_query_xpath",
+    "query_nodes",
+    "designos_lint",
+    "check_design",
+    "designos_undo",
+    "designos_redo",
+];
+
+/// Non-prefixed compatibility aliases accepted by [`Engine::call`].
+pub const ALIASES: &[&str] = &["export_fig_file", "query_nodes", "check_design"];
+
 impl Engine {
+    pub const DISPATCHED: &[&str] = DISPATCHED;
+    pub const ALIASES: &[&str] = ALIASES;
+
     /// Resolves the target page when a tool call omits `parent_id` / `page_id`:
     /// prefers `self.active_page_id` (the user's currently selected page in `design:os studio`)
     /// if valid in `self.doc.pages`, falling back to `self.doc.pages.first()`.
@@ -823,6 +856,22 @@ pub fn tools() -> Vec<Value> {
         json!({"output_path":{"type":"string","description":"Destination .fig path inside the workspace."}}),
         vec!["output_path"],
         false,
+        true,
+    );
+    add(
+        "query_xpath",
+        "Query layers on a page using an XPath-like selector (e.g. //FRAME, //FRAME[@name='Card'], //TEXT[contains(@name, 'Title')]) or a kind/name substring.",
+        json!({"selector":{"type":"string","maxLength":1024},"query":{"type":"string","maxLength":1024},"page_id":id}),
+        vec![],
+        true,
+        true,
+    );
+    add(
+        "lint",
+        "Audit layers on a page for zero-bounds geometry and default layer names, returning structured findings and pass status.",
+        json!({"page_id":id}),
+        vec![],
+        true,
         true,
     );
     add("undo", "Undo the latest successful edit in this session; returns changed=false if the stack is empty.", json!({}), vec![], false, false);

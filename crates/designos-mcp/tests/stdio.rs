@@ -10,7 +10,10 @@ async fn stdio_handshake_discovery_edit_and_error_recovery() {
         let client = ().serve(TokioChildProcess::new(command).unwrap()).await.unwrap();
         assert_eq!(client.peer_info().unwrap().server_info.as_ref().unwrap().name, "designos-mcp");
         let tools = client.list_all_tools().await.unwrap();
-        assert_eq!(tools.len(), 22);
+        let snapshot_raw = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots/tools.json"))
+            .expect("read tests/snapshots/tools.json");
+        let snapshot: Vec<Value> = serde_json::from_str(&snapshot_raw).expect("parse tools.json");
+        assert_eq!(tools.len(), snapshot.len());
         assert!(tools.iter().all(|t| t.annotations.is_some()));
         let call = |name: &'static str, args: Value| CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone());
         let doc = client.call_tool(call("designos_get_document", json!({}))).await.unwrap();
