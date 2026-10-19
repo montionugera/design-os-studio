@@ -2621,11 +2621,17 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
         let ctx_r = Rect::from_min_size(Pos2::new(rect.left(), bar_r.bottom()), Vec2::new(rect.width(), ctx_h));
         p.rect_filled(ctx_r, 0.0, TERM_BG_ELEVATED);
         widgets::hline(&p, ctx_r.left(), ctx_r.right(), ctx_r.bottom() - 1.0, TERM_BORDER);
-        let skills_chip_w = 68.0;
-        let skills_chip_r =
-            Rect::from_min_size(Pos2::new((ctx_r.right() - skills_chip_w - 4.0).max(ctx_r.left() + 80.0), ctx_r.top() + 2.0), Vec2::new(skills_chip_w, 16.0));
+        let skills_chip_w = theme::SPACE_REGION + theme::SPACE_SECTION;
+        let skills_chip_r = Rect::from_min_size(
+            Pos2::new(
+                (ctx_r.right() - skills_chip_w - theme::SPACE_ROW).max(ctx_r.left() + theme::SPACE_REGION + theme::CONTROL_TOOL),
+                ctx_r.top() + theme::INSET_SEGMENT,
+            ),
+            Vec2::new(skills_chip_w, theme::SPACE_BLOCK),
+        );
         let ctx_badge = format!("{} · {}", state.doc_name, state.current_page_name);
-        let ctx_elided = widgets::elide(&p, &ctx_badge, &theme::font_caption(), (skills_chip_r.left() - ctx_r.left() - 22.0).max(32.0));
+        let ctx_elided =
+            widgets::elide(&p, &ctx_badge, &theme::font_caption(), (skills_chip_r.left() - ctx_r.left() - theme::SPACE_SECTION).max(theme::CONTROL_TOOL));
         p.circle_filled(Pos2::new(ctx_r.left() + 10.0, ctx_r.center().y), 2.5, STATUS_INFO_TEXT);
         p.text(Pos2::new(ctx_r.left() + 17.0, ctx_r.center().y), Align2::LEFT_CENTER, ctx_elided, theme::font_caption(), STATUS_INFO_TEXT);
         if state.skills.paint_chip(ui, &p, skills_chip_r, "agents-skills-picker-btn") {
@@ -2644,7 +2650,8 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
         if state.runtime_dropdown_open {
             render_runtime_dropdown_menu(state, ui, rect, bar_r.bottom() + 4.0, file_path);
         }
-        state.skills.show_picker_popover(ui, rect, (ctx_r.bottom() + 250.0).min(rect.bottom() - 8.0));
+        let popover_offset = theme::SPACE_REGION * 5.0;
+        state.skills.show_picker_popover(ui, rect, (ctx_r.bottom() + popover_offset).min(rect.bottom() - theme::SPACE_INLINE));
 
         let repaint_ms = if state.viewport_focused { 50 } else { 500 };
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(repaint_ms));
@@ -3075,7 +3082,8 @@ pub fn show_left(state: &mut TerminalState, ui: &mut Ui, rect: Rect, file_path: 
     }
 
     // Bottom-left `Skills` picker chip button (`RD-4`)
-    let skills_r = Rect::from_center_size(Pos2::new(composer_rect.left() + 138.0, icon_y), Vec2::new(66.0, 20.0));
+    let skills_r =
+        Rect::from_min_size(Pos2::new(prd_r.right() + theme::SPACE_ROW, prd_r.top()), Vec2::new(theme::SPACE_REGION + theme::SPACE_BLOCK, prd_r.height()));
     if state.skills.paint_chip(ui, &p, skills_r, "agents-composer-skills") {
         state.provision_session_agent_files(file_path);
     }
@@ -5134,6 +5142,7 @@ Done!
     #[test]
     fn export_selection_pastes_fixed_sentence_only() {
         let mut st = TerminalState::default();
+        st.bind_session(format!("p{}-export-sel", std::process::id()));
         st.spawn_tab(AgentCliPreset::Shell, None).expect("spawn");
         st.active_tab_mut().unwrap().spawn_preset = AgentCliPreset::Claude;
         let rec = attach_recorder(st.active_tab_mut().unwrap());
@@ -5190,6 +5199,7 @@ Done!
         let _ = std::fs::remove_file(&marker);
 
         let mut st = TerminalState::default();
+        st.bind_session(format!("p{pid}-dead-agent"));
         spawn_stub_exiting_agent_into(&mut st);
         assert!(wait_until_tab_exits(&mut st, 8), "stub agent must exit");
         assert!(!st.active_tab_mut().unwrap().is_alive());

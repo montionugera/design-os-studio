@@ -20,7 +20,7 @@ use crate::terminal::{
 };
 use crate::theme;
 use crate::widgets;
-use egui::{Align2, Color32, CornerRadius, Id, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
+use egui::{Align2, Color32, Id, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -624,9 +624,9 @@ impl SkillsAttachmentState {
             (Color32::from_rgb(0x28, 0x28, 0x2C), Color32::from_rgb(0x3C, 0x3C, 0x42), Color32::from_rgb(0xB3, 0xB3, 0xB3))
         };
         p.rect_filled(rect, theme::cr(theme::RADIUS_CONTROL), bg);
-        p.rect_stroke(rect, theme::cr(theme::RADIUS_CONTROL), Stroke::new(1.0, border), StrokeKind::Inside);
+        p.rect_stroke(rect, theme::cr(theme::RADIUS_CONTROL), Stroke::new(theme::BORDER_WIDTH, border), StrokeKind::Inside);
         let label = if selected_count > 0 { format!("Skills ({selected_count}/{MAX_SKILLS_PER_RUN})") } else { "Skills".to_string() };
-        let elided = widgets::elide(p, &label, &theme::font_caption_strong(), (rect.width() - 8.0).max(24.0));
+        let elided = widgets::elide(p, &label, &theme::font_caption_strong(), (rect.width() - theme::SPACE_INLINE).max(theme::TARGET_MIN));
         p.text(rect.center(), Align2::CENTER_CENTER, elided, theme::font_caption_strong(), fg);
         widgets::record(ui, id_str, rect);
         if resp.clicked() {
@@ -647,47 +647,57 @@ impl SkillsAttachmentState {
         }
         self.poll_watcher(Some(ui.ctx()));
 
-        let pop_w = (panel_rect.width() - 16.0).clamp(220.0, 320.0);
-        let row_h = 44.0;
-        let header_h = 30.0;
-        let footer_h = if self.limit_violation().is_some() { 40.0 } else { 26.0 };
-        let pop_h = (header_h + (self.entries.len() as f32) * row_h + footer_h + 8.0).min((panel_rect.height() - 24.0).max(180.0));
-        let pop_x = (panel_rect.left() + 8.0).min(panel_rect.right() - pop_w - 4.0);
-        let pop_y = (anchor_bottom_y - pop_h - 6.0).max(panel_rect.top() + 38.0);
+        let min_pop_w = theme::CONTROL_ROW * 5.0 + theme::SPACE_SECTION;
+        let max_pop_w = theme::CONTROL_ROW * 8.0;
+        let pop_w = (panel_rect.width() - theme::INSET_PANEL).clamp(min_pop_w, max_pop_w);
+        let row_h = theme::CONTROL_ROW + theme::SPACE_ROW;
+        let header_h = theme::CONTROL_STANDARD;
+        let footer_h = if self.limit_violation().is_some() { theme::CONTROL_ROW } else { theme::CONTROL_DENSE };
+        let min_pop_h = theme::CONTROL_ROW * 4.0 + theme::SPACE_SECTION;
+        let pop_h =
+            (header_h + (self.entries.len() as f32) * row_h + footer_h + theme::SPACE_INLINE).min((panel_rect.height() - theme::SPACE_SECTION).max(min_pop_h));
+        let pop_x = (panel_rect.left() + theme::SPACE_INLINE).min(panel_rect.right() - pop_w - theme::SPACE_ROW);
+        let pop_y = (anchor_bottom_y - pop_h - theme::SPACE_INLINE).max(panel_rect.top() + theme::CONTROL_ROW);
         let pop_r = Rect::from_min_size(Pos2::new(pop_x, pop_y), Vec2::new(pop_w, pop_h));
 
         let p = ui.painter().clone();
-        p.rect_filled(pop_r, CornerRadius::same(8), Color32::from_rgb(0x1F, 0x20, 0x24));
-        p.rect_stroke(pop_r, CornerRadius::same(8), Stroke::new(1.0, Color32::from_rgb(0x3E, 0x3E, 0x46)), StrokeKind::Inside);
+        p.rect_filled(pop_r, theme::cr(theme::RADIUS_FRAME), Color32::from_rgb(0x1F, 0x20, 0x24));
+        p.rect_stroke(pop_r, theme::cr(theme::RADIUS_FRAME), Stroke::new(theme::BORDER_WIDTH, Color32::from_rgb(0x3E, 0x3E, 0x46)), StrokeKind::Inside);
         widgets::record(ui, "agents-skills-picker-popover", pop_r);
 
         // Header
         let selected_count = self.selected_entries().len();
         let tokens = self.combined_tokens();
         let header_text = format!("ATTACH SKILLS ({selected_count}/{MAX_SKILLS_PER_RUN} · {tokens}/{MAX_COMBINED_TOKENS} tok)");
-        let header_elided = widgets::elide(&p, &header_text, &theme::font_caption_strong(), (pop_w - 40.0).max(60.0));
-        p.text(Pos2::new(pop_r.left() + 10.0, pop_r.top() + 15.0), Align2::LEFT_CENTER, header_elided, theme::font_caption_strong(), Color32::WHITE);
+        let header_elided = widgets::elide(&p, &header_text, &theme::font_caption_strong(), (pop_w - theme::CONTROL_ROW).max(theme::SPACE_REGION));
+        p.text(
+            Pos2::new(pop_r.left() + theme::INSET_BUTTON, pop_r.top() + theme::INSET_PANEL),
+            Align2::LEFT_CENTER,
+            header_elided,
+            theme::font_caption_strong(),
+            Color32::WHITE,
+        );
 
-        let close_r = Rect::from_center_size(Pos2::new(pop_r.right() - 14.0, pop_r.top() + 15.0), Vec2::splat(18.0));
+        let close_r = Rect::from_center_size(Pos2::new(pop_r.right() - theme::INSET_PANEL, pop_r.top() + theme::INSET_PANEL), Vec2::splat(theme::TARGET_MIN));
         let close_resp = ui.interact(close_r, Id::new("agents-skills-picker-close"), Sense::click());
-        icons::paint(&p, Icon::Close, close_r.center(), 10.0, if close_resp.hovered() { STATUS_BAD_TEXT } else { theme::TEXT_SECONDARY });
+        icons::paint(&p, Icon::Close, close_r.center(), theme::SPACE_GROUP, if close_resp.hovered() { STATUS_BAD_TEXT } else { theme::TEXT_SECONDARY });
         widgets::record(ui, "agents-skills-picker-close", close_r);
         if close_resp.clicked() {
             self.picker_open = false;
             return;
         }
-        widgets::hline(&p, pop_r.left() + 6.0, pop_r.right() - 6.0, pop_r.top() + header_h, TERM_BORDER);
+        widgets::hline(&p, pop_r.left() + theme::SPACE_INLINE, pop_r.right() - theme::SPACE_INLINE, pop_r.top() + header_h, TERM_BORDER);
 
         // Rows
         let mut toggle_target: Option<String> = None;
-        let mut ry = pop_r.top() + header_h + 4.0;
-        let max_rows_bottom = pop_r.bottom() - footer_h - 2.0;
+        let mut ry = pop_r.top() + header_h + theme::SPACE_ROW;
+        let max_rows_bottom = pop_r.bottom() - footer_h - theme::INSET_SEGMENT;
 
         for entry in &self.entries {
-            if ry + row_h - 4.0 > max_rows_bottom {
+            if ry + row_h - theme::SPACE_ROW > max_rows_bottom {
                 break;
             }
-            let row_r = Rect::from_min_size(Pos2::new(pop_r.left() + 6.0, ry), Vec2::new(pop_w - 12.0, row_h - 4.0));
+            let row_r = Rect::from_min_size(Pos2::new(pop_r.left() + theme::INSET_FRAME, ry), Vec2::new(pop_w - theme::INSET_PANEL, row_h - theme::SPACE_ROW));
             let is_valid = entry.status.is_valid();
             let is_selected = is_valid && self.selected_names.iter().any(|n| n == &entry.name);
             let row_id = format!("agents-skill-row-{}", entry.id);
@@ -709,23 +719,29 @@ impl SkillsAttachmentState {
             } else {
                 TERM_BORDER
             };
-            p.rect_filled(row_r, CornerRadius::same(6), row_bg);
-            p.rect_stroke(row_r, CornerRadius::same(6), Stroke::new(1.0, row_border), StrokeKind::Inside);
+            p.rect_filled(row_r, theme::cr(theme::RADIUS_CONTROL), row_bg);
+            p.rect_stroke(row_r, theme::cr(theme::RADIUS_CONTROL), Stroke::new(theme::BORDER_WIDTH, row_border), StrokeKind::Inside);
 
             // Checkbox
-            let cb_r = Rect::from_center_size(Pos2::new(row_r.left() + 14.0, row_r.top() + 13.0), Vec2::splat(13.0));
+            let cb_r = Rect::from_center_size(Pos2::new(row_r.left() + theme::INSET_BUTTON, row_r.top() + theme::SPACE_GROUP), Vec2::splat(theme::SPACE_GROUP));
             let cb_bg = if is_selected { STATUS_INFO_TEXT } else { Color32::from_rgb(0x16, 0x17, 0x1B) };
-            p.rect_filled(cb_r, CornerRadius::same(3), cb_bg);
-            p.rect_stroke(cb_r, CornerRadius::same(3), Stroke::new(1.0, if is_selected { STATUS_INFO_TEXT } else { TERM_BORDER }), StrokeKind::Inside);
+            p.rect_filled(cb_r, theme::cr(theme::RADIUS_SEGMENT), cb_bg);
+            p.rect_stroke(
+                cb_r,
+                theme::cr(theme::RADIUS_SEGMENT),
+                Stroke::new(theme::BORDER_WIDTH, if is_selected { STATUS_INFO_TEXT } else { TERM_BORDER }),
+                StrokeKind::Inside,
+            );
             if is_selected {
-                icons::paint(&p, Icon::Check, cb_r.center(), 9.0, Color32::from_rgb(0x0E, 0x0E, 0x12));
+                icons::paint(&p, Icon::Check, cb_r.center(), theme::SPACE_INLINE, Color32::from_rgb(0x0E, 0x0E, 0x12));
             }
 
             // Title + Version
             let title_str = if is_valid { format!("{} @{}", entry.name, entry.version) } else { entry.name.clone() };
-            let title_elided = widgets::elide(&p, &title_str, &theme::font_caption_strong(), (row_r.width() - 96.0).max(40.0));
+            let title_elided =
+                widgets::elide(&p, &title_str, &theme::font_caption_strong(), (row_r.width() - theme::SPACE_REGION * 2.0).max(theme::CONTROL_ROW));
             p.text(
-                Pos2::new(row_r.left() + 26.0, row_r.top() + 13.0),
+                Pos2::new(row_r.left() + theme::SPACE_SECTION, row_r.top() + theme::SPACE_GROUP),
                 Align2::LEFT_CENTER,
                 title_elided,
                 theme::font_caption_strong(),
@@ -734,16 +750,19 @@ impl SkillsAttachmentState {
 
             // Right pill: error badge or token count + source
             if let Some(err_label) = entry.status.error_badge() {
-                let badge_w = (err_label.len() as f32 * 5.4 + 10.0).min(118.0);
-                let badge_r = Rect::from_min_size(Pos2::new(row_r.right() - badge_w - 6.0, row_r.top() + 5.0), Vec2::new(badge_w, 16.0));
-                p.rect_filled(badge_r, CornerRadius::same(4), STATUS_BAD_BG);
-                p.rect_stroke(badge_r, CornerRadius::same(4), Stroke::new(1.0, STATUS_BAD_BORDER), StrokeKind::Inside);
-                let err_elided = widgets::elide(&p, err_label, &theme::font_caption(), badge_w - 6.0);
+                let badge_w = (err_label.len() as f32 * theme::SPACE_ROW + theme::SPACE_GROUP).min(theme::CONTROL_ROW * 3.0);
+                let badge_r = Rect::from_min_size(
+                    Pos2::new(row_r.right() - badge_w - theme::INSET_SEGMENT, row_r.top() + theme::INSET_SEGMENT),
+                    Vec2::new(badge_w, theme::INSET_PANEL),
+                );
+                p.rect_filled(badge_r, theme::cr(theme::RADIUS_SEGMENT), STATUS_BAD_BG);
+                p.rect_stroke(badge_r, theme::cr(theme::RADIUS_SEGMENT), Stroke::new(theme::BORDER_WIDTH, STATUS_BAD_BORDER), StrokeKind::Inside);
+                let err_elided = widgets::elide(&p, err_label, &theme::font_caption(), badge_w - theme::SPACE_INLINE);
                 p.text(badge_r.center(), Align2::CENTER_CENTER, err_elided, theme::font_caption(), STATUS_BAD_TEXT);
             } else {
                 let meta_str = format!("{} · {}t", entry.source.badge_label(), entry.token_count);
                 p.text(
-                    Pos2::new(row_r.right() - 6.0, row_r.top() + 13.0),
+                    Pos2::new(row_r.right() - theme::SPACE_INLINE, row_r.top() + theme::SPACE_GROUP),
                     Align2::RIGHT_CENTER,
                     meta_str,
                     theme::font_caption(),
@@ -752,8 +771,14 @@ impl SkillsAttachmentState {
             }
 
             // Description line
-            let desc_elided = widgets::elide(&p, &entry.description, &theme::font_caption(), (row_r.width() - 32.0).max(40.0));
-            p.text(Pos2::new(row_r.left() + 26.0, row_r.top() + 28.0), Align2::LEFT_CENTER, desc_elided, theme::font_caption(), theme::TEXT_SECONDARY);
+            let desc_elided = widgets::elide(&p, &entry.description, &theme::font_caption(), (row_r.width() - theme::CONTROL_TOOL).max(theme::CONTROL_ROW));
+            p.text(
+                Pos2::new(row_r.left() + theme::SPACE_SECTION, row_r.top() + theme::CONTROL_STANDARD),
+                Align2::LEFT_CENTER,
+                desc_elided,
+                theme::font_caption(),
+                theme::TEXT_SECONDARY,
+            );
 
             widgets::record(ui, &row_id, row_r);
             if is_valid && resp.clicked() {
@@ -767,22 +792,33 @@ impl SkillsAttachmentState {
         }
 
         // Footer: limit notice or user skills directory hint
-        widgets::hline(&p, pop_r.left() + 6.0, pop_r.right() - 6.0, pop_r.bottom() - footer_h, TERM_BORDER);
+        widgets::hline(&p, pop_r.left() + theme::SPACE_INLINE, pop_r.right() - theme::SPACE_INLINE, pop_r.bottom() - footer_h, TERM_BORDER);
         if let Some(violation) = self.limit_violation() {
-            let warn_r =
-                Rect::from_min_max(Pos2::new(pop_r.left() + 6.0, pop_r.bottom() - footer_h + 4.0), Pos2::new(pop_r.right() - 6.0, pop_r.bottom() - 4.0));
-            p.rect_filled(warn_r, CornerRadius::same(4), STATUS_WARN_BG);
-            p.rect_stroke(warn_r, CornerRadius::same(4), Stroke::new(1.0, STATUS_WARN_BORDER), StrokeKind::Inside);
-            let msg = widgets::elide(&p, &violation, &theme::font_caption_strong(), warn_r.width() - 12.0);
+            let warn_r = Rect::from_min_max(
+                Pos2::new(pop_r.left() + theme::INSET_FRAME, pop_r.bottom() - footer_h + theme::SPACE_ROW),
+                Pos2::new(pop_r.right() - theme::INSET_FRAME, pop_r.bottom() - theme::SPACE_ROW),
+            );
+            p.rect_filled(warn_r, theme::cr(theme::RADIUS_CONTROL), STATUS_WARN_BG);
+            p.rect_stroke(warn_r, theme::cr(theme::RADIUS_CONTROL), Stroke::new(theme::BORDER_WIDTH, STATUS_WARN_BORDER), StrokeKind::Inside);
+            let msg = widgets::elide(&p, &violation, &theme::font_caption_strong(), warn_r.width() - theme::SPACE_GROUP);
             p.text(warn_r.center(), Align2::CENTER_CENTER, msg, theme::font_caption_strong(), STATUS_WARN_TEXT);
             widgets::record(ui, "agents-skills-limit-warning", warn_r);
         } else {
             let footer_msg = format!("User skills: {}/skills/<name>/SKILL.md", self.library_root.display());
-            let footer_elided = widgets::elide(&p, &footer_msg, &theme::font_caption(), pop_w - 20.0);
-            p.text(Pos2::new(pop_r.left() + 10.0, pop_r.bottom() - 13.0), Align2::LEFT_CENTER, footer_elided, theme::font_caption(), STATUS_OK_TEXT);
-            let ok_r = Rect::from_min_size(Pos2::new(pop_r.right() - 56.0, pop_r.bottom() - 21.0), Vec2::new(48.0, 16.0));
-            p.rect_filled(ok_r, CornerRadius::same(4), STATUS_OK_BG);
-            p.rect_stroke(ok_r, CornerRadius::same(4), Stroke::new(1.0, STATUS_OK_BORDER), StrokeKind::Inside);
+            let footer_elided = widgets::elide(&p, &footer_msg, &theme::font_caption(), pop_w - theme::SPACE_SECTION);
+            p.text(
+                Pos2::new(pop_r.left() + theme::INSET_BUTTON, pop_r.bottom() - theme::SPACE_GROUP),
+                Align2::LEFT_CENTER,
+                footer_elided,
+                theme::font_caption(),
+                STATUS_OK_TEXT,
+            );
+            let ok_r = Rect::from_min_size(
+                Pos2::new(pop_r.right() - theme::SPACE_REGION - theme::SPACE_INLINE, pop_r.bottom() - theme::SPACE_SECTION),
+                Vec2::new(theme::SPACE_REGION, theme::INSET_PANEL),
+            );
+            p.rect_filled(ok_r, theme::cr(theme::RADIUS_SEGMENT), STATUS_OK_BG);
+            p.rect_stroke(ok_r, theme::cr(theme::RADIUS_SEGMENT), Stroke::new(theme::BORDER_WIDTH, STATUS_OK_BORDER), StrokeKind::Inside);
             p.text(ok_r.center(), Align2::CENTER_CENTER, "READY", theme::font_caption_strong(), STATUS_OK_TEXT);
         }
     }
